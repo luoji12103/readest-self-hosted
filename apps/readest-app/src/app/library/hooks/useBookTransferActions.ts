@@ -9,6 +9,7 @@ import { eventDispatcher } from '@/utils/event';
 import { transferManager } from '@/services/transferManager';
 import {
   getActiveFileSyncBackends,
+  isReadestBookFileUploadActive,
   isReadestCloudEnabled,
 } from '@/services/sync/cloudSyncProvider';
 import { runFileBookDownload, runFileBookUpload } from '@/services/sync/file/runLibrarySync';
@@ -38,7 +39,7 @@ export const useBookTransferActions = (
     async (book: Book, _syncBooks = true) => {
       const settingsNow = useSettingsStore.getState().settings;
       const backends = getActiveFileSyncBackends(settingsNow);
-      const readest = isReadestCloudEnabled(settingsNow);
+      const readest = isReadestBookFileUploadActive(settingsNow);
 
       // An explicit Upload must reach EVERY destination the user selected
       // (#5062), not just the first one.

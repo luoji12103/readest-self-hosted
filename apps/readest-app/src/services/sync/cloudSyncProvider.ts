@@ -2,6 +2,7 @@ import type { SystemSettings } from '@/types/settings';
 import type { UserPlan } from '@/types/quota';
 import { isCloudSyncAllowed } from '@/utils/access';
 import type { FileSyncBackendKind } from '@/services/sync/file/providerRegistry';
+import { isBookFileUploadEnabled } from '@/services/runtimeConfig';
 
 /**
  * The cloud sync provider kind for library data (book files, book rows,
@@ -186,3 +187,8 @@ export const isReadestCloudStorageActive = (
   settings: SystemSettings | null | undefined,
   _plan?: UserPlan,
 ): boolean => isReadestCloudEnabled(settings);
+
+/** Whether this deployment accepts book binaries in Readest-hosted storage. */
+export const isReadestBookFileUploadActive = (
+  settings: SystemSettings | null | undefined,
+): boolean => isBookFileUploadEnabled() && isReadestCloudStorageActive(settings);

@@ -65,7 +65,9 @@ Example response:
     "cloudSyncRequiresPremium": false,
     "ttsCacheRequiresPremium": false,
     "bookFileUploadEnabled": false,
-    "deeplEnabled": false
+    "translationProviders": ["google", "azure", "yandex"],
+    "translationDailyQuota": null,
+    "clientDownloadUrl": null
   }
 }
 ```
@@ -76,7 +78,10 @@ Fields:
 - `supabaseUrl`: public Supabase project URL used by the client for authentication and sync.
 - `supabaseAnonKey`: a legacy Supabase JWT with role `anon`, or a public key whose prefix is `sb_publishable_`.
 - `deploymentMode`: identifies a `hosted` or `self-hosted` deployment.
-- `capabilities`: complete server policy consumed by compatible clients. Every supported capability must be present.
+- `capabilities`: server policy consumed by compatible clients. Omitted flags retain hosted-compatible defaults for backward compatibility.
+  - `translationProviders`: enabled providers from `deepl`, `azure`, `google`, and `yandex`.
+  - `translationDailyQuota`: advertised daily character limit, or `null` when no server-backed quota applies.
+  - `clientDownloadUrl`: optional HTTPS page for this deployment's clients, or `null` to hide the link.
 
 Current Readest authentication and sync flows require Supabase client config, so `supabaseUrl` and `supabaseAnonKey` must be present for a saved custom server.
 

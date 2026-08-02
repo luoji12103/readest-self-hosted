@@ -18,7 +18,9 @@ describe('public Readest client config route', () => {
     vi.stubEnv('READEST_CLOUD_SYNC_REQUIRES_PREMIUM', 'false');
     vi.stubEnv('READEST_TTS_CACHE_REQUIRES_PREMIUM', 'false');
     vi.stubEnv('READEST_BOOK_FILE_UPLOAD_ENABLED', 'false');
-    vi.stubEnv('READEST_DEEPL_ENABLED', 'false');
+    vi.stubEnv('READEST_TRANSLATION_PROVIDERS', 'google,azure,yandex');
+    vi.stubEnv('READEST_TRANSLATION_DAILY_QUOTA', '25000');
+    vi.stubEnv('READEST_CLIENT_DOWNLOAD_URL', 'https://downloads.example.com/readest');
 
     const response = GET();
     const config = await response.json();
@@ -38,7 +40,9 @@ describe('public Readest client config route', () => {
         cloudSyncRequiresPremium: false,
         ttsCacheRequiresPremium: false,
         bookFileUploadEnabled: false,
-        deeplEnabled: false,
+        translationProviders: ['google', 'azure', 'yandex'],
+        translationDailyQuota: 25000,
+        clientDownloadUrl: 'https://downloads.example.com/readest',
       },
     });
     expect(JSON.stringify(config)).not.toContain('must-not-be-exposed');

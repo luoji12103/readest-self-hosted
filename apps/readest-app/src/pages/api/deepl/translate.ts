@@ -9,6 +9,7 @@ import {
 } from '@/utils/access';
 import { ErrorCodes } from '@/services/translators';
 import { UsageStatsManager } from '@/utils/usage';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 const DEFAULT_DEEPL_FREE_API = 'https://api-free.deepl.com/v2/translate';
 const DEFAULT_DEEPL_PRO_API = 'https://api.deepl.com/v2/translate';
@@ -81,6 +82,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  if (!getRuntimeCapabilities().translationProviders.includes('deepl')) {
+    return res.status(404).json({ error: 'Translation provider is not available' });
   }
 
   let env: Partial<CloudflareEnv> = {};

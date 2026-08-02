@@ -44,6 +44,7 @@ import SharedLinksSection from './components/SharedLinksSection';
 import { SyncPassphraseSection } from './components/SyncPassphraseSection';
 import { SyncCategoriesSection } from './components/SyncCategoriesSection';
 import Checkout from './components/Checkout';
+import { getDeploymentMode, getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 type CheckoutState = {
   clientSecret: string;
@@ -57,6 +58,8 @@ const ProfilePage = () => {
   const { appService } = useEnv();
   const { token, user, refresh } = useAuth();
   const { safeAreaInsets, isRoundedWindow } = useThemeStore();
+  const { billingEnabled } = getRuntimeCapabilities();
+  const isSelfHosted = getDeploymentMode() === 'self-hosted';
 
   const [loading, setLoading] = useState(false);
   const [showEmbeddedCheckout, setShowEmbeddedCheckout] = useState(false);
@@ -96,6 +99,7 @@ const ProfilePage = () => {
 
   const { availablePlans, iapAvailable } = useAvailablePlans({
     hasIAP: appService?.hasIAP || false,
+    enabled: billingEnabled,
     onError: useCallback(
       (message: string) => {
         eventDispatcher.dispatch('toast', {
@@ -309,6 +313,7 @@ const ProfilePage = () => {
                     userFullName={userFullName}
                     userEmail={userEmail}
                     planDetails={userPlanDetails}
+                    selfHosted={isSelfHosted}
                   />
 
                   {!showStorageManager && !showSharedLinksManager && !showSyncManager && (
@@ -331,20 +336,23 @@ const ProfilePage = () => {
                   </div>
                 ) : (
                   <>
-                    <div className='flex flex-col gap-y-8 sm:px-6'>
-                      <PlansComparison
-                        availablePlans={availablePlans}
-                        userPlan={userProfilePlan}
-                        onSubscribe={
-                          appService.hasIAP && iapAvailable
-                            ? handleIAPSubscribe
-                            : handleStripeSubscribe
-                        }
-                      />
-                    </div>
+                    {billingEnabled && (
+                      <div className='flex flex-col gap-y-8 sm:px-6'>
+                        <PlansComparison
+                          availablePlans={availablePlans}
+                          userPlan={userProfilePlan}
+                          onSubscribe={
+                            appService.hasIAP && iapAvailable
+                              ? handleIAPSubscribe
+                              : handleStripeSubscribe
+                          }
+                        />
+                      </div>
+                    )}
                     <div className='flex flex-col gap-y-8 px-6'>
                       <AccountActions
                         userPlan={userProfilePlan}
+                        billingEnabled={billingEnabled}
                         iapAvailable={iapAvailable}
                         onLogout={handleLogout}
                         onResetPassword={handleResetPassword}

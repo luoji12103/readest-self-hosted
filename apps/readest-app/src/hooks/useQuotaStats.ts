@@ -4,6 +4,7 @@ import { QuotaType, UserPlan } from '@/types/quota';
 import { getStoragePlanData, getTranslationPlanData, getUserProfilePlan } from '@/utils/access';
 import { setCachedUserPlan } from '@/services/sync/cloudSyncProvider';
 import { useTranslation } from './useTranslation';
+import { getDeploymentMode, getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 export const useQuotaStats = (briefName = false) => {
   const _ = useTranslation();
@@ -14,6 +15,8 @@ export const useQuotaStats = (briefName = false) => {
   useEffect(() => {
     if (!user || !token) return;
 
+    const selfHosted = getDeploymentMode() === 'self-hosted';
+    const capabilities = getRuntimeCapabilities();
     const storagPlan = getStoragePlanData(token);
     const inGB = storagPlan.quota > 1e9;
     const storageQuota: QuotaType = {
@@ -48,7 +51,12 @@ export const useQuotaStats = (briefName = false) => {
     // synchronously for the cloud-sync provider gate; cache it here, the
     // one place the plan is resolved from the JWT.
     setCachedUserPlan(profilePlan);
-    setQuotas([storageQuota, translationQuota]);
+    const hasServerTranslationQuota =
+      capabilities.translationProviders.includes('deepl') &&
+      capabilities.translationDailyQuota !== null;
+    setQuotas(
+      selfHosted && !hasServerTranslationQuota ? [storageQuota] : [storageQuota, translationQuota],
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 

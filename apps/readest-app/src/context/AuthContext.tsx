@@ -13,6 +13,7 @@ import { User } from '@supabase/supabase-js';
 import { supabase } from '@/utils/supabase';
 import { clearStoredAuthSession } from '@/helpers/auth';
 import posthog from 'posthog-js';
+import { refreshCustomServerConfig } from '@/services/customServerConfig';
 
 interface AuthContextType {
   token: string | null;
@@ -52,6 +53,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         posthog.identify(user.id);
         setToken(access_token);
         setUser(user);
+        void refreshCustomServerConfig().catch(() => null);
       } else {
         clearStoredAuthSession();
         setToken(null);

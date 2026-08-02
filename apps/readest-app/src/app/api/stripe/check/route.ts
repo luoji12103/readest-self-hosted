@@ -6,8 +6,13 @@ import {
   createOrUpdateSubscription,
 } from '@/libs/payment/stripe/server';
 import { validateUserAndToken } from '@/utils/access';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 export async function POST(request: Request) {
+  if (!getRuntimeCapabilities().billingEnabled) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
+
   const { sessionId } = await request.json();
 
   const { user, token } = await validateUserAndToken(request.headers.get('authorization'));

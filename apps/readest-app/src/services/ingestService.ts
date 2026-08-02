@@ -2,7 +2,7 @@ import type { Book, BookLookupIndex } from '@/types/book';
 import type { AppService, OsPlatform } from '@/types/system';
 import type { SystemSettings } from '@/types/settings';
 import { transferManager } from '@/services/transferManager';
-import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { isReadestBookFileUploadActive } from '@/services/sync/cloudSyncProvider';
 import { normalizeFilePathForIndex } from '@/services/bookService';
 import { isContentURI, isValidURL } from '@/utils/misc';
 import { isPseStreamFileName } from '@/services/opds/pseStream';
@@ -248,7 +248,7 @@ export async function ingestFile(
     isLoggedIn &&
     !book.uploadedAt &&
     (opts.forceUpload || settings.autoUpload) &&
-    isReadestCloudStorageActive(settings)
+    isReadestBookFileUploadActive(settings)
   ) {
     transferManager.queueUpload(book);
   }

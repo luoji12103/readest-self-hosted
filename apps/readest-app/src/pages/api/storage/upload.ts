@@ -8,6 +8,7 @@ import {
 } from '@/utils/access';
 import { getDownloadSignedUrl, getUploadSignedUrl, isSafeObjectKeyName } from '@/utils/object';
 import { READEST_PUBLIC_STORAGE_BASE_URL } from '@/services/constants';
+import { isBookFileUploadEnabled } from '@/services/runtimeConfig';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   await runMiddleware(req, res, corsAllMethods);
@@ -29,6 +30,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // namespace (GHSA-mfmj-2frf-vhgw).
   if (!isSafeObjectKeyName(fileName)) {
     return res.status(400).json({ error: 'Invalid fileName' });
+  }
+
+  const isBookStoragePath = fileName.startsWith('Readest/Books/');
+  const isCanonicalCover = /^Readest\/Books\/[^/]+\/cover\.png$/.test(fileName);
+  if (isBookStoragePath && !isCanonicalCover && !isBookFileUploadEnabled()) {
+    return res.status(403).json({ error: 'Book file uploads are disabled' });
   }
 
   if (temp) {
