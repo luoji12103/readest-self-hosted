@@ -82,13 +82,13 @@ describe('buildCommandRegistry', () => {
     expect(settingsItems.length).toBeGreaterThan(0);
 
     // Check that multiple panels are represented
-    const panels = new Set(settingsItems.map((i) => i.panel));
+    const panels = new Set<string>(settingsItems.flatMap((i) => (i.panel ? [i.panel] : [])));
     expect(panels.has('Font')).toBe(true);
     expect(panels.has('Layout')).toBe(true);
     expect(panels.has('Theme')).toBe(true);
     expect(panels.has('Control')).toBe(true);
     expect(panels.has('Language')).toBe(true);
-    expect(panels.has('Server')).toBe(true);
+    expect(panels.has('Server')).toBe(false);
     expect(panels.has('Custom')).toBe(true);
   });
 
