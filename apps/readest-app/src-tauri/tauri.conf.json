@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Readest Selfhost",
+  "productName": "Readest SH",
   "mainBinaryName": "readest",
   "identifier": "com.readest.selfhost",
   "version": "../package.json",

@@ -6,7 +6,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const appDir = resolve(scriptDir, '..');
 const configPath = resolve(appDir, process.env.TAURI_CONF_PATH ?? 'src-tauri/tauri.conf.json');
 
-const defaultProductName = 'Readest Selfhost';
+const defaultProductName = 'Readest SH';
 const defaultIdentifier = 'com.readest.selfhost';
 const defaultUpdaterEndpoint =
   'https://github.com/luoji12103/readest-self-hosted/releases/latest/download/latest.json';
