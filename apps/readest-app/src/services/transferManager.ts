@@ -2,7 +2,7 @@ import { Book } from '@/types/book';
 import { AppService, BaseDir } from '@/types/system';
 import { useTransferStore, TransferItem, ReplicaTransferFile } from '@/store/transferStore';
 import { useSettingsStore } from '@/store/settingsStore';
-import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { isReadestBookFileUploadActive } from '@/services/sync/cloudSyncProvider';
 import { TranslationFunc } from '@/hooks/useTranslation';
 import { createProgressThrottle, ProgressHandler, ProgressPayload } from '@/utils/transfer';
 import { eventDispatcher } from '@/utils/event';
@@ -61,7 +61,7 @@ class TransferManager {
   }
 
   private isBookUploadAllowed(): boolean {
-    return isReadestCloudStorageActive(useSettingsStore.getState().settings);
+    return isReadestBookFileUploadActive(useSettingsStore.getState().settings);
   }
 
   private isDeferredBookUpload(t: TransferItem): boolean {

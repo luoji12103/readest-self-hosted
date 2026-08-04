@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const runtimeCapabilities = vi.hoisted(() => ({
+  translationProviders: ['deepl', 'azure', 'google', 'yandex'],
+}));
+
+vi.mock('@/services/runtimeConfig', () => ({
+  getRuntimeCapabilities: () => runtimeCapabilities,
+  getRuntimeConfig: () => undefined,
+}));
+
 // Mock environment module
 vi.mock('@/services/environment', () => ({
   isTauriAppPlatform: vi.fn(() => false),
@@ -342,6 +351,15 @@ describe('provider registry disabled handling', () => {
     const { getTranslators } = await import('@/services/translators/providers');
     const names = getTranslators().map((t) => t.name);
     expect(names).toContain('yandex');
+  });
+
+  it('omits DeepL when the server disables it', async () => {
+    runtimeCapabilities.translationProviders = ['azure', 'google', 'yandex'];
+    const { getTranslator, getTranslators } = await import('@/services/translators/providers');
+
+    expect(getTranslators().map((translator) => translator.name)).not.toContain('deepl');
+    expect(getTranslator('deepl')).toBeUndefined();
+    runtimeCapabilities.translationProviders = ['deepl', 'azure', 'google', 'yandex'];
   });
 
   it('exposes yandex as disabled so callers can grey it out', async () => {

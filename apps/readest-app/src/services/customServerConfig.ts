@@ -1,20 +1,16 @@
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { jwtDecode } from 'jwt-decode';
+import {
+  DEFAULT_RUNTIME_CAPABILITIES,
+  type PublicReadestClientConfig,
+  type ReadestDeploymentMode,
+  type ReadestRuntimeCapabilities,
+  type ReadestTranslationProvider,
+} from './runtimeConfigTypes';
 
-export interface PublicReadestClientConfig {
-  apiBaseUrl?: string | undefined;
-  supabaseUrl?: string | undefined;
-  supabaseAnonKey?: string | undefined;
-  objectStorageType?: string | undefined;
-  storageFixedQuota?: number | undefined;
-  translationFixedQuota?: number | undefined;
-}
-
-export interface CustomServerConfig {
+export interface CustomServerConfig extends PublicReadestClientConfig {
   serverBaseUrl: string;
   apiBaseUrl: string;
-  supabaseUrl?: string | undefined;
-  supabaseAnonKey?: string | undefined;
   fetchedAt: number;
 }
 
@@ -257,6 +253,116 @@ const validateSupabasePublicKey = (key: string) => {
   );
 };
 
+const optionalNumber = (value: unknown, field: string): number | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new CustomServerConfigError('invalid-config', `${field} must be a non-negative number.`);
+  }
+  return value;
+};
+
+const optionalBoolean = (value: unknown, field: string): boolean | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new CustomServerConfigError('invalid-config', `${field} must be a boolean.`);
+  }
+  return value;
+};
+
+const TRANSLATION_PROVIDERS: readonly ReadestTranslationProvider[] = [
+  'deepl',
+  'azure',
+  'google',
+  'yandex',
+];
+
+const optionalTranslationProviders = (value: unknown): ReadestTranslationProvider[] | undefined => {
+  if (value === undefined) return undefined;
+  if (
+    !Array.isArray(value) ||
+    value.some(
+      (provider) =>
+        typeof provider !== 'string' ||
+        !(TRANSLATION_PROVIDERS as readonly string[]).includes(provider),
+    )
+  ) {
+    throw new CustomServerConfigError(
+      'invalid-config',
+      'capabilities.translationProviders contains an unsupported provider.',
+    );
+  }
+  return [...new Set(value)] as ReadestTranslationProvider[];
+};
+
+const optionalNullableNumber = (value: unknown, field: string): number | null | undefined => {
+  if (value === undefined || value === null) return value;
+  return optionalNumber(value, field);
+};
+
+const optionalNullableHttpsUrl = (value: unknown, field: string): string | null | undefined => {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== 'string') {
+    throw new CustomServerConfigError('invalid-config', `${field} must be an https URL or null.`);
+  }
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new CustomServerConfigError('invalid-config', `${field} must be an https URL or null.`);
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new CustomServerConfigError('invalid-config', `${field} must be an https URL or null.`);
+  }
+  return url.toString();
+};
+
+const validateCapabilities = (value: unknown): ReadestRuntimeCapabilities | undefined => {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    throw new CustomServerConfigError('invalid-config', 'capabilities must be an object.');
+  }
+
+  const translationProviders = optionalTranslationProviders(value['translationProviders']);
+  const translationDailyQuota = optionalNullableNumber(
+    value['translationDailyQuota'],
+    'capabilities.translationDailyQuota',
+  );
+  const clientDownloadUrl = optionalNullableHttpsUrl(
+    value['clientDownloadUrl'],
+    'capabilities.clientDownloadUrl',
+  );
+
+  return {
+    billingEnabled:
+      optionalBoolean(value['billingEnabled'], 'capabilities.billingEnabled') ??
+      DEFAULT_RUNTIME_CAPABILITIES.billingEnabled,
+    emailInEnabled:
+      optionalBoolean(value['emailInEnabled'], 'capabilities.emailInEnabled') ??
+      DEFAULT_RUNTIME_CAPABILITIES.emailInEnabled,
+    emailInRequiresPremium:
+      optionalBoolean(value['emailInRequiresPremium'], 'capabilities.emailInRequiresPremium') ??
+      DEFAULT_RUNTIME_CAPABILITIES.emailInRequiresPremium,
+    cloudSyncRequiresPremium:
+      optionalBoolean(value['cloudSyncRequiresPremium'], 'capabilities.cloudSyncRequiresPremium') ??
+      DEFAULT_RUNTIME_CAPABILITIES.cloudSyncRequiresPremium,
+    ttsCacheRequiresPremium:
+      optionalBoolean(value['ttsCacheRequiresPremium'], 'capabilities.ttsCacheRequiresPremium') ??
+      DEFAULT_RUNTIME_CAPABILITIES.ttsCacheRequiresPremium,
+    bookFileUploadEnabled:
+      optionalBoolean(value['bookFileUploadEnabled'], 'capabilities.bookFileUploadEnabled') ??
+      DEFAULT_RUNTIME_CAPABILITIES.bookFileUploadEnabled,
+    translationProviders: translationProviders ?? [
+      ...DEFAULT_RUNTIME_CAPABILITIES.translationProviders,
+    ],
+    translationDailyQuota:
+      translationDailyQuota === undefined
+        ? DEFAULT_RUNTIME_CAPABILITIES.translationDailyQuota
+        : translationDailyQuota,
+    clientDownloadUrl: clientDownloadUrl ?? null,
+  };
+};
+
 const validatePublicConfig = (
   serverBaseUrl: string,
   config: unknown,
@@ -274,6 +380,8 @@ const validatePublicConfig = (
   const apiBaseUrlValue = config['apiBaseUrl'];
   const supabaseUrlValue = config['supabaseUrl'];
   const supabaseAnonKeyValue = config['supabaseAnonKey'];
+  const objectStorageTypeValue = config['objectStorageType'];
+  const deploymentModeValue = config['deploymentMode'];
 
   const apiBaseUrl =
     typeof apiBaseUrlValue === 'string' && apiBaseUrlValue.trim()
@@ -298,10 +406,29 @@ const validatePublicConfig = (
     );
   }
 
+  if (
+    deploymentModeValue !== undefined &&
+    deploymentModeValue !== 'hosted' &&
+    deploymentModeValue !== 'self-hosted'
+  ) {
+    throw new CustomServerConfigError(
+      'invalid-config',
+      'deploymentMode must be hosted or self-hosted.',
+    );
+  }
+
   return {
     apiBaseUrl,
     supabaseUrl,
     supabaseAnonKey,
+    objectStorageType:
+      typeof objectStorageTypeValue === 'string' && objectStorageTypeValue.trim()
+        ? objectStorageTypeValue.trim()
+        : undefined,
+    storageFixedQuota: optionalNumber(config['storageFixedQuota'], 'storageFixedQuota'),
+    translationFixedQuota: optionalNumber(config['translationFixedQuota'], 'translationFixedQuota'),
+    deploymentMode: deploymentModeValue as ReadestDeploymentMode | undefined,
+    capabilities: validateCapabilities(config['capabilities']),
   };
 };
 
@@ -456,6 +583,11 @@ export const resolveCustomServerConfig = async (
     apiBaseUrl: publicConfig.apiBaseUrl ?? serverBaseUrl,
     supabaseUrl: publicConfig.supabaseUrl,
     supabaseAnonKey: publicConfig.supabaseAnonKey,
+    objectStorageType: publicConfig.objectStorageType,
+    storageFixedQuota: publicConfig.storageFixedQuota,
+    translationFixedQuota: publicConfig.translationFixedQuota,
+    deploymentMode: publicConfig.deploymentMode,
+    capabilities: publicConfig.capabilities,
     fetchedAt: options.now?.() ?? Date.now(),
   };
 };
@@ -587,6 +719,17 @@ export const saveCustomServerConfig = async (
   }
 };
 
+export const refreshCustomServerConfig = async (
+  options: ResolveCustomServerConfigOptions = {},
+): Promise<CustomServerConfig | null> => {
+  const current = loadCustomServerConfig();
+  if (!current) return null;
+
+  const refreshed = await resolveCustomServerConfig(current.serverBaseUrl, options);
+  await saveCustomServerConfig(refreshed);
+  return refreshed;
+};
+
 export const loadCustomServerConfig = (): CustomServerConfig | null => {
   const storage = getStorageAdapter();
   if (!storage) return null;
@@ -617,6 +760,20 @@ export const loadCustomServerConfig = (): CustomServerConfig | null => {
         typeof parsed['supabaseAnonKey'] === 'string'
           ? (parsed['supabaseAnonKey'] as string)
           : undefined,
+      objectStorageType:
+        typeof parsed['objectStorageType'] === 'string'
+          ? (parsed['objectStorageType'] as string)
+          : undefined,
+      storageFixedQuota: optionalNumber(parsed['storageFixedQuota'], 'storageFixedQuota'),
+      translationFixedQuota: optionalNumber(
+        parsed['translationFixedQuota'],
+        'translationFixedQuota',
+      ),
+      deploymentMode:
+        parsed['deploymentMode'] === 'hosted' || parsed['deploymentMode'] === 'self-hosted'
+          ? parsed['deploymentMode']
+          : undefined,
+      capabilities: validateCapabilities(parsed['capabilities']),
       fetchedAt,
     };
   } catch {
@@ -644,6 +801,11 @@ export const getCustomServerRuntimeConfig = (): PublicReadestClientConfig | null
     apiBaseUrl: config.apiBaseUrl,
     supabaseUrl: config.supabaseUrl,
     supabaseAnonKey: config.supabaseAnonKey,
+    objectStorageType: config.objectStorageType,
+    storageFixedQuota: config.storageFixedQuota,
+    translationFixedQuota: config.translationFixedQuota,
+    deploymentMode: config.deploymentMode,
+    capabilities: config.capabilities,
   };
 };
 

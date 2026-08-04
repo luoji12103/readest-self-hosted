@@ -48,13 +48,27 @@ window.__READEST_RUNTIME_CONFIG = {"apiBaseUrl":"https://your-readest-server.exa
 
 The client extracts and parses the JSON object. It never executes the remote script, scans application bundles, or imports a WebUI browser session. Discovery uses Tauri native HTTP in desktop and mobile builds, with an 8-second timeout and a 64 KiB response limit.
 
+The bundled endpoint reads its values from the server runtime environment, so it works with any hostname or reverse proxy without rebuilding the client.
+
 Example response:
 
 ```json
 {
   "apiBaseUrl": "https://your-readest-server.example.com",
   "supabaseUrl": "https://your-supabase-public.example.com",
-  "supabaseAnonKey": "your-public-anon-jwt-or-publishable-key"
+  "supabaseAnonKey": "your-public-anon-jwt-or-publishable-key",
+  "deploymentMode": "self-hosted",
+  "capabilities": {
+    "billingEnabled": false,
+    "emailInEnabled": false,
+    "emailInRequiresPremium": false,
+    "cloudSyncRequiresPremium": false,
+    "ttsCacheRequiresPremium": false,
+    "bookFileUploadEnabled": false,
+    "translationProviders": ["google", "azure", "yandex"],
+    "translationDailyQuota": null,
+    "clientDownloadUrl": null
+  }
 }
 ```
 
@@ -63,8 +77,15 @@ Fields:
 - `apiBaseUrl`: public base URL for Readest API requests. If omitted, the entered server base URL is used.
 - `supabaseUrl`: public Supabase project URL used by the client for authentication and sync.
 - `supabaseAnonKey`: a legacy Supabase JWT with role `anon`, or a public key whose prefix is `sb_publishable_`.
+- `deploymentMode`: identifies a `hosted` or `self-hosted` deployment.
+- `capabilities`: server policy consumed by compatible clients. Omitted flags retain hosted-compatible defaults for backward compatibility.
+  - `translationProviders`: enabled providers from `deepl`, `azure`, `google`, and `yandex`.
+  - `translationDailyQuota`: advertised daily character limit, or `null` when no server-backed quota applies.
+  - `clientDownloadUrl`: optional HTTPS page for this deployment's clients, or `null` to hide the link.
 
 Current Readest authentication and sync flows require Supabase client config, so `supabaseUrl` and `supabaseAnonKey` must be present for a saved custom server.
+
+Capability flags describe server policy; they do not grant authorization by themselves. Operators should enforce disabled server features at their API or storage boundary as appropriate.
 
 ## Public Config Is Not Secret Config
 

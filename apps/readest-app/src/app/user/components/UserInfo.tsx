@@ -8,9 +8,16 @@ interface UserInfoProps {
   userFullName: string;
   userEmail: string;
   planDetails: PlanDetails;
+  selfHosted?: boolean;
 }
 
-const UserInfo: React.FC<UserInfoProps> = ({ avatarUrl, userFullName, userEmail, planDetails }) => {
+const UserInfo: React.FC<UserInfoProps> = ({
+  avatarUrl,
+  userFullName,
+  userEmail,
+  planDetails,
+  selfHosted = false,
+}) => {
   const _ = useTranslation();
   return (
     <div className='flex flex-col items-center gap-x-6 gap-y-2 md:flex-row md:items-center'>
@@ -40,7 +47,7 @@ const UserInfo: React.FC<UserInfoProps> = ({ avatarUrl, userFullName, userEmail,
           <span
             className={`inline-block rounded-full px-3 py-1 text-sm font-medium ${planDetails.color}`}
           >
-            {_(planDetails.name)}
+            {selfHosted ? _('Self-hosted') : _(planDetails.name)}
           </span>
         </div>
       </div>

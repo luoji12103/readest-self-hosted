@@ -40,6 +40,7 @@ vi.mock('@/hooks/useTranslation', () => ({
 
 vi.mock('@/services/sync/cloudSyncProvider', () => ({
   isReadestCloudEnabled: () => routing.readestEnabled,
+  isReadestBookFileUploadActive: () => routing.readestEnabled,
   getActiveFileSyncBackends: () => routing.backends,
 }));
 

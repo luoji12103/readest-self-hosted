@@ -50,8 +50,8 @@ docker compose up -d
 ```
 
 this pulls `${READEST_IMAGE}` (default: `ghcr.io/readest/readest:latest`) instead of building the client locally.
-the web client now reads `SUPABASE_PUBLIC_URL`, `SUPABASE_ANON_KEY`, `API_BASE_URL`, `OBJECT_STORAGE_TYPE`, `STORAGE_FIXED_QUOTA`, and `TRANSLATION_FIXED_QUOTA` from runtime
-container env, so custom self-hosted values work with pulled images.
+the server publishes public connection details, quotas, and the `READEST_*` deployment capability flags from runtime
+container env, so custom self-hosted values work with pulled images and compatible clients.
 
 if you prefer Docker Hub, set `READEST_IMAGE` in `docker/.env`, for example:
 

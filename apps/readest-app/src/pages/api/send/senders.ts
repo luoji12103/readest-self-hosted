@@ -4,9 +4,10 @@ import { corsAllMethods, runMiddleware } from '@/utils/cors';
 import {
   EMAIL_IN_PLANS,
   getUserProfilePlan,
-  isEmailInPlan,
+  isEmailInAllowed,
   validateUserAndToken,
 } from '@/utils/access';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 import { normalizeSenderEmail } from '@/services/send/sendAddress';
 import type { DBSendAllowedSender } from '@/types/sendRecords';
 
@@ -25,6 +26,10 @@ const MAX_EMAIL_LENGTH = 254;
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   await runMiddleware(req, res, corsAllMethods);
 
+  if (!getRuntimeCapabilities().emailInEnabled) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
   const { user, token } = await validateUserAndToken(req.headers['authorization']);
   if (!user || !token) {
     return res.status(403).json({ error: 'Not authenticated' });
@@ -32,7 +37,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   // Sender allowlist only matters for the email-in channel — gate it too.
   const plan = getUserProfilePlan(token);
-  if (!isEmailInPlan(plan)) {
+  if (!isEmailInAllowed(plan)) {
     return res.status(403).json({
       error: 'Email-in is available on the Plus, Pro, and Lifetime plans',
       code: 'plan_required',

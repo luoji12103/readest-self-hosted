@@ -3,6 +3,7 @@ import { deeplProvider } from './deepl';
 import { azureProvider } from './azure';
 import { googleProvider } from './google';
 import { yandexProvider } from './yandex';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 function createTranslator<T extends string>(
   name: T,
@@ -32,11 +33,12 @@ const availableTranslators = [
 export type TranslatorName = (typeof availableTranslators)[number]['name'];
 
 export const getTranslator = (name: TranslatorName): TranslationProvider | undefined => {
-  return availableTranslators.find((translator) => translator.name === name);
+  return getTranslators().find((translator) => translator.name === name);
 };
 
 export const getTranslators = (): TranslationProvider[] => {
-  return availableTranslators;
+  const enabled = getRuntimeCapabilities().translationProviders;
+  return availableTranslators.filter((translator) => enabled.includes(translator.name));
 };
 
 /**

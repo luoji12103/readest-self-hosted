@@ -2,8 +2,12 @@ import Stripe from 'stripe';
 import { NextResponse } from 'next/server';
 import { getStripe } from '@/libs/payment/stripe/server';
 import { StripeProductMetadata } from '@/types/payment';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 
 export async function GET() {
+  if (!getRuntimeCapabilities().billingEnabled) {
+    return Response.json({ error: 'Not found' }, { status: 404 });
+  }
   try {
     const stripe = getStripe();
     const prices = await stripe.prices.list({

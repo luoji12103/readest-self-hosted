@@ -3,7 +3,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useEnv } from '@/context/EnvContext';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
-import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { isReadestBookFileUploadActive } from '@/services/sync/cloudSyncProvider';
 import { useTranslation } from '@/hooks/useTranslation';
 import { syncSubscribedCatalogs } from '@/services/opds';
 import { AUTO_CHECK_INTERVAL_MS } from '@/services/opds/types';
@@ -55,7 +55,7 @@ export function useOPDSSubscriptions() {
           if (
             user &&
             currentSettings.autoUpload &&
-            isReadestCloudStorageActive(currentSettings) &&
+            isReadestBookFileUploadActive(currentSettings) &&
             uniqueNewBooks.length > 0
           ) {
             const booksToUpload = uniqueNewBooks.filter((b) => !b.uploadedAt);

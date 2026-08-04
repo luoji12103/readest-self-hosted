@@ -26,6 +26,7 @@ import { useFileSyncStore } from '@/store/fileSyncStore';
 import { CatalogManager } from '@/app/opds/components/CatalogManager';
 import { saveSysSettings } from '@/helpers/settings';
 import { isCloudSyncAllowed } from '@/utils/access';
+import { getRuntimeCapabilities } from '@/services/runtimeConfig';
 import { isWebAppPlatform } from '@/services/environment';
 import { getGoogleWebClientId } from '@/services/sync/providers/gdrive/buildGoogleDriveProvider';
 import { getMicrosoftClientId } from '@/services/sync/providers/onedrive/buildOneDriveProvider';
@@ -83,6 +84,7 @@ type SubPage =
  */
 const IntegrationsPanel: React.FC = () => {
   const _ = useTranslation();
+  const { emailInEnabled } = getRuntimeCapabilities();
   const router = useRouter();
   const { envConfig, appService } = useEnv();
   const { user } = useAuth();
@@ -362,7 +364,7 @@ const IntegrationsPanel: React.FC = () => {
         <CatalogManager inSubPage />
       </div>
     );
-  if (subPage === 'send')
+  if (subPage === 'send' && emailInEnabled)
     return (
       <div className='my-4 w-full'>
         <SendToReadestForm onBack={() => setSubPage(null)} />
@@ -617,12 +619,14 @@ const IntegrationsPanel: React.FC = () => {
               status={opdsStatus}
               onClick={() => setSubPage('opds')}
             />
-            <IntegrationRow
-              icon={RiSendPlaneLine}
-              title={_('Send to Readest')}
-              status={_('Email books to your library')}
-              onClick={() => setSubPage('send')}
-            />
+            {emailInEnabled && (
+              <IntegrationRow
+                icon={RiSendPlaneLine}
+                title={_('Send to Readest')}
+                status={_('Email books to your library')}
+                onClick={() => setSubPage('send')}
+              />
+            )}
           </div>
         </div>
       </div>

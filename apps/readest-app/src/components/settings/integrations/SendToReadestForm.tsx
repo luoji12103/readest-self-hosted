@@ -7,7 +7,7 @@ import { useAuth } from '@/context/AuthContext';
 import { fetchWithAuth } from '@/utils/fetch';
 import { getAPIBaseUrl } from '@/services/environment';
 import { isInboxDrainEnabled, setInboxDrainEnabled } from '@/services/send/devicePrefs';
-import { getAccessToken, getUserProfilePlan, isEmailInPlan } from '@/utils/access';
+import { getAccessToken, getUserProfilePlan, isEmailInAllowed } from '@/utils/access';
 import { navigateToLogin, navigateToProfile } from '@/utils/nav';
 import { eventDispatcher } from '@/utils/event';
 import type { UserPlan } from '@/types/quota';
@@ -51,7 +51,7 @@ const SendToReadestForm: React.FC<SendToReadestFormProps> = ({ onBack }) => {
   // stay up rather than briefly flashing the upgrade card for a paid user
   // on a slow client.
   const [userPlan, setUserPlan] = useState<UserPlan | null>(null);
-  const canUseEmailIn = userPlan !== null && isEmailInPlan(userPlan);
+  const canUseEmailIn = userPlan !== null && isEmailInAllowed(userPlan);
   // Editing affordances stay collapsed once configured, keeping the panel
   // minimal; the refresh / plus icons reveal the input rows.
   const [editingAddress, setEditingAddress] = useState(false);
@@ -73,7 +73,7 @@ const SendToReadestForm: React.FC<SendToReadestFormProps> = ({ onBack }) => {
       const token = await getAccessToken();
       const plan: UserPlan = token ? getUserProfilePlan(token) : 'free';
       setUserPlan(plan);
-      if (!isEmailInPlan(plan)) {
+      if (!isEmailInAllowed(plan)) {
         setLoading(false);
         return;
       }

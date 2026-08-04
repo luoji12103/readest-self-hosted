@@ -15,6 +15,7 @@ import {
   getCustomServerConfigStorageKey,
   loadCustomServerConfig,
   normalizeServerBaseUrl,
+  refreshCustomServerConfig,
   resolveCustomServerConfig,
   saveCustomServerConfig,
   setCustomServerConfigStorageAdapter,
@@ -141,6 +142,75 @@ describe('customServerConfig', () => {
   });
 
   describe('fetchPublicClientConfig', () => {
+    test('validates and normalizes public deployment policy', async () => {
+      const fetchImpl = vi.fn(async () =>
+        jsonResponse({
+          apiBaseUrl: 'https://api.example.com',
+          supabaseUrl: 'https://supabase.example.com',
+          supabaseAnonKey: anonJwt,
+          objectStorageType: 's3',
+          storageFixedQuota: 1024,
+          translationFixedQuota: 2048,
+          deploymentMode: 'self-hosted',
+          capabilities: {
+            billingEnabled: false,
+            emailInEnabled: false,
+            emailInRequiresPremium: false,
+            cloudSyncRequiresPremium: false,
+            ttsCacheRequiresPremium: false,
+            bookFileUploadEnabled: false,
+            translationProviders: ['google', 'azure', 'yandex'],
+            translationDailyQuota: null,
+            clientDownloadUrl: null,
+          },
+        }),
+      ) as unknown as typeof fetch;
+
+      await expect(
+        fetchPublicClientConfig('https://readest.example.com', { fetchImpl }),
+      ).resolves.toMatchObject({
+        objectStorageType: 's3',
+        storageFixedQuota: 1024,
+        translationFixedQuota: 2048,
+        deploymentMode: 'self-hosted',
+        capabilities: {
+          billingEnabled: false,
+          emailInEnabled: false,
+          emailInRequiresPremium: false,
+          cloudSyncRequiresPremium: false,
+          ttsCacheRequiresPremium: false,
+          bookFileUploadEnabled: false,
+          translationProviders: ['google', 'azure', 'yandex'],
+          translationDailyQuota: null,
+          clientDownloadUrl: null,
+        },
+      });
+    });
+
+    test('fills missing capability fields with hosted-compatible defaults', async () => {
+      const fetchImpl = vi.fn(async () =>
+        jsonResponse({
+          supabaseUrl: 'https://supabase.example.com',
+          supabaseAnonKey: anonJwt,
+          capabilities: { billingEnabled: false },
+        }),
+      ) as unknown as typeof fetch;
+
+      const config = await fetchPublicClientConfig('https://readest.example.com', { fetchImpl });
+
+      expect(config.capabilities).toEqual({
+        billingEnabled: false,
+        emailInEnabled: true,
+        emailInRequiresPremium: true,
+        cloudSyncRequiresPremium: true,
+        ttsCacheRequiresPremium: true,
+        bookFileUploadEnabled: true,
+        translationProviders: ['deepl', 'azure', 'google', 'yandex'],
+        translationDailyQuota: null,
+        clientDownloadUrl: null,
+      });
+    });
+
     test('uses well-known config first', async () => {
       const fetchImpl = vi.fn(async () =>
         jsonResponse({
@@ -566,6 +636,79 @@ describe('customServerConfig', () => {
   });
 
   describe('storage', () => {
+    test('refreshes and caches capabilities without losing the offline copy', async () => {
+      const storage = makeMemoryStorage();
+      setCustomServerConfigStorageAdapter(storage);
+      await saveCustomServerConfig({
+        serverBaseUrl: 'https://readest.example.com',
+        apiBaseUrl: 'https://readest.example.com',
+        supabaseUrl: 'https://sync.example.com',
+        supabaseAnonKey: anonJwt,
+        deploymentMode: 'hosted',
+        capabilities: {
+          billingEnabled: true,
+          emailInEnabled: true,
+          emailInRequiresPremium: true,
+          cloudSyncRequiresPremium: true,
+          ttsCacheRequiresPremium: true,
+          bookFileUploadEnabled: true,
+          translationProviders: ['deepl', 'azure', 'google', 'yandex'],
+          translationDailyQuota: null,
+          clientDownloadUrl: 'https://readest.com?utm_source=readest_web',
+        },
+        fetchedAt: 1,
+      });
+
+      await refreshCustomServerConfig({
+        now: () => 2,
+        fetchImpl: vi.fn(async () =>
+          jsonResponse({
+            apiBaseUrl: 'https://readest.example.com',
+            supabaseUrl: 'https://sync.example.com',
+            supabaseAnonKey: anonJwt,
+            deploymentMode: 'self-hosted',
+            capabilities: {
+              billingEnabled: false,
+              emailInEnabled: false,
+              emailInRequiresPremium: false,
+              cloudSyncRequiresPremium: false,
+              ttsCacheRequiresPremium: false,
+              bookFileUploadEnabled: false,
+              translationProviders: ['google', 'azure', 'yandex'],
+              translationDailyQuota: null,
+              clientDownloadUrl: null,
+            },
+          }),
+        ) as unknown as typeof fetch,
+      });
+
+      expect(loadCustomServerConfig()).toMatchObject({
+        deploymentMode: 'self-hosted',
+        capabilities: {
+          billingEnabled: false,
+          emailInEnabled: false,
+          emailInRequiresPremium: false,
+          cloudSyncRequiresPremium: false,
+          ttsCacheRequiresPremium: false,
+          bookFileUploadEnabled: false,
+          translationProviders: ['google', 'azure', 'yandex'],
+          translationDailyQuota: null,
+          clientDownloadUrl: null,
+        },
+        fetchedAt: 2,
+      });
+
+      const offlineCopy = loadCustomServerConfig();
+      await expect(
+        refreshCustomServerConfig({
+          fetchImpl: vi.fn(async () => {
+            throw new TypeError('offline');
+          }) as unknown as typeof fetch,
+        }),
+      ).rejects.toMatchObject({ code: 'manual-config-required' });
+      expect(loadCustomServerConfig()).toEqual(offlineCopy);
+    });
+
     test('saves, reads, and clears current custom server config', async () => {
       const storage = makeMemoryStorage();
       setCustomServerConfigStorageAdapter(storage);

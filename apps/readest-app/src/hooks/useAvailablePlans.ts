@@ -15,16 +15,23 @@ const IAP_PRODUCT_IDS = [
 
 interface UseAvailablePlansParams {
   hasIAP: boolean;
+  enabled?: boolean;
   onError?: (message: string) => void;
 }
 
-export const useAvailablePlans = ({ hasIAP, onError }: UseAvailablePlansParams) => {
+export const useAvailablePlans = ({ hasIAP, enabled = true, onError }: UseAvailablePlansParams) => {
   const [availablePlans, setAvailablePlans] = useState<AvailablePlan[]>([]);
   const [iapAvailable, setIapAvailable] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
+    if (!enabled) {
+      setAvailablePlans([]);
+      setIapAvailable(false);
+      return;
+    }
+
     const fetchPlans = async () => {
       setLoading(true);
       setError(null);
@@ -52,7 +59,7 @@ export const useAvailablePlans = ({ hasIAP, onError }: UseAvailablePlansParams) 
     };
 
     fetchPlans();
-  }, [hasIAP, onError]);
+  }, [enabled, hasIAP, onError]);
 
   return { availablePlans, iapAvailable, loading, error };
 };

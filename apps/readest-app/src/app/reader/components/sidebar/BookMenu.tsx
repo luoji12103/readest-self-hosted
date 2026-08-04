@@ -13,7 +13,7 @@ import { useParallelViewStore } from '@/store/parallelViewStore';
 import { isWebAppPlatform } from '@/services/environment';
 import { eventDispatcher } from '@/utils/event';
 import { FIXED_LAYOUT_FORMATS } from '@/types/book';
-import { DOWNLOAD_READEST_URL } from '@/services/constants';
+import { getClientDownloadUrl } from '@/services/runtimeConfig';
 import { saveViewSettings } from '@/helpers/settings';
 import { setProofreadRulesVisibility } from '@/app/reader/components/ProofreadRules';
 import { setAboutDialogVisible } from '@/components/AboutWindow';
@@ -30,6 +30,7 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
   const _ = useTranslation();
   const { envConfig } = useEnv();
   const { settings } = useSettingsStore();
+  const clientDownloadUrl = getClientDownloadUrl();
   const { bookKeys, recreateViewer, getViewSettings } = useReaderStore();
   const { getVisibleLibrary } = useLibraryStore();
   const { openParallelView } = useBooksManager();
@@ -64,7 +65,8 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
     setIsDropdownOpen?.(false);
   };
   const downloadReadest = () => {
-    window.open(DOWNLOAD_READEST_URL, '_blank');
+    if (!clientDownloadUrl) return;
+    window.open(clientDownloadUrl, '_blank');
     setIsDropdownOpen?.(false);
   };
   const handleExportAnnotations = () => {
@@ -212,7 +214,9 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
       />
       <MenuItem label={_('Reload Page')} shortcut='Shift+R' onClick={handleReloadPage} />
       <hr aria-hidden='true' className='border-base-200 my-1' />
-      {isWebAppPlatform() && <MenuItem label={_('Download Readest')} onClick={downloadReadest} />}
+      {isWebAppPlatform() && clientDownloadUrl && (
+        <MenuItem label={_('Download Readest')} onClick={downloadReadest} />
+      )}
       <MenuItem label={_('About Readest')} onClick={showAboutReadest} />
     </Menu>
   );
