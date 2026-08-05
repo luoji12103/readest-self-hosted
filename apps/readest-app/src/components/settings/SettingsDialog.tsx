@@ -11,7 +11,6 @@ import { VscSymbolColor } from 'react-icons/vsc';
 import { PiDotsThreeVerticalBold, PiRobot, PiSpeakerHigh } from 'react-icons/pi';
 import { LiaHandPointerSolid } from 'react-icons/lia';
 import { IoAccessibilityOutline } from 'react-icons/io5';
-import { MdDns } from 'react-icons/md';
 import {
   MdArrowBackIosNew,
   MdArrowForwardIos,
@@ -34,7 +33,6 @@ import LangPanel from './LangPanel';
 import MiscPanel from './MiscPanel';
 import AIPanel from './AIPanel';
 import TTSPanel from './TTSPanel';
-import ServerSettingsPanel from './ServerSettingsPanel';
 
 export type SettingsPanelType =
   | 'Font'
@@ -45,7 +43,6 @@ export type SettingsPanelType =
   | 'Language'
   | 'AI'
   | 'Integrations'
-  | 'Server'
   | 'Custom';
 export type SettingsPanelPanelProp = {
   bookKey: string;
@@ -113,11 +110,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
       tab: 'Integrations',
       icon: RiShareLine,
       label: _('Integrations'),
-    },
-    {
-      tab: 'Server',
-      icon: MdDns,
-      label: _('Server'),
     },
     {
       tab: 'AI',
@@ -188,7 +180,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     Language: null,
     AI: null,
     Integrations: null,
-    Server: null,
     Custom: null,
   });
 
@@ -223,7 +214,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         language: 'Language',
         ai: 'AI',
         integrations: 'Integrations',
-        server: 'Server',
         custom: 'Custom',
       };
       const panelKey = parts[1]?.toLowerCase();
@@ -484,7 +474,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         )}
         {activePanel === 'AI' && <AIPanel />}
         {activePanel === 'Integrations' && <IntegrationsPanel />}
-        {activePanel === 'Server' && <ServerSettingsPanel />}
         {activePanel === 'Custom' && (
           <MiscPanel
             bookKey={bookKey}
