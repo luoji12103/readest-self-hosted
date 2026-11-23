@@ -114,6 +114,7 @@ jobs:
 
       - name: Initialize Android project
         env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: |
           set -euo pipefail
@@ -122,68 +123,7 @@ jobs:
           pnpm patch-tauri-selfhost
           pnpm tauri android init
           pnpm tauri icon ../../data/icons/readest-book.png
-
-          pushd src-tauri/gen/android
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("app/build.gradle.kts")
-          text = path.read_text()
-
-          def find_block(source: str, marker: str) -> tuple[int, int, int]:
-              start = source.find(marker)
-              if start == -1:
-                  raise SystemExit(f"Expected Gradle block was not found: {marker}")
-              open_brace = source.find("{", start)
-              if open_brace == -1:
-                  raise SystemExit(f"Expected Gradle block opening brace was not found: {marker}")
-              depth = 0
-              for index in range(open_brace, len(source)):
-                  char = source[index]
-                  if char == "{":
-                      depth += 1
-                  elif char == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return start, open_brace, index
-              raise SystemExit(f"Expected Gradle block closing brace was not found: {marker}")
-
-          signing_config = '''
-                  create("selfhostRelease") {
-                      keyAlias = System.getenv("ANDROID_KEY_ALIAS")
-                      keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
-                      storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH") ?: error("ANDROID_KEYSTORE_PATH is required"))
-                      storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                  }
-          '''
-          if 'create("selfhostRelease")' not in text:
-              if "    signingConfigs {" in text:
-                  _, open_brace, _ = find_block(text, "    signingConfigs")
-                  text = text[: open_brace + 1] + signing_config + text[open_brace + 1 :]
-              else:
-                  signing_block = f"    signingConfigs {{{signing_config}    }}\n"
-                  build_types_index = text.find("    buildTypes {")
-                  if build_types_index == -1:
-                      raise SystemExit("Expected Android buildTypes block was not found")
-                  text = text[:build_types_index] + signing_block + text[build_types_index:]
-
-          release_assignment = '''
-                      signingConfig = signingConfigs.getByName("selfhostRelease")
-          '''
-          if 'signingConfigs.getByName("selfhostRelease")' not in text:
-              _, _, release_close = find_block(text, 'getByName("release")')
-              text = text[:release_close] + release_assignment + text[release_close:]
-
-          if 'missingDimensionStrategy("store", "foss")' not in text:
-              _, default_config_open, _ = find_block(text, "    defaultConfig")
-              dimension_strategy = '''
-                  missingDimensionStrategy("store", "foss")
-          '''
-              text = text[: default_config_open + 1] + dimension_strategy + text[default_config_open + 1 :]
-
-          path.write_text(text)
-          PY
-          popd
+          python3 ../../scripts/configure-selfhost-android-gradle.py src-tauri/gen/android/app/build.gradle.kts
 
       - name: Decode Android keystore
         env:

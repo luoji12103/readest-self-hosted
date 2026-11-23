@@ -200,8 +200,6 @@ jobs:
           - arch: arm64
             runner: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
-    env:
-      TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: 'true'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -222,6 +220,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
+            libasound2-dev \
+            libclang-dev \
+            g++ \
             libfontconfig-dev \
             libgtk-3-dev \
             libwebkit2gtk-4.1 \
@@ -233,7 +234,12 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
-            xdg-utils
+            xdg-utils \
+            libnss3 \
+            libpulse0 \
+            libspeechd2 \
+            libxkbcommon-x11-0
+          pkg-config --modversion alsa
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
@@ -265,64 +271,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: linux-selfhost-${{ matrix.config.arch }}-cargo
+          key: linux-selfhost-cef-${{ matrix.config.arch }}-cargo
 
-      - name: Install truly portable AppImage bundler
+      # The v0.12.20 CEF CLI pins and verifies quick-sharun with the deployment-array fix.
+      - name: Install the pinned Tauri CEF CLI
         env:
-          TAURI_APPIMAGE_CLI_REV: 503bdbc1eade37d50a64ea7f81dbe853338b7fda
+          TAURI_CEF_CLI_REV: 6beeb209b5514f597a26f48b7a5b9fe4c59b5f12
         run: |
           set -euo pipefail
-          tauri_source="$RUNNER_TEMP/tauri-appimage-cli"
-          rm -rf "$tauri_source"
-          git init -q "$tauri_source"
-          git -C "$tauri_source" remote add origin https://github.com/tauri-apps/tauri.git
-          git -C "$tauri_source" fetch --depth=1 origin "$TAURI_APPIMAGE_CLI_REV"
-          fetched_rev=$(git -C "$tauri_source" rev-parse FETCH_HEAD)
-          if [ "$fetched_rev" != "$TAURI_APPIMAGE_CLI_REV" ]; then
-            echo "::error::Fetched Tauri AppImage CLI revision ${fetched_rev}, expected ${TAURI_APPIMAGE_CLI_REV}"
-            exit 1
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          marker="$cargo_bin/.cargo-tauri-cef-rev"
+          if [[ -x "$cargo_bin/cargo-tauri" && -f "$marker" && "$(cat "$marker")" == "$TAURI_CEF_CLI_REV" ]]; then
+            exit 0
           fi
-          git -C "$tauri_source" checkout -q --detach FETCH_HEAD
+          cargo install tauri-cli --git https://github.com/readest/tauri --rev "$TAURI_CEF_CLI_REV" --locked --force
+          printf '%s\n' "$TAURI_CEF_CLI_REV" > "$marker"
 
-          TAURI_SOURCE="$tauri_source" python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          path = (
-              Path(os.environ['TAURI_SOURCE'])
-              / 'crates/tauri-bundler/src/bundle/linux/appimage/sharun.rs'
-          )
-          text = path.read_text()
-          download_start = '''  let data = download(
-          '''
-          download_start_replacement = '''  if !quick_sharun.exists() {
-              let data = download(
-          '''
-          download_end = '''  write_and_make_executable(&quick_sharun, data)?;
-          '''
-          download_end_replacement = '''    write_and_make_executable(&quick_sharun, data)?;
-            }
-          '''
-          if text.count(download_start) != 1 or text.count(download_end) != 1:
-              raise SystemExit('Pinned Tauri AppImage helper download block changed unexpectedly')
-          text = text.replace(download_start, download_start_replacement)
-          text = text.replace(download_end, download_end_replacement)
-          path.write_text(text)
-          PY
-
-          grep -Fq 'if !quick_sharun.exists()' \
-            "$tauri_source/crates/tauri-bundler/src/bundle/linux/appimage/sharun.rs"
-          git -C "$tauri_source" diff --check
-          cargo install --path "$tauri_source/crates/tauri-cli" --locked --force
-
-      - name: Pin quick-sharun AppImage helper
+      - name: Stage CEF AppImage runtime libraries
         run: |
           set -euo pipefail
-          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
-          mkdir -p "$cache_dir"
-          curl -fsSL --retry 3 -o "$cache_dir/quick-sharun.sh" \
-            "https://github.com/pkgforge-dev/Anylinux-AppImages/raw/b3a9e985cdedf7efa81d172f182cd13983743147/useful-tools/quick-sharun.sh"
-          chmod +x "$cache_dir/quick-sharun.sh"
+          lib_dir="/usr/lib/$(gcc -print-multiarch)"
+          # quick-sharun finds NSS modules in the multiarch directory; Ubuntu installs them in nss/.
+          sudo cp -f --remove-destination "$lib_dir"/nss/*.so "$lib_dir/"
+          # Pass both libraries explicitly and keep the existing AppRun hook entry.
+          conf=apps/readest-app/src-tauri/tauri.conf.json
+          jq --arg d "$lib_dir" '.bundle.linux.appimage.files += {
+            "/usr/lib/libspeechd.so.2": ($d + "/libspeechd.so.2"),
+            "/usr/lib/libxkbcommon-x11.so.0": ($d + "/libxkbcommon-x11.so.0")
+          }' "$conf" > "$conf.tmp"
+          mv "$conf.tmp" "$conf"
 
       - name: Validate signing secrets
         env:
@@ -342,6 +319,9 @@ jobs:
         timeout-minutes: 45
         env:
           ASSET_ARCH: ${{ matrix.config.arch }}
+          TAURI_CEF_CARGO: '1'
+          # Avoid running the app under Xvfb while quick-sharun discovers libraries.
+          STRACE_MODE: '0'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -351,7 +331,7 @@ jobs:
           set -euo pipefail
           cd apps/readest-app
           pnpm patch-tauri-selfhost
-          cargo tauri build
+          pnpm tauri build
 
           version=$(node -p "require('./package.json').version")
           output_dir=dist/selfhost/linux
@@ -369,6 +349,12 @@ jobs:
             echo "::error::Expected one AppImage, DEB, and RPM for Linux ${ASSET_ARCH}; found ${#appimages[@]}, ${#debs[@]}, ${#rpms[@]}"
             exit 1
           fi
+
+          appimage_path=$(realpath "${appimages[0]}")
+          extract_dir=$(mktemp -d "$RUNNER_TEMP/selfhost-appimage.XXXXXX")
+          (cd "$extract_dir" && "$appimage_path" --appimage-extract > /dev/null)
+          bash "$GITHUB_WORKSPACE/scripts/verify-selfhost-linux-appimage.sh" \
+            "$extract_dir/squashfs-root" "$SELFHOST_PRODUCT_NAME"
 
           copy_signed() {
             local source="$1"
@@ -617,6 +603,7 @@ jobs:
 
       - name: Initialize signed Android project
         env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: |
           set -euo pipefail
@@ -625,68 +612,7 @@ jobs:
           pnpm patch-tauri-selfhost
           pnpm tauri android init
           pnpm tauri icon ../../data/icons/readest-book.png
-
-          pushd src-tauri/gen/android
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("app/build.gradle.kts")
-          text = path.read_text()
-
-          def find_block(source: str, marker: str) -> tuple[int, int, int]:
-              start = source.find(marker)
-              if start == -1:
-                  raise SystemExit(f"Expected Gradle block was not found: {marker}")
-              open_brace = source.find("{", start)
-              if open_brace == -1:
-                  raise SystemExit(f"Expected Gradle block opening brace was not found: {marker}")
-              depth = 0
-              for index in range(open_brace, len(source)):
-                  char = source[index]
-                  if char == "{":
-                      depth += 1
-                  elif char == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return start, open_brace, index
-              raise SystemExit(f"Expected Gradle block closing brace was not found: {marker}")
-
-          signing_config = '''
-                  create("selfhostRelease") {
-                      keyAlias = System.getenv("ANDROID_KEY_ALIAS")
-                      keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
-                      storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH") ?: error("ANDROID_KEYSTORE_PATH is required"))
-                      storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                  }
-          '''
-          if 'create("selfhostRelease")' not in text:
-              if "    signingConfigs {" in text:
-                  _, open_brace, _ = find_block(text, "    signingConfigs")
-                  text = text[: open_brace + 1] + signing_config + text[open_brace + 1 :]
-              else:
-                  signing_block = f"    signingConfigs {{{signing_config}    }}\n"
-                  build_types_index = text.find("    buildTypes {")
-                  if build_types_index == -1:
-                      raise SystemExit("Expected Android buildTypes block was not found")
-                  text = text[:build_types_index] + signing_block + text[build_types_index:]
-
-          release_assignment = '''
-                      signingConfig = signingConfigs.getByName("selfhostRelease")
-          '''
-          if 'signingConfigs.getByName("selfhostRelease")' not in text:
-              _, _, release_close = find_block(text, 'getByName("release")')
-              text = text[:release_close] + release_assignment + text[release_close:]
-
-          if 'missingDimensionStrategy("store", "foss")' not in text:
-              _, default_config_open, _ = find_block(text, "    defaultConfig")
-              dimension_strategy = '''
-                  missingDimensionStrategy("store", "foss")
-          '''
-              text = text[: default_config_open + 1] + dimension_strategy + text[default_config_open + 1 :]
-
-          path.write_text(text)
-          PY
-          popd
+          python3 ../../scripts/configure-selfhost-android-gradle.py src-tauri/gen/android/app/build.gradle.kts
 
       - name: Decode Android keystore
         env:
