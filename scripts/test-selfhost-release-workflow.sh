@@ -59,6 +59,38 @@ for filename in ('release-selfhost.yml', 'backfill-selfhost-releases.yml'):
     if re.findall(r'^  ([\w_]+):', events, re.M) != ['workflow_dispatch']:
         raise SystemExit(f'{filename} must only run on manual dispatch')
 
+release = Path('.github/workflows/release-selfhost.yml').read_text()
+errors = []
+# A run value ends at the next nonblank line at or above the run key's indentation.
+lines = release.splitlines()
+for index, line in enumerate(lines):
+    key = re.match(r' *(?:- +)?(run):', line)
+    if not key:
+        continue
+    script = [line[key.end():]]
+    for continuation in lines[index + 1:]:
+        if continuation.strip() and len(continuation) - len(continuation.lstrip(' ')) <= key.start(1):
+            break
+        script.append(continuation)
+    if any('${{' in part for part in script):
+        errors.append(f'release-selfhost.yml:{index + 1}: run steps must pass GitHub expressions through env')
+
+permissions = re.search(r'(?ms)^permissions:[ \t]*\n(.*?)(?=^\S|\Z)', release)
+if not permissions or permissions.group(1).strip() != 'contents: read':
+    errors.append('release-selfhost.yml must default to contents: read')
+
+job_permissions = {}
+jobs = release.split('\njobs:\n', 1)[1]
+for job_name, job in re.findall(r'(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', jobs):
+    grant = re.search(r'(?ms)^    permissions:(.*?)(?=^ {4}\S|\Z)', job)
+    if grant:
+        job_permissions[job_name] = grant.group(1).strip()
+if job_permissions != {'publish': 'contents: write'}:
+    errors.append('Only the publish job may override release-selfhost.yml permissions with contents: write')
+
+if errors:
+    raise SystemExit('\n'.join(errors))
+
 backfill = Path('.github/workflows/backfill-selfhost-releases.yml').read_text()
 if not re.search(r'^permissions:\n  contents: read\n\s*\njobs:', backfill, re.M):
     raise SystemExit('The backfill report must have read-only permissions')
