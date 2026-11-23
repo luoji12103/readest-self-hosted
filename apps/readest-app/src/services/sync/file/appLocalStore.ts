@@ -1,4 +1,5 @@
-import { AppService } from '@/types/system';
+import { Book } from '@/types/book';
+import { AppService, BaseDir } from '@/types/system';
 import { SystemSettings } from '@/types/settings';
 import { EnvConfigType } from '@/services/environment';
 import { useLibraryStore } from '@/store/libraryStore';
@@ -6,15 +7,54 @@ import { getCoverFilename, getLocalBookFilename } from '@/utils/book';
 import { LocalStore } from './localStore';
 
 /**
+ * Where this device's copy of the book actually is, or null when it holds none
+ * (the engine's `no-source` verdict). In-place imports keep their bytes outside
+ * `Books/<hash>/`, so `book.filePath` is a valid fallback — but only a fallback.
+ * The managed copy wins, exactly as `resolveBookContentSource` puts it:
+ * "book.filePath is device-local and can outlive a prior in-place/import mode".
+ *
+ * Preferring `filePath` blindly is what kept #5084 alive into #5265. A row
+ * poisoned by a pre-#5087 client carries a PEER's absolute path; probing only
+ * that path reports `no-source` for a book whose managed copy is sitting right
+ * there, so the engine never confirms the file on the remote and never stamps
+ * `uploadedAt` — leaving the row classified as a purely-local book, the state
+ * that turns "Remove from Device Only" into a cloud-and-device delete.
+ */
+const resolveLocalSource = async (
+  appService: AppService,
+  book: Book,
+): Promise<{ path: string; base: BaseDir } | null> => {
+  const managed = getLocalBookFilename(book);
+  if (await appService.exists(managed, 'Books')) return { path: managed, base: 'Books' };
+  if (book.filePath && (await appService.exists(book.filePath, 'None'))) {
+    return { path: book.filePath, base: 'None' };
+  }
+  return null;
+};
+
+// Cloud-shelf discovery prepares covers/configs concurrently, but library
+// persistence is a read-modify-write transaction. Serialize commits per app
+// service so two providers or two remote books cannot save L+A / L+B over each
+// other. Weak keys avoid retaining an app instance after its environment dies.
+const libraryAddQueues = new WeakMap<AppService, Promise<void>>();
+const serializeLibraryAdd = async (
+  appService: AppService,
+  work: () => Promise<void>,
+): Promise<void> => {
+  const queue = libraryAddQueues.get(appService) ?? Promise.resolve();
+  const run = queue.then(work, work);
+  libraryAddQueues.set(
+    appService,
+    run.catch(() => {}),
+  );
+  await run;
+};
+
+/**
  * The app-backed {@link LocalStore} used by every file-sync consumer (the
  * reader hook and the library "Sync now" form). Consolidating the buffered +
  * streaming book/cover loaders here is the whole reason the bridge exists:
  * the logic used to be copy-pasted across both consumers.
- *
- * In-place imports keep their bytes outside `Books/<hash>/`, so the book-file
- * helpers resolve to `(book.filePath, 'None')` when `filePath` is set and fall
- * through to the hash-copy `Books`-relative path otherwise — mirroring
- * `cloudService.uploadBook` so sync treats in-place books as first-class.
  */
 export const createAppLocalStore = ({
   appService,
@@ -29,18 +69,21 @@ export const createAppLocalStore = ({
   saveBookConfig: (book, config) => appService.saveBookConfig(book, config, settings),
 
   loadBookFile: async (book) => {
-    const fp = book.filePath ?? getLocalBookFilename(book);
-    const base = book.filePath ? 'None' : 'Books';
-    if (!(await appService.exists(fp, base))) return null;
-    const file = await appService.openFile(fp, base);
-    const bytes = await file.arrayBuffer();
-    return { bytes, size: bytes.byteLength };
+    const source = await resolveLocalSource(appService, book);
+    if (!source) return null;
+    const file = await appService.openFile(source.path, source.base);
+    try {
+      const bytes = await file.arrayBuffer();
+      return { bytes, size: bytes.byteLength };
+    } finally {
+      await (file as File & { close?: () => Promise<void> }).close?.();
+    }
   },
 
   resolveLocalBookPath: async (book) => {
-    const fp = book.filePath ?? getLocalBookFilename(book);
-    const base = book.filePath ? 'None' : 'Books';
-    if (!(await appService.exists(fp, base))) return null;
+    const source = await resolveLocalSource(appService, book);
+    if (!source) return null;
+    const { path: fp, base } = source;
     const file = await appService.openFile(fp, base);
     const size = file.size;
     // Release the FD before streaming so the Tauri side can re-open the path
@@ -72,8 +115,12 @@ export const createAppLocalStore = ({
     const fp = getCoverFilename(book);
     if (!(await appService.exists(fp, 'Books'))) return null;
     const file = await appService.openFile(fp, 'Books');
-    const bytes = await file.arrayBuffer();
-    return { bytes, size: bytes.byteLength };
+    try {
+      const bytes = await file.arrayBuffer();
+      return { bytes, size: bytes.byteLength };
+    } finally {
+      await (file as File & { close?: () => Promise<void> }).close?.();
+    }
   },
 
   saveBookCover: async (book, bytes) => {
@@ -90,25 +137,46 @@ export const createAppLocalStore = ({
       book.coverImageUrl = null;
     }
     book.syncedAt = Date.now();
-    book.downloadedAt = Date.now();
+    // The caller owns file availability. Library discovery deliberately adds
+    // cloud-shelf rows with `downloadedAt: null`; stamping them here would turn
+    // metadata-only sync back into a false claim that the EPUB/PDF is on disk.
     if (!book.metaHash) book.metaHash = book.hash;
-    // Hydrate from disk if the store hasn't loaded yet. Merging against an
-    // empty in-memory array would persist this book as the *entire* library
-    // and clobber whatever is on disk. Mirrors useLibraryStore.updateBooks'
-    // hardening; the Sync-now caller also hydrates up front, so this is
-    // belt-and-suspenders for a data-loss path.
-    let library = useLibraryStore.getState().library;
-    if (!useLibraryStore.getState().libraryLoaded) {
-      library = await appService.loadLibraryBooks();
-      useLibraryStore.getState().setLibrary(library);
-    }
-    // Avoid duplicates if the user runs Sync now twice quickly.
-    if (library.find((b) => b.hash === book.hash)) return;
-    const newLibrary = [...library, book];
-    await appService.saveLibraryBooks(newLibrary);
-    // Update the store last so subscribers re-render against a library that's
-    // already persisted on disk.
-    useLibraryStore.getState().setLibrary(newLibrary);
+    await serializeLibraryAdd(appService, async () => {
+      // Hydrate from disk if the store hasn't loaded yet. Merging against an
+      // empty in-memory array would persist this book as the *entire* library
+      // and clobber whatever is on disk. Mirrors useLibraryStore.updateBooks'
+      // hardening; the Sync-now caller also hydrates up front, so this is
+      // belt-and-suspenders for a data-loss path.
+      let library = useLibraryStore.getState().library;
+      if (!useLibraryStore.getState().libraryLoaded) {
+        library = await appService.loadLibraryBooks();
+        useLibraryStore.getState().setLibrary(library);
+      }
+
+      const existingIndex = library.findIndex((candidate) => candidate.hash === book.hash);
+      if (existingIndex >= 0) {
+        const existing = library[existingIndex]!;
+        // A newer live remote row is a re-import/revival of this hash. Replace
+        // the older tombstone with the metadata-only row; every other duplicate
+        // remains an idempotent no-op.
+        if (
+          !existing.deletedAt ||
+          book.deletedAt ||
+          (book.updatedAt ?? 0) <= (existing.deletedAt ?? 0)
+        ) {
+          return;
+        }
+      }
+
+      const newLibrary =
+        existingIndex >= 0
+          ? [...library.slice(0, existingIndex), book, ...library.slice(existingIndex + 1)]
+          : [...library, book];
+      await appService.saveLibraryBooks(newLibrary);
+      // Update the store last so subscribers re-render against a library that's
+      // already persisted on disk.
+      useLibraryStore.getState().setLibrary(newLibrary);
+    });
   },
 
   updateBookMetadata: async (book) => {

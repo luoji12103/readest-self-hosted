@@ -1,3 +1,5 @@
+import { getPdfTextFromRange, getPdfTextLayer } from '@/utils/pdfText';
+
 export interface Frame {
   top: number;
   left: number;
@@ -22,6 +24,14 @@ export interface Position {
   dir?: PositionDir;
 }
 
+// One section's part of a selection that runs across section documents (a PDF
+// selection continued onto the next page, #5809).
+export interface SelectionSegment {
+  range: Range;
+  index: number;
+  text: string;
+}
+
 export interface TextSelection {
   key: string;
   text: string;
@@ -32,9 +42,26 @@ export interface TextSelection {
   href?: string;
   annotated?: boolean;
   rect?: Rect;
+  // Present when the selection spans several section documents, in reading
+  // order. `range`/`index`/`cfi` are the first segment's and `text` is all
+  // segments' text joined, so single-range consumers keep working.
+  segments?: SelectionSegment[];
   // Native Android selection handles were suppressed for this selection
   // (Blink hyphen bounds bug, issue #1553) — the app draws its own handles.
   handlesSuppressed?: boolean;
+  // The instant quick action has already run on this selection (#6213): the
+  // dictionary lookup consumed it and handed it back when it closed. Set so the
+  // republishes that follow — a highlight stamping `annotated`, say — are not
+  // read as a fresh selection and answered with the quick action all over again.
+  quickActionHandled?: boolean;
+  // Selection made inside the footnote/annotation popup window rather than a
+  // main book document. `cfi` (when present) already points into the pristine
+  // section document; tools that need a live main-document range or that
+  // cannot work without a CFI must be disabled accordingly.
+  popup?: boolean;
+  // Maps a range in the popup's document to a CFI in the pristine section, so
+  // a popup highlight can be re-anchored when its range handles move (#6390).
+  getPopupCfi?: (range: Range) => string | undefined;
 }
 
 const frameRect = (frame: Frame, rect?: Rect, sx = 1, sy = 1) => {
@@ -219,22 +246,20 @@ export const isPointerInsideSelection = (selection: Selection, ev: PointerEvent)
   return false;
 };
 
-export const getPosition = (
-  targetElement: Range | Element | TextSelection,
-  rect: Rect,
-  paddingPx: number,
-  isVertical: boolean = false,
-) => {
-  const { range: target, rect: targetRect } =
-    targetElement && 'range' in targetElement
-      ? targetElement
-      : { range: targetElement, rect: undefined };
+// The iframe rect and CSS transform scale that map a target's client rects
+// into the outer webview's coordinate system.
+const getFrameTransform = (target: Range | Element) => {
   const frameElement = getIframeElement(target);
   const transform = frameElement ? getComputedStyle(frameElement).transform : '';
   const match = transform.match(/matrix\((.+)\)/);
   const [sx, , , sy] = match?.[1]?.split(/\s*,\s*/)?.map((x) => parseFloat(x)) ?? [];
-
   const frame = frameElement?.getBoundingClientRect() ?? { top: 0, left: 0 };
+  return { frame, sx, sy };
+};
+
+// A target's line rects in webview coordinates (an element's padding excluded).
+const getWebviewRects = (target: Range | Element): Rect[] => {
+  const { frame, sx, sy } = getFrameTransform(target);
   let padding = { top: 0, right: 0, bottom: 0, left: 0 };
   if ('nodeType' in target && target.nodeType === 1) {
     const computedStyle = window.getComputedStyle(target);
@@ -245,25 +270,56 @@ export const getPosition = (
       left: parseInt(computedStyle.paddingLeft, 10) || 0,
     };
   }
-  const rects = Array.from(target.getClientRects()).map((rect) => {
-    return {
-      top: rect.top + padding.top,
-      right: rect.right - padding.right,
-      bottom: rect.bottom - padding.bottom,
-      left: rect.left + padding.left,
-    };
-  });
-  const first = targetRect
-    ? frameRect(frame, targetRect, sx, sy)
-    : frameRect(frame, rects[0], sx, sy);
-  const last = targetRect
-    ? frameRect(frame, targetRect, sx, sy)
-    : frameRect(frame, rects.at(-1), sx, sy);
+  return Array.from(target.getClientRects()).map((rect) =>
+    frameRect(
+      frame,
+      {
+        top: rect.top + padding.top,
+        right: rect.right - padding.right,
+        bottom: rect.bottom - padding.bottom,
+        left: rect.left + padding.left,
+      },
+      sx,
+      sy,
+    ),
+  );
+};
+
+export const getPosition = (
+  targetElement: Range | Element | TextSelection,
+  rect: Rect,
+  paddingPx: number,
+  isVertical: boolean = false,
+  // A side already taken by another popup at the same spot (#6390): the
+  // footnote popup a tap on a highlighted link opens along with the toolbar.
+  avoidDir: Position['dir'] | null = null,
+) => {
+  const {
+    range: target,
+    rect: targetRect,
+    segments,
+  } = targetElement && 'range' in targetElement
+    ? targetElement
+    : { range: targetElement, rect: undefined, segments: undefined };
+  // A selection across section documents: its rects span several iframes, so
+  // gather them per segment (each in its own frame) in reading order.
+  const ranges = segments && segments.length > 1 ? segments.map((s) => s.range) : [target];
+  let rects: Rect[];
+  if (targetRect) {
+    const { frame, sx, sy } = getFrameTransform(target);
+    rects = [frameRect(frame, targetRect, sx, sy)];
+  } else {
+    rects = ranges.flatMap(getWebviewRects);
+  }
+  const zero = { left: 0, right: 0, top: 0, bottom: 0 };
+  const first = rects[0] ?? zero;
+  const last = rects.at(-1) ?? zero;
 
   if (isVertical) {
     const leftSpace = first.left - rect.left;
     const rightSpace = rect.right - first.right;
-    const dir = leftSpace > rightSpace ? 'left' : 'right';
+    const roomier = leftSpace > rightSpace ? 'left' : 'right';
+    const dir = roomier === avoidDir ? (roomier === 'left' ? 'right' : 'left') : roomier;
     const position = {
       point: constrainPointWithinRect(
         {
@@ -310,10 +366,7 @@ export const getPosition = (
     // Multi-page selection: both ends are off the visible page, but the middle
     // may cross it. Anchor to the last on-screen line so the popup tracks the
     // visible part of the selection.
-    const v = rects
-      .map((r) => frameRect(frame, r, sx, sy))
-      .filter((r) => inFrame(midX(r), midY(r)))
-      .at(-1);
+    const v = rects.filter((r) => inFrame(midX(r), midY(r))).at(-1);
     if (v) {
       return {
         point: constrainPointWithinRect(
@@ -329,7 +382,43 @@ export const getPosition = (
   }
   if (!startInView) return end;
   if (!endInView) return start;
+  if (avoidDir === 'down') return start;
+  if (avoidDir === 'up') return end;
   return start.point.y > window.innerHeight - end.point.y ? start : end;
+};
+
+// Whether a popup `sizePx` deep fits beyond the triangle on its side, within
+// the book cell (`rect`) and its padding.
+export const hasRoomFor = (position: Position, rect: Rect, sizePx: number, paddingPx: number) => {
+  const { point, dir } = position;
+  const room =
+    dir === 'up'
+      ? point.y
+      : dir === 'down'
+        ? rect.bottom - rect.top - point.y
+        : dir === 'left'
+          ? point.x
+          : rect.right - rect.left - point.x;
+  return room >= sizePx + paddingPx;
+};
+
+// Where the highlight toolbar goes when the footnote popup has taken
+// `avoidDir` at the same word (#6390): the free side when it lands there with
+// room to spare, otherwise the popup's side (`shared`), where the popup is to
+// open beyond it. `place` anchors the toolbar, avoiding the side it is given.
+export const placeToolbar = (
+  place: (avoidDir: Position['dir'] | null) => Position,
+  avoidDir: Position['dir'] | null,
+  rect: Rect,
+  sizePx: number,
+  paddingPx: number,
+) => {
+  if (!avoidDir) return { position: place(null), shared: false };
+  const free = place(avoidDir);
+  if (free.dir !== avoidDir && hasRoomFor(free, rect, sizePx, paddingPx)) {
+    return { position: free, shared: false };
+  }
+  return { position: free.dir === avoidDir ? free : place(null), shared: true };
 };
 
 // The popup will be positioned based on the triangle position and the direction
@@ -428,6 +517,76 @@ export const extendSelectionFromContents = (
   return false;
 };
 
+// Vim visual-mode motions (#7281): move the selection's moving end (its focus)
+// the way vim moves the cursor. Directions are logical, so RTL text follows.
+type Direction = 'forward' | 'backward';
+const VIM_MOTIONS: Record<string, [Direction, string]> = {
+  h: ['backward', 'character'],
+  l: ['forward', 'character'],
+  b: ['backward', 'word'],
+  j: ['forward', 'line'],
+  k: ['backward', 'line'],
+  $: ['forward', 'lineboundary'],
+  '(': ['backward', 'sentence'],
+  ')': ['forward', 'sentence'],
+};
+
+const isSpaceAtFocus = (sel: Selection, dir: Direction) => {
+  const node = sel.focusNode;
+  if (node?.nodeType !== Node.TEXT_NODE) return false;
+  const text = node.textContent ?? '';
+  const ch = dir === 'forward' ? text[sel.focusOffset] : text[sel.focusOffset - 1];
+  return !!ch && /\s/.test(ch);
+};
+
+const skipSpaces = (sel: Selection, dir: Direction) => {
+  while (isSpaceAtFocus(sel, dir)) {
+    const { focusNode, focusOffset } = sel;
+    sel.modify('extend', dir, 'character');
+    if (sel.focusNode === focusNode && sel.focusOffset === focusOffset) return;
+  }
+};
+
+export const applyVimMotion = (sel: Selection, key: string): boolean => {
+  if (key === 'o') {
+    const { anchorNode, anchorOffset, focusNode, focusOffset } = sel;
+    if (!anchorNode || !focusNode) return false;
+    sel.setBaseAndExtent(focusNode, focusOffset, anchorNode, anchorOffset);
+  } else if (key === 'w') {
+    // Start of the next word. A forward word step lands on the word's end on
+    // macOS and past the next space on Windows; skipping spaces evens them out.
+    if (!isSpaceAtFocus(sel, 'forward')) sel.modify('extend', 'forward', 'word');
+    skipSpaces(sel, 'forward');
+  } else if (key === 'e') {
+    // End of the next word, without the space Windows' word step takes along.
+    skipSpaces(sel, 'forward');
+    sel.modify('extend', 'forward', 'word');
+    skipSpaces(sel, 'backward');
+  } else if (key === '}') {
+    // End of the paragraph, then the next one on a repeat. Chromium's
+    // `paragraph` step keeps the caret's x like a line step, so step over the
+    // edge and go to the boundary instead.
+    sel.modify('extend', 'forward', 'character');
+    sel.modify('extend', 'forward', 'paragraphboundary');
+  } else if (key === '0' || key === '{') {
+    // Start of the line, or of the paragraph (the one before on a repeat).
+    // Chromium won't extend a forward selection back to a boundary, so move a
+    // collapsed caret there and re-extend from the anchor.
+    const { anchorNode, anchorOffset, focusNode } = sel;
+    if (!anchorNode || !focusNode) return false;
+    sel.collapse(focusNode, sel.focusOffset);
+    if (key === '{') sel.modify('move', 'backward', 'character');
+    sel.modify('move', 'backward', key === '0' ? 'lineboundary' : 'paragraphboundary');
+    if (!sel.focusNode) return false;
+    sel.setBaseAndExtent(anchorNode, anchorOffset, sel.focusNode, sel.focusOffset);
+  } else {
+    const motion = VIM_MOTIONS[key];
+    if (!motion) return false;
+    sel.modify('extend', motion[0], motion[1]);
+  }
+  return true;
+};
+
 export const snapRangeToWords = (range: Range): void => {
   if (typeof Intl === 'undefined' || !Intl.Segmenter) return;
 
@@ -509,7 +668,11 @@ export const getWordRangeAt = (node: Node, offset: number): Range | null => {
 
 // The word range under a point (in `doc` viewport coordinates), like a native
 // double-click. Returns null when the point isn't on word-like text.
-export const getWordRangeFromPoint = (doc: Document, x: number, y: number): Range | null => {
+export const getCaretPointFromPoint = (
+  doc: Document,
+  x: number,
+  y: number,
+): { node: Node; offset: number } | null => {
   let node: Node | null = null;
   let offset = 0;
   if (doc.caretPositionFromPoint) {
@@ -526,7 +689,167 @@ export const getWordRangeFromPoint = (doc: Document, x: number, y: number): Rang
     }
   }
   if (!node) return null;
-  return getWordRangeAt(node, offset);
+  return { node, offset };
+};
+
+export const getWordRangeFromPoint = (doc: Document, x: number, y: number): Range | null => {
+  const point = getCaretPointFromPoint(doc, x, y);
+  return point ? getWordRangeAt(point.node, point.offset) : null;
+};
+
+interface SelectedTextSlice {
+  node: Text;
+  start: number;
+  end: number;
+}
+
+const getSelectedTextSlices = (range: Range): SelectedTextSlice[] => {
+  const root = range.commonAncestorContainer;
+  const textNodes: Text[] = [];
+  if (root.nodeType === Node.TEXT_NODE) {
+    textNodes.push(root as Text);
+  } else {
+    const walker = root.ownerDocument?.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    if (!walker) return [];
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      if (range.intersectsNode(node)) textNodes.push(node as Text);
+    }
+  }
+
+  return textNodes
+    .map((node) => ({
+      node,
+      start: node === range.startContainer ? range.startOffset : 0,
+      end: node === range.endContainer ? range.endOffset : node.data.length,
+    }))
+    .filter(({ start, end }) => end > start);
+};
+
+// Restrict a captured Range snapshot to the non-whitespace segment under the
+// click. This corrects engines that treat NBSP-like separators as part of one
+// word while preserving their punctuation, hyphen, and language rules. Do not
+// pass the live Range associated with Selection: changing it rewrites the
+// browser selection and can disturb native touch handles. The selected segment
+// may span inline DOM nodes.
+export const trimRangeWhitespaceAroundPoint = (
+  range: Range,
+  pointNode: Node,
+  pointOffset: number,
+): boolean => {
+  const slices = getSelectedTextSlices(range);
+  const text = slices.map(({ node, start, end }) => node.data.slice(start, end)).join('');
+  if (!text || text !== range.toString() || !/\s/u.test(text)) return false;
+
+  let caretOffset: number | null = null;
+  let consumed = 0;
+  for (const slice of slices) {
+    const length = slice.end - slice.start;
+    if (slice.node === pointNode && pointOffset >= slice.start && pointOffset <= slice.end) {
+      caretOffset = consumed + pointOffset - slice.start;
+      break;
+    }
+    consumed += length;
+  }
+  if (caretOffset === null) return false;
+
+  const isWhitespace = (char: string): boolean => /\s/u.test(char);
+  let pivot: number;
+  if (caretOffset < text.length && !isWhitespace(text[caretOffset]!)) {
+    pivot = caretOffset;
+  } else if (caretOffset > 0 && !isWhitespace(text[caretOffset - 1]!)) {
+    pivot = caretOffset - 1;
+  } else {
+    return false;
+  }
+
+  let segmentStart = pivot;
+  while (segmentStart > 0 && !isWhitespace(text[segmentStart - 1]!)) segmentStart--;
+  let segmentEnd = pivot + 1;
+  while (segmentEnd < text.length && !isWhitespace(text[segmentEnd]!)) segmentEnd++;
+  if (segmentStart === 0 && segmentEnd === text.length) return false;
+
+  const boundaryAt = (target: number, side: 'start' | 'end') => {
+    let offset = 0;
+    for (const slice of slices) {
+      const length = slice.end - slice.start;
+      const nextOffset = offset + length;
+      if (target < nextOffset || (side === 'end' && target === nextOffset)) {
+        return { node: slice.node, offset: slice.start + target - offset };
+      }
+      offset = nextOffset;
+    }
+    return null;
+  };
+
+  const start = boundaryAt(segmentStart, 'start');
+  const end = boundaryAt(segmentEnd, 'end');
+  if (!start || !end) return false;
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset);
+  return true;
+};
+
+// A footnote marker right after a word joins it in a native word selection
+// (letters followed by digits make one word), so a double-click or long-press
+// on "fox¹" picked "fox1" (#6803). Markers are a noteref link or a superscript
+// or link holding only a marker, as Read Aloud skips them.
+const NOTE_MARKER_TEXT = /^\s*[[(]?[*\d\u2020\u2021\u00a7]+[)\]]?\s*$/;
+
+const isNoteMarker = (el: Element): boolean => {
+  if (!NOTE_MARKER_TEXT.test(el.textContent ?? '')) return false;
+  const type = el.getAttribute('epub:type') ?? '';
+  return (
+    el.localName === 'sup' ||
+    (el.localName === 'a' && el.hasAttribute('href')) ||
+    /\bnoteref\b/.test(type) ||
+    el.getAttribute('role') === 'doc-noteref'
+  );
+};
+
+const outermostNoteMarker = (node: Node): Element | null => {
+  let marker: Element | null = null;
+  for (
+    let el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+    el;
+    el = el.parentElement
+  ) {
+    if (isNoteMarker(el)) marker = el;
+    else if (marker) break;
+  }
+  return marker;
+};
+
+const markerAtBoundary = (container: Node, offset: number, side: 'start' | 'end') => {
+  if (container.nodeType === Node.ELEMENT_NODE) {
+    const child = container.childNodes[side === 'end' ? offset - 1 : offset];
+    return child?.nodeType === Node.ELEMENT_NODE && isNoteMarker(child as Element)
+      ? (child as Element)
+      : null;
+  }
+  return outermostNoteMarker(container);
+};
+
+// Drop a footnote marker from either end of a word selection. Only for a
+// captured Range snapshot (see trimRangeWhitespaceAroundPoint); a selection
+// that is nothing but the marker is left as it is.
+export const trimNoteMarkersFromWordRange = (range: Range): boolean => {
+  const trimmed = range.cloneRange();
+  let changed = false;
+  const endMarker = markerAtBoundary(range.endContainer, range.endOffset, 'end');
+  if (endMarker && !endMarker.contains(range.startContainer)) {
+    trimmed.setEndBefore(endMarker);
+    changed = true;
+  }
+  const startMarker = markerAtBoundary(range.startContainer, range.startOffset, 'start');
+  if (startMarker && !startMarker.contains(range.endContainer)) {
+    trimmed.setStartAfter(startMarker);
+    changed = true;
+  }
+  if (!changed || trimmed.collapsed || !trimmed.toString().trim()) return false;
+  range.setStart(trimmed.startContainer, trimmed.startOffset);
+  range.setEnd(trimmed.endContainer, trimmed.endOffset);
+  return true;
 };
 
 // --- Android hyphenation selection-bounds bug (issue #1553) -----------------
@@ -773,6 +1096,11 @@ export const repairJumpedSelectionRange = (
 };
 
 export const getTextFromRange = (range: Range, rejectTags: string[] = []): string => {
+  // pdf.js breaks every printed line with a <br>; rebuild paragraphs from the
+  // page geometry instead of emitting one line per line (#5814).
+  const textLayer = getPdfTextLayer(range);
+  if (textLayer) return getPdfTextFromRange(range, textLayer);
+
   const clonedRange = range.cloneRange();
   const fragment = clonedRange.cloneContents();
   const walker = document.createTreeWalker(
@@ -808,3 +1136,108 @@ export const getTextFromRange = (range: Range, rejectTags: string[] = []): strin
 
   return text;
 };
+
+const BLOCK_DISPLAY = /^(block|flex|grid|flow-root|list-item|table)/;
+
+export interface TextRun {
+  text: string;
+  bold: boolean;
+  italic: boolean;
+}
+
+const isBoldWeight = (weight: string) =>
+  weight === 'bold' || weight === 'bolder' || Number.parseInt(weight, 10) >= 600;
+
+// The selection as the reader sees it, for quote cards (#5830), as runs of
+// bold / italic text: whitespace collapsed the way CSS does, nodes hidden with
+// display: none (a toggled-off translation) and ruby annotations skipped, and a
+// line break at each block boundary or <br>. getTextFromRange keeps raw
+// text-node values, whose source-formatting newlines would read as paragraph
+// breaks.
+export const getRenderedRunsFromRange = (range: Range): TextRun[] => {
+  const doc = range.startContainer.ownerDocument;
+  const win = doc?.defaultView;
+  if (!doc || !win || getPdfTextLayer(range)) {
+    return [{ text: getTextFromRange(range, ['rt']), bold: false, italic: false }];
+  }
+
+  const styleOf = (el: Element) => win.getComputedStyle(el);
+  const blockOf = (node: Node) => {
+    let el = node.parentElement;
+    while (el && !BLOCK_DISPLAY.test(styleOf(el).display)) el = el.parentElement;
+    return el;
+  };
+
+  const runs: TextRun[] = [];
+  let text = '';
+  const append = (value: string, bold: boolean, italic: boolean) => {
+    if (!value) return;
+    text += value;
+    const last = runs.at(-1);
+    if (last && last.bold === bold && last.italic === italic) last.text += value;
+    else runs.push({ text: value, bold, italic });
+  };
+  const lineBreak = () => {
+    const last = runs.at(-1);
+    if (!last) return;
+    const trimmed = last.text.trimEnd();
+    text = text.slice(0, text.length - (last.text.length - trimmed.length)) + '\n';
+    last.text = `${trimmed}\n`;
+  };
+
+  let lastBlock: Element | null | undefined;
+  const addText = (node: Text) => {
+    const parent = node.parentElement;
+    const style = parent ? styleOf(parent) : null;
+    if (style?.visibility === 'hidden') return;
+    const raw = node.nodeValue ?? '';
+    const start = node === range.startContainer ? range.startOffset : 0;
+    const end = node === range.endContainer ? range.endOffset : raw.length;
+    let value = raw.slice(start, end);
+    const block = blockOf(node);
+    if (lastBlock !== undefined && block !== lastBlock && text && !text.endsWith('\n')) {
+      lineBreak();
+    }
+    lastBlock = block;
+    if (!parent?.closest('pre') && !style?.whiteSpace.startsWith('pre')) {
+      value = value.replace(/[\t\n\r ]+/g, ' ');
+      if (!text || /[ \n]$/.test(text)) value = value.replace(/^ /, '');
+    }
+    append(
+      value,
+      !!style && isBoldWeight(style.fontWeight),
+      !!style && /italic|oblique/.test(style.fontStyle),
+    );
+  };
+
+  const root = range.commonAncestorContainer;
+  if (root.nodeType === Node.TEXT_NODE) {
+    addText(root as Text);
+    return runs;
+  }
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => {
+      if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element;
+        if (/^(rt|rp)$/i.test(el.tagName) || styleOf(el).display === 'none') {
+          return NodeFilter.FILTER_REJECT;
+        }
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.TEXT_NODE) addText(node as Text);
+    else if ((node as Element).tagName.toLowerCase() === 'br') {
+      const last = runs.at(-1);
+      append('\n', last?.bold ?? false, last?.italic ?? false);
+    }
+  }
+  return runs;
+};
+
+export const getRenderedTextFromRange = (range: Range): string =>
+  getRenderedRunsFromRange(range)
+    .map((run) => run.text)
+    .join('');

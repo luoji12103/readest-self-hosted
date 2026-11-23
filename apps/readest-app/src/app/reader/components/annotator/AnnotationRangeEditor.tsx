@@ -34,6 +34,7 @@ export const Handle: React.FC<HandleProps> = ({
   onDragEnd,
 }) => {
   const isDragging = useRef(false);
+  const dragOffsetRef = useRef<Point>({ x: 0, y: 0 });
   const size = useResponsiveSize(24);
   const circleRadius = useResponsiveSize(8);
   const stemHeight = useResponsiveSize(12);
@@ -43,10 +44,15 @@ export const Handle: React.FC<HandleProps> = ({
       e.preventDefault();
       e.stopPropagation();
       isDragging.current = true;
+      // Record offset between pointer position and text boundary position to avoid bulb jumping:
+      dragOffsetRef.current = {
+        x: e.clientX - position.x,
+        y: e.clientY - position.y,
+      };
       onDragStart(e.pointerType);
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
     },
-    [onDragStart],
+    [onDragStart, position.x, position.y],
   );
 
   const handlePointerMove = useCallback(
@@ -54,7 +60,10 @@ export const Handle: React.FC<HandleProps> = ({
       if (!isDragging.current) return;
       e.preventDefault();
       e.stopPropagation();
-      onDrag({ x: e.clientX, y: e.clientY });
+      onDrag({
+        x: e.clientX - dragOffsetRef.current.x,
+        y: e.clientY - dragOffsetRef.current.y,
+      });
     },
     [onDrag],
   );
@@ -73,6 +82,7 @@ export const Handle: React.FC<HandleProps> = ({
 
   return (
     <div
+      data-testid='selection-handle'
       className={clsx(
         'pointer-events-auto absolute z-50 cursor-grab touch-none active:cursor-grabbing',
         hidden && 'hidden',
@@ -102,7 +112,13 @@ export const Handle: React.FC<HandleProps> = ({
         width={size}
         height={size + stemHeight}
         viewBox={`0 0 ${size} ${size + stemHeight}`}
-        className={clsx(type === 'start' && 'rotate-180')}
+        // NOTE: no `rotate-*` utility here. Tailwind v4 emits those as the
+        // standalone `rotate` property, which COMPOSES with `transform`
+        // instead of being overridden by it (v3 folded it into `transform`
+        // via --tw-rotate). A `rotate-180` alongside this transform added a
+        // half turn to every start handle: 180+180 = 0 horizontally and
+        // 180+270 = 90 vertically, both leaving the start ball on the same
+        // side as the end ball instead of mirroring it.
         style={{
           transform: isVertical
             ? type === 'start'
@@ -167,7 +183,7 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
   const isEink = settings.globalViewSettings.isEink;
   const einkFgColor = isDarkMode ? '#ffffff' : '#000000';
   const { handlePositions, getHandlePositionsFromRange, applyAnnotationRange } =
-    useAnnotationEditor({ bookKey, annotation, getAnnotationText, setSelection });
+    useAnnotationEditor({ bookKey, annotation, selection, getAnnotationText, setSelection });
 
   const handleColorHex = getHighlightColorHex(settings, handleColor) ?? '#FFFF00';
   const draggingRef = useRef<'start' | 'end' | null>(null);
@@ -225,12 +241,13 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
       const win = doc?.defaultView;
       if (!doc || !win) return;
       const feRect = win.frameElement?.getBoundingClientRect();
+      const yBias = isVertical ? 0 : draggingRef.current === 'start' ? 2 : -2;
       const built = rangeFromAnchorToPoint(
         doc,
         anchor.node,
         anchor.offset,
         point.x - (feRect?.left ?? 0),
-        point.y - (feRect?.top ?? 0),
+        point.y - (feRect?.top ?? 0) + yBias,
       );
       if (!built) return;
       lastBuiltRef.current = { range: built, index: selection.index };
@@ -323,7 +340,14 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
   const showLoupe = appService?.isMobile && !viewSettings?.isEink && !viewSettings?.vertical;
 
   return (
-    <div className='pointer-events-none fixed inset-0 z-50'>
+    // The handle layer sits BELOW the popup/sheet layer. Both used to be z-50
+    // in the same stacking context, so the tie broke on DOM order — and the
+    // range editors are rendered after the popups, which put their handles on
+    // top of the dictionary, the translator and the note editor sheet. z-[44]
+    // keeps them over the book and the paragraph/TTS chrome (z-40) while
+    // leaving the popups (z-50), dialogs (z-50) and the side panels' overlay
+    // (z-[45]) above them.
+    <div className='pointer-events-none fixed inset-0 z-[44]'>
       <Handle
         hidden={activeHandle === 'end' || loupeDragPoint !== null}
         position={currentStart}

@@ -1,0 +1,535 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { cleanup, renderHook } from '@testing-library/react';
+
+// readest/readest issues #6558, #6562, #6563: a desktop right-click on an image
+// opens Readest's own image menu (Copy Image / Save Image) instead of the
+// webview's, whose items differ per engine and include a useless "Copy image
+// address" for the blob URL. EPUB and PDF behave the same: a PDF page is a
+// canvas under its text layer, so foliate-js finds its images by position.
+
+const h = vi.hoisted(() => ({
+  view: {
+    next: vi.fn(),
+    prev: vi.fn(),
+    deselect: vi.fn(),
+    getCFI: vi.fn(() => 'cfi'),
+    renderer: { containerPosition: 100, scrollLocked: false },
+  },
+  appService: { isAndroidApp: false, isMobile: false } as Record<string, boolean>,
+  osPlatform: 'macos',
+  textAtPoint: false,
+  viewSettings: { scrolled: false } as { scrolled: boolean; vertical?: boolean },
+  dispatch: vi.fn(),
+}));
+
+vi.mock('@/context/EnvContext', () => ({
+  useEnv: () => ({ appService: h.appService }),
+}));
+vi.mock('@/store/readerStore', () => ({
+  useReaderStore: () => ({
+    getView: () => h.view,
+    getViewSettings: () => h.viewSettings,
+    getProgress: () => null,
+  }),
+}));
+vi.mock('@/store/bookDataStore', () => ({
+  useBookDataStore: () => ({ getBookData: () => ({}) }),
+}));
+vi.mock('@/utils/event', () => ({
+  eventDispatcher: {
+    onSync: vi.fn(),
+    offSync: vi.fn(),
+    on: vi.fn(),
+    off: vi.fn(),
+    dispatch: h.dispatch,
+  },
+}));
+vi.mock('@/app/reader/hooks/useInstantAnnotation', () => ({
+  useInstantAnnotation: () => ({
+    isInstantAnnotationEnabled: () => false,
+    handleInstantAnnotationPointerDown: vi.fn(() => true),
+    handleInstantAnnotationPointerMove: vi.fn(() => true),
+    handleInstantAnnotationPointerCancel: vi.fn(),
+    handleInstantAnnotationPointerUp: vi.fn(async () => false),
+    reapplyInstantAnnotation: vi.fn(),
+    cancelInstantAnnotation: vi.fn(),
+  }),
+}));
+vi.mock('@/utils/misc', async (importActual) => {
+  const actual = await importActual<typeof import('@/utils/misc')>();
+  return { ...actual, getOSPlatform: () => h.osPlatform };
+});
+
+vi.mock('@/app/reader/utils/crossDocSelection', async (importActual) => {
+  const actual = await importActual<typeof import('@/app/reader/utils/crossDocSelection')>();
+  return { ...actual, isTextAtPoint: () => h.textAtPoint };
+});
+
+import { useTextSelector } from '@/app/reader/hooks/useTextSelector';
+import type { TextSelection } from '@/utils/sel';
+
+const ZERO_INSETS = { top: 0, right: 0, bottom: 0, left: 0 };
+
+const setup = (setSelection: (s: TextSelection | null) => void) => {
+  const noop = vi.fn();
+  return renderHook(() =>
+    useTextSelector(
+      'book-1',
+      ZERO_INSETS,
+      setSelection as React.Dispatch<React.SetStateAction<TextSelection | null>>,
+      noop,
+      noop,
+      // getAnnotationText: return the range text so we can assert the selected word
+      vi.fn(async (range: Range) => range.toString()),
+      noop,
+    ),
+  );
+};
+
+const rightClick = (target: Element, x = 50, y = 50, pointerType = 'mouse') => {
+  const event = new MouseEvent('contextmenu', {
+    bubbles: true,
+    cancelable: true,
+    clientX: x,
+    clientY: y,
+  });
+  Object.defineProperty(event, 'pointerType', { value: pointerType });
+  target.dispatchEvent(event);
+  return event;
+};
+
+type ImageMenu = { bookKey: string; getImage: () => Promise<Blob>; x: number; y: number };
+const imageMenus = () =>
+  h.dispatch.mock.calls
+    .filter(([name]) => name === 'image-context-menu')
+    .map(([, detail]) => detail as ImageMenu);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  h.appService = { isAndroidApp: false, isMobile: false };
+  h.textAtPoint = false;
+  h.osPlatform = 'macos';
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  document.body.innerHTML = '';
+});
+
+const listeners: EventListener[] = [];
+const listen = () => {
+  const { result } = setup(vi.fn());
+  listeners.push(result.current.handleContextmenu);
+  document.addEventListener('contextmenu', result.current.handleContextmenu);
+};
+
+afterEach(() => {
+  for (const listener of listeners.splice(0)) {
+    document.removeEventListener('contextmenu', listener);
+  }
+});
+
+describe('useTextSelector image context menu (#6558)', () => {
+  test('opens the image menu for an image in a reflowable page', async () => {
+    const blob = new Blob(['jpg'], { type: 'image/jpeg' });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ blob: async () => blob })),
+    );
+    listen();
+    document.body.innerHTML = '<p>text <img src="blob:http://localhost/figure"></p>';
+    const event = rightClick(document.querySelector('img')!, 30, 40);
+    expect(event.defaultPrevented).toBe(true);
+    const [menu, ...rest] = imageMenus();
+    expect(rest).toEqual([]);
+    expect(menu).toMatchObject({ bookKey: 'book-1', x: 30, y: 40 });
+    await expect(menu!.getImage()).resolves.toBe(blob);
+    expect(fetch).toHaveBeenCalledWith('blob:http://localhost/figure');
+    vi.unstubAllGlobals();
+  });
+
+  const svgPage = (inner: string) => {
+    document.body.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">${inner}</svg>`;
+    return document.querySelectorAll('image');
+  };
+  const loadedFrom = async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ blob: async () => new Blob() })),
+    );
+    await imageMenus().at(-1)!.getImage();
+    const url = vi.mocked(fetch).mock.calls[0]![0];
+    vi.unstubAllGlobals();
+    return url;
+  };
+
+  test('takes the SVG <image> under the pointer, not the first one', async () => {
+    listen();
+    const [, second] = svgPage(
+      '<image xlink:href="blob:http://localhost/first"/><image xlink:href="blob:http://localhost/second"/>',
+    );
+    expect(rightClick(second!).defaultPrevented).toBe(true);
+    expect(await loadedFrom()).toBe('blob:http://localhost/second');
+  });
+
+  test('resolves a relative SVG <image> href against its document', async () => {
+    listen();
+    const [image] = svgPage('<image href="images/figure.png"/>');
+    rightClick(image!);
+    expect(await loadedFrom()).toBe(new URL('images/figure.png', document.baseURI).href);
+  });
+
+  test('asks the PDF page for the image under the pointer', () => {
+    listen();
+    document.body.innerHTML = '<div id="canvas"></div><div class="textLayer"></div>';
+    const getImage = vi.fn();
+    const getImageAt = vi.fn((x: number, y: number) => (x > 50 && y > 600 ? getImage : null));
+    Object.assign(document, { getImageAt });
+    const textLayer = document.querySelector('.textLayer')!;
+
+    expect(rightClick(textLayer, 10, 10).defaultPrevented).toBe(false);
+    expect(imageMenus()).toEqual([]);
+
+    expect(rightClick(textLayer, 100, 650).defaultPrevented).toBe(true);
+    expect(imageMenus()).toEqual([{ bookKey: 'book-1', getImage, x: 100, y: 650 }]);
+    expect(getImageAt).toHaveBeenLastCalledWith(100, 650);
+    delete (document as { getImageAt?: unknown }).getImageAt;
+  });
+
+  test('leaves the browser menu to text on the web', () => {
+    listen();
+    document.body.innerHTML = '<p>plain text</p>';
+    expect(rightClick(document.querySelector('p')!).defaultPrevented).toBe(false);
+    expect(imageMenus()).toEqual([]);
+  });
+
+  // readest/readest#6668: the webview's own menu (Back / Reload / Inspect...)
+  // has no place in the desktop app's reading area.
+  test('suppresses the webview menu on text in the desktop app', () => {
+    h.appService = { isDesktopApp: true, isMobile: false };
+    listen();
+    document.body.innerHTML = '<p>plain text</p>';
+    expect(rightClick(document.querySelector('p')!).defaultPrevented).toBe(true);
+    expect(imageMenus()).toEqual([]);
+  });
+});
+
+// readest/readest#6574: on iOS and Android a long press on an image opens the
+// same menu. Android's WebView reports the long press as a contextmenu event,
+// iOS WebKit fires none, so a touch held still on an image opens it there.
+describe('useTextSelector image long-press menu (#6574)', () => {
+  test('opens the image menu from an Android long press', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<img src="blob:http://localhost/figure">';
+    expect(rightClick(document.querySelector('img')!, 30, 40, 'touch').defaultPrevented).toBe(true);
+    expect(imageMenus()).toMatchObject([{ bookKey: 'book-1', x: 30, y: 40 }]);
+  });
+
+  test('keeps a long press on text for selection', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<p>plain text</p>';
+    expect(rightClick(document.querySelector('p')!, 50, 50, 'touch').defaultPrevented).toBe(true);
+    expect(imageMenus()).toEqual([]);
+  });
+
+  test('keeps a long press on PDF text for selection, even over an image', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<div class="textLayer"><span>scanned words</span></div>';
+    Object.assign(document, { getImageAt: () => vi.fn() });
+    const textLayer = document.querySelector('.textLayer')!;
+    h.textAtPoint = true;
+    rightClick(document.querySelector('span')!, 50, 50, 'touch');
+    expect(imageMenus()).toEqual([]);
+    h.textAtPoint = false;
+    rightClick(textLayer, 50, 50, 'touch');
+    expect(imageMenus()).toHaveLength(1);
+    delete (document as { getImageAt?: unknown }).getImageAt;
+  });
+
+  describe('iOS', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      h.appService = { isIOSApp: true, isMobile: true };
+      document.body.innerHTML = '<p>text</p><img src="blob:http://localhost/figure">';
+    });
+    afterEach(() => vi.useRealTimers());
+
+    const touch = (type: string, target: Element, x = 30, y = 40) =>
+      ({
+        type,
+        target,
+        pointerType: 'touch',
+        clientX: x,
+        clientY: y,
+        button: 0,
+      }) as unknown as PointerEvent;
+    const press = (target: Element) => {
+      const { result } = setup(vi.fn());
+      result.current.handlePointerDown(document, 0, touch('pointerdown', target));
+      return result.current;
+    };
+
+    test('opens the image menu once a touch has held still on an image', () => {
+      press(document.querySelector('img')!);
+      vi.advanceTimersByTime(499);
+      expect(imageMenus()).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(imageMenus()).toMatchObject([{ bookKey: 'book-1', x: 30, y: 40 }]);
+    });
+
+    test('a tap, a scroll or a swipe opens no menu', () => {
+      const img = document.querySelector('img')!;
+      press(img).handlePointerUp(document, 0, touch('pointerup', img));
+      press(img).handlePointerCancel(document, 0, touch('pointercancel', img));
+      press(img).handlePointerMove(document, 0, touch('pointermove', img, 30, 52));
+      vi.advanceTimersByTime(1000);
+      expect(imageMenus()).toEqual([]);
+    });
+
+    test('a reader closed mid-hold opens no menu', () => {
+      const { result, unmount } = setup(vi.fn());
+      const img = document.querySelector('img')!;
+      result.current.handlePointerDown(document, 0, touch('pointerdown', img));
+      unmount();
+      vi.advanceTimersByTime(1000);
+      expect(imageMenus()).toEqual([]);
+    });
+
+    test('a hold on text opens no menu', () => {
+      press(document.querySelector('p')!);
+      vi.advanceTimersByTime(1000);
+      expect(imageMenus()).toEqual([]);
+    });
+  });
+});
+
+// #7145: with the image viewer set to open on long press, a long press on an
+// image opens the viewer in place of the menu; a right-click keeps the menu.
+describe('useTextSelector long press opens the image viewer (#7145)', () => {
+  let postSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(async () => {
+    postSpy = vi.spyOn(window, 'postMessage').mockImplementation(() => {});
+    const { setImageViewerGesture } = await import('@/app/reader/utils/iframeEventHandlers');
+    setImageViewerGesture('book-1', 'longPress');
+  });
+  afterEach(async () => {
+    const { setImageViewerGesture } = await import('@/app/reader/utils/iframeEventHandlers');
+    setImageViewerGesture('book-1', 'tap');
+  });
+  const openedMedia = () =>
+    postSpy.mock.calls
+      .map((call: unknown[]) => call[0] as Record<string, unknown>)
+      .filter((m: Record<string, unknown>) => m['type'] === 'iframe-open-media');
+
+  test('an Android long press on an image opens the viewer, not the menu', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<img src="blob:http://localhost/figure">';
+    expect(rightClick(document.querySelector('img')!, 50, 50, 'touch').defaultPrevented).toBe(true);
+    expect(imageMenus()).toEqual([]);
+    expect(openedMedia()).toEqual([
+      {
+        type: 'iframe-open-media',
+        bookKey: 'book-1',
+        elementType: 'image',
+        src: 'blob:http://localhost/figure',
+      },
+    ]);
+  });
+
+  // #6872: tables follow the same gesture; a long press on their text selects it.
+  test.each([
+    { textAtPoint: false, opens: true },
+    { textAtPoint: true, opens: false },
+  ])('an Android long press on a table (on text: $textAtPoint)', ({ textAtPoint, opens }) => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    h.textAtPoint = textAtPoint;
+    listen();
+    document.body.innerHTML = '<table><tr><td>Cell</td></tr></table>';
+    rightClick(document.querySelector('td')!, 50, 50, 'touch');
+    expect(imageMenus()).toEqual([]);
+    expect(openedMedia()).toEqual(
+      opens ? [expect.objectContaining({ type: 'iframe-open-media', elementType: 'table' })] : [],
+    );
+  });
+
+  test('an Android long press on blank table space while text is selected opens nothing', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<p>Intro</p><table><tr><td>Cell</td></tr></table>';
+    document.getSelection()!.selectAllChildren(document.querySelector('p')!);
+    try {
+      rightClick(document.querySelector('td')!, 50, 50, 'touch');
+      expect(openedMedia()).toEqual([]);
+    } finally {
+      document.getSelection()!.removeAllRanges();
+    }
+  });
+
+  test('an iOS touch hold on blank table space opens the table zoom', () => {
+    vi.useFakeTimers();
+    try {
+      h.appService = { isIOSApp: true, isMobile: true };
+      h.osPlatform = 'ios';
+      document.body.innerHTML = '<table><tr><td>Cell</td></tr></table>';
+      const { result } = setup(vi.fn());
+      result.current.handlePointerDown(document, 0, {
+        target: document.querySelector('td'),
+        pointerType: 'touch',
+        clientX: 30,
+        clientY: 40,
+        button: 0,
+      } as unknown as PointerEvent);
+      vi.advanceTimersByTime(500);
+      expect(openedMedia()).toEqual([
+        expect.objectContaining({ type: 'iframe-open-media', elementType: 'table' }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('a long press on a table in a book set to Tap opens nothing', async () => {
+    const { setImageViewerGesture } = await import('@/app/reader/utils/iframeEventHandlers');
+    setImageViewerGesture('book-1', 'tap');
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<table><tr><td>Cell</td></tr></table>';
+    rightClick(document.querySelector('td')!, 50, 50, 'touch');
+    expect(openedMedia()).toEqual([]);
+  });
+
+  test.each([true, false])('an iOS touch hold opens the viewer (native app: %s)', (isIOSApp) => {
+    vi.useFakeTimers();
+    try {
+      h.appService = { isIOSApp, isMobile: true };
+      h.osPlatform = 'ios';
+      document.body.innerHTML = '<img src="blob:http://localhost/figure">';
+      const img = document.querySelector('img')!;
+      const { result } = setup(vi.fn());
+      result.current.handlePointerDown(document, 0, {
+        target: img,
+        pointerType: 'touch',
+        clientX: 30,
+        clientY: 40,
+        button: 0,
+      } as unknown as PointerEvent);
+
+      vi.advanceTimersByTime(499);
+      expect(openedMedia()).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(openedMedia()).toEqual([
+        {
+          type: 'iframe-open-media',
+          bookKey: 'book-1',
+          elementType: 'image',
+          src: img.src,
+        },
+      ]);
+      expect(imageMenus()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each([
+    { holdMs: 500, emitsCompatibilityClick: true },
+    { holdMs: 500, emitsCompatibilityClick: false },
+    { holdMs: 1600, emitsCompatibilityClick: true },
+    { holdMs: 1600, emitsCompatibilityClick: false },
+  ])('an iOS $holdMs ms image hold preserves the next tap (compatibility click: $emitsCompatibilityClick)', async ({
+    holdMs,
+    emitsCompatibilityClick,
+  }) => {
+    vi.useFakeTimers();
+    h.appService = { isIOSApp: true, isMobile: true };
+    h.osPlatform = 'ios';
+    document.body.innerHTML = '<a href="#figure"><img src="blob:http://localhost/figure"></a>';
+    const img = document.querySelector('img')!;
+    const { result } = setup(vi.fn());
+    const pointer = {
+      target: img,
+      pointerType: 'touch',
+      clientX: 30,
+      clientY: 40,
+      button: 0,
+    } as unknown as PointerEvent;
+    const { handleClickCapture, handleMousedown, handleMouseup } = await import(
+      '@/app/reader/utils/iframeEventHandlers'
+    );
+    const navigate = vi.fn((event: Event) => event.preventDefault());
+    const capture = (event: MouseEvent) => handleClickCapture('book-1', event);
+    document.addEventListener('click', navigate);
+    document.addEventListener('click', capture, true);
+    try {
+      result.current.handlePointerDown(document, 0, pointer);
+      vi.advanceTimersByTime(holdMs);
+      await result.current.handlePointerUp(document, 0, pointer);
+      expect(openedMedia()).toHaveLength(1);
+      const compatibilityClick = () => {
+        const mouse = new MouseEvent('mousedown');
+        handleMousedown('book-1', mouse);
+        handleMouseup('book-1', mouse);
+        img.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      };
+      if (emitsCompatibilityClick) compatibilityClick();
+      expect(navigate).not.toHaveBeenCalled();
+      result.current.handlePointerDown(document, 0, pointer);
+      await result.current.handlePointerUp(document, 0, pointer);
+      compatibilityClick();
+      expect(navigate).toHaveBeenCalledTimes(1);
+      expect(openedMedia()).toHaveLength(1);
+    } finally {
+      document.removeEventListener('click', navigate);
+      document.removeEventListener('click', capture, true);
+      vi.useRealTimers();
+    }
+  });
+
+  test.each(['android', 'ios'])('a mouse right-click on %s keeps the image menu', (platform) => {
+    h.appService = {
+      isMobile: true,
+      isAndroidApp: platform === 'android',
+      isIOSApp: platform === 'ios',
+    };
+    h.osPlatform = platform;
+    document.body.innerHTML = '<img src="blob:http://localhost/figure">';
+    const img = document.querySelector('img')!;
+    const { result } = setup(vi.fn());
+    result.current.handlePointerDown(document, 0, {
+      target: img,
+      pointerType: 'mouse',
+      button: 2,
+      clientX: 30,
+      clientY: 40,
+    } as unknown as PointerEvent);
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
+    Object.defineProperty(event, 'target', { value: img });
+    result.current.handleContextmenu(event);
+    expect(imageMenus()).toHaveLength(1);
+    expect(openedMedia()).toEqual([]);
+  });
+
+  test('a desktop right-click on an image keeps the menu', () => {
+    listen();
+    document.body.innerHTML = '<img src="blob:http://localhost/figure">';
+    rightClick(document.querySelector('img')!);
+    expect(imageMenus()).toHaveLength(1);
+    expect(openedMedia()).toEqual([]);
+  });
+
+  test('a long press on a PDF image, which the viewer cannot show, keeps the menu', () => {
+    h.appService = { isAndroidApp: true, isMobile: true };
+    listen();
+    document.body.innerHTML = '<div class="textLayer"></div>';
+    Object.assign(document, { getImageAt: () => vi.fn() });
+    rightClick(document.querySelector('.textLayer')!);
+    expect(imageMenus()).toHaveLength(1);
+    expect(openedMedia()).toEqual([]);
+    delete (document as { getImageAt?: unknown }).getImageAt;
+  });
+});

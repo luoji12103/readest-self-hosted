@@ -1,6 +1,7 @@
 import type { SystemSettings } from '@/types/settings';
 import type { ReplicaAdapter } from '@/services/sync/replicaRegistry';
 import type { FieldsObject, ReplicaRow } from '@/types/replica';
+import { serializeCustomHeaders, deserializeCustomHeaders } from '@/utils/customHeaders';
 import { unwrap } from './helpers';
 
 export const SETTINGS_KIND = 'settings';
@@ -26,9 +27,11 @@ export const SETTINGS_REPLICA_ID = 'singleton';
  *     across devices.
  *   * Collection settings already synced via dedicated kinds
  *     (`customFonts`, `customTextures`, `customDictionaries`,
- *     `opdsCatalogs`). Note: `dictionarySettings` sub-fields
+ *     `opdsCatalogs`, `absServers`). Note: `dictionarySettings` sub-fields
  *     (providerOrder / providerEnabled / webSearches) ARE bundled
- *     here — see entries below.
+ *     here — see entries below. They ride this row for transport but
+ *     are gated by the 'dictionary' sync category, not 'settings'
+ *     (see `SETTINGS_DICTIONARY_FIELDS`).
  */
 export const SETTINGS_WHITELIST = [
   'globalViewSettings.userStylesheet',
@@ -50,6 +53,12 @@ export const SETTINGS_WHITELIST = [
   'dictionarySettings.providerEnabled',
   'dictionarySettings.webSearches',
   'dictionarySettings.fontScale',
+  'dictionarySettings.autoPlayPronunciation',
+  'dictionarySettings.saveLookupsToVocabulary',
+  'dictionarySettings.contextTranslatorId',
+  'dictionarySettings.contextPromptId',
+  'dictionarySettings.contextSystemPrompt',
+  'dictionarySettings.contextMaxOutputTokens',
   // External integrations. Server URL + identifiers sync as plaintext;
   // the credential fields are listed in `encryptedFields` below so the
   // publish/pull middleware wraps them in cipher envelopes.
@@ -57,9 +66,24 @@ export const SETTINGS_WHITELIST = [
   'kosync.username',
   'kosync.userkey',
   'kosync.password',
+  'kosync.customHeaders',
+  'kosync.allowSelfSignedCert',
+  'bookorbit.serverUrl',
+  'bookorbit.username',
+  'bookorbit.userkey',
+  'bookorbit.password',
+  'bookorbit.customHeaders',
+  'bookorbit.allowSelfSignedCert',
+  'grimmory.serverUrl',
+  'grimmory.username',
+  'grimmory.password',
+  'grimmory.customHeaders',
+  'grimmory.allowSelfSignedCert',
   'readwise.baseUrl',
   'readwise.accessToken',
   'hardcover.accessToken',
+  'notion.databaseId',
+  'notion.accessToken',
   // WebDAV connection. serverUrl + rootPath sync as plaintext so a fresh
   // device pre-fills the connect form; username / password are listed in
   // `encryptedFields` below. Per-device bookkeeping (enabled, deviceId,
@@ -82,6 +106,42 @@ export const SETTINGS_WHITELIST = [
 ] as const;
 
 /**
+ * Whitelisted paths that belong to the user-facing "Dictionaries" sync
+ * category rather than "App settings". They ride the bundled settings
+ * row because that's where the values live in SystemSettings, but the
+ * user reads the Manage Sync panel by category, not by transport: with
+ * Dictionaries off, provider order / enable flags / web searches must
+ * neither leave nor enter the device (#5465).
+ *
+ * `publishSettingsIfChanged` drops these from the push and
+ * `applyRemoteSettings` strips them from an incoming patch whenever
+ * `isSyncCategoryEnabled('dictionary')` is false.
+ *
+ * The dependency edge in `syncCategories.ts` (dictionary requires
+ * settings) still holds in the other direction: these can only travel
+ * while the settings row itself syncs.
+ *
+ * Re-enable semantics differ slightly from a whole-kind category: the
+ * settings row keeps pulling while Dictionaries is off, so its cursor
+ * advances past the discarded values and re-enabling doesn't backfill
+ * them. The local side does resume immediately — the push snapshot was
+ * never updated for these paths, so the next save publishes the local
+ * values — and any later remote edit lands normally under per-field LWW.
+ */
+export const SETTINGS_DICTIONARY_FIELDS = [
+  'dictionarySettings.providerOrder',
+  'dictionarySettings.providerEnabled',
+  'dictionarySettings.webSearches',
+  'dictionarySettings.fontScale',
+  'dictionarySettings.autoPlayPronunciation',
+  'dictionarySettings.saveLookupsToVocabulary',
+  'dictionarySettings.contextTranslatorId',
+  'dictionarySettings.contextPromptId',
+  'dictionarySettings.contextSystemPrompt',
+  'dictionarySettings.contextMaxOutputTokens',
+] as const;
+
+/**
  * Whitelisted paths whose values are credentials. The publish/pull
  * crypto middleware wraps these in cipher envelopes via the active
  * CryptoSession; pack / unpack themselves only see plaintext.
@@ -98,8 +158,17 @@ export const SETTINGS_ENCRYPTED_FIELDS = [
   'kosync.username',
   'kosync.userkey',
   'kosync.password',
+  'kosync.customHeaders',
+  'bookorbit.username',
+  'bookorbit.userkey',
+  'bookorbit.password',
+  'bookorbit.customHeaders',
+  'grimmory.username',
+  'grimmory.password',
+  'grimmory.customHeaders',
   'readwise.accessToken',
   'hardcover.accessToken',
+  'notion.accessToken',
   'webdav.username',
   'webdav.password',
   's3.accessKeyId',
@@ -107,6 +176,20 @@ export const SETTINGS_ENCRYPTED_FIELDS = [
 ] as const;
 
 export type SettingsWhitelistKey = (typeof SETTINGS_WHITELIST)[number];
+
+/**
+ * `encryptPackedFields` / `decryptRowFields` only handle string-valued
+ * fields (`String(value)` on encrypt, a decrypted string back on
+ * decrypt) — every other entry in `SETTINGS_ENCRYPTED_FIELDS` is a plain
+ * string. These paths are object-valued, so pack/unpack serialize them
+ * to/from a JSON string at this boundary so the crypto middleware only
+ * ever sees a string.
+ */
+const OBJECT_VALUED_ENCRYPTED_PATHS = [
+  'kosync.customHeaders',
+  'bookorbit.customHeaders',
+  'grimmory.customHeaders',
+] as const;
 
 // In practice every path comes from the compile-time SETTINGS_WHITELIST so
 // these never appear, but readPath/writePath are exported helpers and the
@@ -166,6 +249,16 @@ export interface SettingsRemoteRecord {
   lastSeenCipher?: Record<string, string>;
 }
 
+/** Parse each object-valued encrypted path back from its JSON-string wire form, in place. */
+const deserializeObjectValuedPaths = (patch: Record<string, unknown>): void => {
+  for (const path of OBJECT_VALUED_ENCRYPTED_PATHS) {
+    const raw = readPath(patch, path);
+    if (typeof raw === 'string') {
+      writePath(patch, path, deserializeCustomHeaders(raw));
+    }
+  }
+};
+
 const unwrapSettingsFields = (fields: FieldsObject): Record<string, unknown> => {
   const out: Record<string, unknown> = {};
   for (const path of SETTINGS_WHITELIST) {
@@ -186,6 +279,15 @@ export const settingsAdapter: ReplicaAdapter<SettingsRemoteRecord> = {
       const value = readPath(record.patch, path);
       if (value !== undefined) fields[path] = value;
     }
+    for (const path of OBJECT_VALUED_ENCRYPTED_PATHS) {
+      if (!(path in fields)) continue;
+      const serialized = serializeCustomHeaders(fields[path] as Record<string, string>);
+      if (serialized === null) {
+        delete fields[path];
+      } else {
+        fields[path] = serialized;
+      }
+    }
     return fields;
   },
 
@@ -195,6 +297,7 @@ export const settingsAdapter: ReplicaAdapter<SettingsRemoteRecord> = {
       const v = fields[path];
       if (v !== undefined) writePath(patch, path, v);
     }
+    deserializeObjectValuedPaths(patch);
     return { name: 'singleton', patch: patch as Partial<SystemSettings> };
   },
 
@@ -212,6 +315,7 @@ export const settingsAdapter: ReplicaAdapter<SettingsRemoteRecord> = {
     for (const [path, v] of Object.entries(flat)) {
       writePath(patch, path, v);
     }
+    deserializeObjectValuedPaths(patch);
     return { name: 'singleton', patch: patch as Partial<SystemSettings> };
   },
 

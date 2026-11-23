@@ -2,6 +2,7 @@ package com.bilingify.readest
 
 import android.os.Build
 import android.os.Bundle
+import android.view.ActionMode
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.webkit.WebView
@@ -22,6 +23,18 @@ import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import com.readest.native_bridge.KeyDownInterceptor
 import com.readest.native_bridge.NativeBridgePlugin
+import com.readest.native_bridge.SelectionMenuSuppressor
+
+internal fun shouldCaptureNativeLearnKey(keyCode: Int): Boolean = when (keyCode) {
+    KeyEvent.KEYCODE_VOLUME_DOWN,
+    KeyEvent.KEYCODE_VOLUME_UP,
+    KeyEvent.KEYCODE_MEDIA_NEXT,
+    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+    KeyEvent.KEYCODE_MEDIA_REWIND -> true
+    else -> false
+}
 
 class MainActivity : TauriActivity(), KeyDownInterceptor {
     private var wv: WebView? = null
@@ -42,7 +55,19 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
 
     override fun onWebViewCreate(webView: WebView) {
         wv = webView
+        // requestFocus() out of touch mode (after a hardware page-turn key)
+        // otherwise focuses the page's first focusable node, the a11y skip link
+        // at the section start, and scrolls the reader there on every wake (#6967).
+        webView.settings.setNeedInitialFocus(false)
         ensureInitialPaint()
+        focusWebView()
+    }
+
+    // After a cold launch (e.g. a widget tap) nothing holds focus, so the first
+    // hardware page-turn key only moves focus into the page and is lost (and
+    // focus lands on the a11y skip link, resetting the page to the chapter start).
+    private fun focusWebView() {
+        if (hasWindowFocus) wv?.requestFocus()
     }
 
     private fun ensureInitialPaint() {
@@ -57,6 +82,7 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
         if (hasFocus) {
             hasWindowFocus = true
             ensureInitialPaint()
+            focusWebView()
         }
     }
 
@@ -102,6 +128,20 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
     override fun setKeyLearnMode(enabled: Boolean) {
         Log.d("MainActivity", "Key learn mode: $enabled")
         keyLearnModeEnabled = enabled
+    }
+
+    // #5427: Chromium presents the system text-selection toolbar
+    // (Copy / Share / Select all) through paths that never fire a cancelable
+    // contextmenu event, so it can cover Readest's own annotation toolbar.
+    // While the JS side keeps the flag set (reader text is selected), hand
+    // the framework a no-op ActionMode so the floating toolbar is never
+    // built; selection and drag handles are unaffected.
+    override fun onWindowStartingActionMode(
+        callback: ActionMode.Callback?,
+        type: Int
+    ): ActionMode? {
+        return SelectionMenuSuppressor.onWindowStartingActionMode(window?.decorView, callback, type)
+            ?: super.onWindowStartingActionMode(callback, type)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -159,9 +199,10 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
         if (event.action == KeyEvent.ACTION_DOWN) {
             val keyCode = event.keyCode
 
-            // Learn mode: forward and consume every key so the settings UI
-            // can capture whatever the remote sends.
-            if (keyLearnModeEnabled && keyCode != KeyEvent.KEYCODE_BACK) {
+            // Only keys forwarded natively at runtime are learned natively.
+            // Keyboard, D-pad, and remote keys continue to WebView so their
+            // DOM identity and complete modifier chord are preserved.
+            if (keyLearnModeEnabled && shouldCaptureNativeLearnKey(keyCode)) {
                 forwardKeyToWebView(keyNameFor(keyCode), keyCode)
                 return true
             }
@@ -284,7 +325,11 @@ class MainActivity : TauriActivity(), KeyDownInterceptor {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        NativeBridgePlugin.getInstance()?.handleActivityResult(requestCode, resultCode, data)
+        // Routed through the companion so a file-picker result that arrives
+        // before Tauri has instantiated the plugin (activity recreated after
+        // a process death behind the picker, #1217) is stashed and replayed
+        // from load() instead of being dropped.
+        NativeBridgePlugin.deliverActivityResult(requestCode, resultCode, data)
     }
 
     override fun onNewIntent(intent: Intent) {

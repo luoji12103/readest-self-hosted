@@ -12,6 +12,8 @@ import {
 import { Insets } from '@/types/misc';
 import { EnvConfigType } from '@/services/environment';
 import { FoliateView } from '@/types/view';
+import { isAbsEbook } from '@/utils/audiobook';
+import { partialMD5 } from '@/utils/md5';
 import { DocumentLoader, TOCItem } from '@/libs/document';
 import {
   isPseStreamFileName,
@@ -21,8 +23,13 @@ import {
 import type { FileSystem } from '@/types/system';
 import { isFeedBookUrl, parseFeedBookUrl } from '@/services/rss/feedBookUrl';
 import { openFeedBookDoc } from '@/services/rss/feedReader';
-import { BOOK_NAV_VERSION, computeBookNav, hydrateBookNav, updateToc } from '@/services/nav';
-import { formatTitle, getMetadataHash, getPrimaryLanguage } from '@/utils/book';
+import { computeBookNav, hydrateBookNav, isBookNavCacheCurrent, updateToc } from '@/services/nav';
+import {
+  formatTitle,
+  getMetadataHash,
+  getPrimaryLanguage,
+  parseSeriesPosition,
+} from '@/utils/book';
 import { getBaseFilename } from '@/utils/path';
 import { SUPPORTED_LANGNAMES } from '@/services/constants';
 import { useSettingsStore } from './settingsStore';
@@ -30,6 +37,7 @@ import { BookData, useBookDataStore } from './bookDataStore';
 import { useLibraryStore } from './libraryStore';
 import { clearBookProgress, getBookProgress, setBookProgress } from './readerProgressStore';
 import { uniqueId } from '@/utils/misc';
+import { getWidePages, type WidePagesOptions } from '@/utils/spread';
 
 interface ViewState {
   /* Unique key for each book view */
@@ -48,6 +56,8 @@ interface ViewState {
   /* True while an Auto Scroll session (#4998) is engaged for this view;
      session-only, never persisted. Drives the View menu checkmark. */
   autoScrollEnabled: boolean;
+  /* True while drawing mode is on for this view; session-only. */
+  drawingEnabled: boolean;
   syncing: boolean;
   gridInsets: Insets | null;
   /* True while the reader is showing a position requested by an external
@@ -76,6 +86,7 @@ interface ReaderStore {
   setBottomBarTab: (tab: string) => void;
   setBookmarkRibbonVisibility: (key: string, visible: boolean) => void;
   setTTSEnabled: (key: string, enabled: boolean) => void;
+  setDrawingEnabled: (key: string, enabled: boolean) => void;
   setAutoScrollEnabled: (key: string, enabled: boolean) => void;
   setIsLoading: (key: string, loading: boolean) => void;
   setIsSyncing: (key: string, syncing: boolean) => void;
@@ -107,6 +118,7 @@ interface ReaderStore {
   ) => Promise<void>;
   clearViewState: (key: string) => void;
   getViewState: (key: string) => ViewState | null;
+  areBooksOpen: (ids: string[]) => boolean;
   getGridInsets: (key: string) => Insets | null;
   setGridInsets: (key: string, insets: Insets | null) => void;
   setViewInited: (key: string, inited: boolean) => void;
@@ -147,8 +159,25 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       delete viewStates[key];
       return { viewStates };
     });
+    // A streamed ABS ebook reads through a RemoteFile that authenticates with
+    // a short-lived access token, so its cached BookDoc must not outlive the
+    // last open view: the next open resolves the stream afresh against the
+    // store's current token. Local books keep their cache for instant reopens.
+    const id = key.split('-')[0]!;
+    if (Object.keys(get().viewStates).some((k) => k.split('-')[0] === id)) return;
+    const book = useLibraryStore.getState().getBookByHash(id);
+    if (book && isAbsEbook(book)) useBookDataStore.getState().clearBookData(id);
   },
   getViewState: (key: string) => get().viewStates[key] || null,
+  // Closed books keep their keys but drop their view states; failed ones load again.
+  areBooksOpen: (ids: string[]) => {
+    const { bookKeys, viewStates } = get();
+    return (
+      bookKeys.length > 0 &&
+      bookKeys.every((key) => viewStates[key] && !viewStates[key].error) &&
+      bookKeys.map((key) => key.split('-')[0]).join() === ids.join()
+    );
+  },
   initViewState: async (
     envConfig: EnvConfigType,
     id: string,
@@ -172,6 +201,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           ribbonVisible: false,
           ttsEnabled: false,
           autoScrollEnabled: false,
+          drawingEnabled: false,
           syncing: false,
           gridInsets: null,
           previewMode: false,
@@ -193,12 +223,33 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       const isPseStream = !!book.url && isPseStreamFileName(book.url);
       const isFeed = !!book.url && isFeedBookUrl(book.url);
       let bookDoc = bookData?.bookDoc;
+      let docFormat = bookData?.docFormat;
       let file: File | null = bookData?.file ?? null;
+      // Per-book config and the third-party annotation module are pure IO
+      // with no dependency on the document load. Kick them off here so their
+      // round trips overlap with the content fetch / document parsing below
+      // instead of serializing behind them. Every `await configPromise`
+      // resolves to the same object.
+      const configPromise = appService.loadBookConfig(book, settings);
+      // Avoid an unhandled rejection if the open path fails before the
+      // config awaits below are ever reached; the rejection still propagates
+      // at those await sites.
+      configPromise.catch(() => undefined);
+      const annotationImportPromise = import('@/services/annotation');
+      // Avoid an unhandled rejection if the open path throws before the
+      // annotation section below ever awaits this import.
+      annotationImportPromise.catch(() => undefined);
+      // A comic's wide pages are cached in its config: those an open measured,
+      // and those found as streamed pages load.
+      const makeWidePages = (config: BookConfig): WidePagesOptions => ({
+        known: config.widePages,
+        onFound: (ids) => useBookDataStore.getState().setConfig(id, { widePages: ids }),
+      });
       if (!bookDoc || (!isPseStream && !isFeed && !file) || reload) {
         console.log('Loading book', key);
         if (isPseStream) {
           const data = parsePseStreamFileName(book.url!);
-          const doc = await openPseStreamBook(data);
+          const doc = await openPseStreamBook(data, makeWidePages(await configPromise));
           bookDoc = doc.book;
           file = null;
         } else if (isFeed) {
@@ -208,24 +259,47 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           bookDoc = await openFeedBookDoc(fs, book.hash, feedUrl, book.title);
           file = null;
         } else {
-          const content = (await appService.loadBookContent(book)) as BookContent;
+          // resolveNativeBookFilePath only reads `book` (it feeds the Rust
+          // EPUB prefetch), so it can race the content load instead of
+          // queueing behind it.
+          const [content, nativeFilePath] = await Promise.all([
+            appService.loadBookContent(book) as Promise<BookContent>,
+            appService.resolveNativeBookFilePath(book).catch((err: unknown) => {
+              console.warn('resolveNativeBookFilePath failed', err);
+              return null;
+            }),
+          ]);
           file = content.file;
-          let nativeFilePath: string | null = null;
-          try {
-            nativeFilePath = await appService.resolveNativeBookFilePath(book);
-          } catch (err) {
-            console.warn('resolveNativeBookFilePath failed', err);
-          }
+          const config = await configPromise;
           const doc = await new DocumentLoader(file, {
             nativeFilePath: nativeFilePath ?? undefined,
+            widePages: makeWidePages(config),
           }).open();
           bookDoc = doc.book;
+          docFormat = doc.format;
+          if (doc.format === 'CBZ') config.widePages = getWidePages(bookDoc.sections);
         }
       }
-      const config = await appService.loadBookConfig(book, settings);
-      // Import annotations from third-party readers on first open
+      // KOReader keys a book by its file's partial MD5, but an Audiobookshelf
+      // ebook's hash comes from its abs:// path: keep the file's own id with
+      // the book for KOReader Sync (#7088). Hashed on every open, since the
+      // server can replace an item's file, and waited for only briefly: a
+      // stalled range read must not keep the book from opening.
+      if (file && isAbsEbook(book)) {
+        const hashing = partialMD5(file).then(
+          (hash) => {
+            book.metadata!.absFileHash = hash;
+          },
+          (err) => console.warn('Failed to hash the Audiobookshelf ebook', err),
+        );
+        await Promise.race([hashing, new Promise((resolve) => setTimeout(resolve, 5000))]);
+      }
+      const config = await configPromise;
+      // Import annotations from third-party readers on first open. The
+      // module import was already kicked off above; providers still run
+      // here so the merged config lands before the first render.
       if (bookDoc.metadata.identifier) {
-        const { getAnnotationProviders } = await import('@/services/annotation');
+        const { getAnnotationProviders } = await annotationImportPromise;
         for (const provider of getAnnotationProviders()) {
           if (provider.isAvailable(appService)) {
             const merged = await provider.importAnnotations(
@@ -243,17 +317,20 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       // Filter out invalid booknotes
       config.booknotes = config.booknotes?.filter((booknote) => booknote.cfi) ?? [];
       // Load cached book navigation (TOC + section fragments) or compute and persist.
+      // Feed manifests grow between opens, so feed books always recompute instead.
       if (book.format === 'EPUB' && bookDoc.rendition?.layout !== 'pre-paginated') {
-        const cachedNav = await appService.loadBookNav(book);
-        if (cachedNav?.version === BOOK_NAV_VERSION && process.env.NODE_ENV === 'production') {
+        const cachedNav = isFeed ? null : await appService.loadBookNav(book);
+        if (isBookNavCacheCurrent(cachedNav) && process.env.NODE_ENV === 'production') {
           hydrateBookNav(bookDoc, cachedNav);
         } else {
           const freshNav = await computeBookNav(bookDoc);
           hydrateBookNav(bookDoc, freshNav);
-          try {
-            await appService.saveBookNav(book, freshNav);
-          } catch (e) {
-            console.warn('Failed to persist book nav cache:', e);
+          if (!isFeed) {
+            try {
+              await appService.saveBookNav(book, freshNav);
+            } catch (e) {
+              console.warn('Failed to persist book nav cache:', e);
+            }
           }
         }
       }
@@ -284,18 +361,22 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
         if (series) {
           book.metadata.series = book.metadata.series ?? formatTitle(series.name);
           book.metadata.seriesIndex =
-            book.metadata.seriesIndex ?? parseFloat(series.position || '0');
+            book.metadata.seriesIndex ?? parseSeriesPosition(series.position);
           book.metadata.seriesTotal =
             book.metadata.seriesTotal ?? (series.total ? parseInt(series.total, 10) : undefined);
         }
       }
       // TODO: uncomment this when we can ensure metaHash is correctly generated for all books
       // book.metaHash = book.metaHash ?? getMetadataHash(bookDoc.metadata);
-      book.metaHash = getMetadataHash(bookDoc.metadata);
+      // PDF metaHash is salted with the original import filename (issue #5411),
+      // which is lost after import — keep the value stamped at import time.
+      if (book.format !== 'PDF' || !book.metaHash) {
+        book.metaHash = getMetadataHash(bookDoc.metadata);
+      }
 
       const isFixedLayout =
         bookDoc.rendition?.layout === 'pre-paginated' || FIXED_LAYOUT_FORMATS.has(book.format);
-      const newBookData: BookData = { id, book, file, config, bookDoc, isFixedLayout };
+      const newBookData: BookData = { id, book, file, config, bookDoc, docFormat, isFixedLayout };
       useBookDataStore.setState((state) => ({
         booksData: {
           ...state.booksData,
@@ -319,6 +400,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             ribbonVisible: false,
             ttsEnabled: false,
             autoScrollEnabled: false,
+            drawingEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
@@ -343,6 +425,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             ribbonVisible: false,
             ttsEnabled: false,
             autoScrollEnabled: false,
+            drawingEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
@@ -369,7 +452,12 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             config: {
               ...bookData.config,
               updatedAt: Date.now(),
-              viewSettings,
+              // The sidebar tab is written to the book config only, so keep
+              // it rather than the live copy's stale value (#6836).
+              viewSettings: {
+                ...viewSettings,
+                sideBarTab: bookData.config?.viewSettings?.sideBarTab ?? viewSettings.sideBarTab,
+              },
             },
           },
         },
@@ -490,6 +578,17 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       },
     })),
 
+  setDrawingEnabled: (key: string, enabled: boolean) =>
+    set((state) => ({
+      viewStates: {
+        ...state.viewStates,
+        [key]: {
+          ...state.viewStates[key]!,
+          drawingEnabled: enabled,
+        },
+      },
+    })),
+
   setAutoScrollEnabled: (key: string, enabled: boolean) =>
     set((state) => ({
       viewStates: {
@@ -559,19 +658,16 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     })),
 
   recreateViewer: (envConfig: EnvConfigType, key: string) => {
+    if (!key || get().viewStates[key]?.key !== key) return;
     const id = key.split('-')[0]!;
-    get()
-      .initViewState(envConfig, id, key, true, true)
-      .then(() => {
-        set((state) => ({
-          viewStates: {
-            ...state.viewStates,
-            [key]: {
-              ...state.viewStates[key]!,
-              viewerKey: `${key}-${uniqueId()}`,
-            },
-          },
-        }));
-      });
+    // `initViewState` already mints a fresh `viewerKey` when the reload lands,
+    // which is what remounts <FoliateViewer>. Minting a second one here
+    // remounted it twice: the abandoned first mount kept running its async
+    // `openBook()` and registered another `data` transform listener on the
+    // *same* reloaded bookDoc, so every resource was piped through the
+    // transform chain twice. A twice-transformed stylesheet lost all its
+    // font-family declarations, and the book fell back to the app font
+    // (readest#5277).
+    void get().initViewState(envConfig, id, key, true, true);
   },
 }));

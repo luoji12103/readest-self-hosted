@@ -49,6 +49,27 @@ describe('isSyncCategoryEnabled', () => {
     expect(isSyncCategoryEnabled('font')).toBe(true);
   });
 
+  describe('book_data', () => {
+    test('is a listed category', () => {
+      expect(SYNC_CATEGORIES).toContain('book_data');
+    });
+
+    test('defaults on when unset', () => {
+      setSettings({ syncCategories: {} });
+      expect(isSyncCategoryEnabled('book_data')).toBe(true);
+    });
+
+    test('follows its toggle', () => {
+      setSettings({ syncCategories: { book_data: false } });
+      expect(isSyncCategoryEnabled('book_data')).toBe(false);
+    });
+
+    test('is not gated by Readest Cloud', () => {
+      setSettings({ webdav: { enabled: true } } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book_data')).toBe(true);
+    });
+  });
+
   describe('cloud sync provider gate (exclusive routing, #4380)', () => {
     test('book/progress/note are gated off while a third-party provider is selected', () => {
       setSettings({ webdav: { enabled: true } } as Partial<SystemSettings>);
@@ -222,12 +243,25 @@ describe('isSyncCategoryEnabled', () => {
   });
 });
 
+describe('translator category', () => {
+  test('one toggle gates both custom_translator and translation_prompt kinds', () => {
+    expect(isSyncCategoryEnabled('translation_prompt')).toBe(true);
+    setSettings({ syncCategories: { custom_translator: false } });
+    expect(isSyncCategoryEnabled('custom_translator')).toBe(false);
+    expect(isSyncCategoryEnabled('translation_prompt')).toBe(false);
+  });
+});
+
 describe('SYNC_CATEGORIES', () => {
-  test('covers all ten user-facing categories (incl. settings + stats + credentials)', () => {
+  test('covers all fifteen user-facing categories (incl. book_data + settings + stats + vocabulary + credentials)', () => {
     expect([...SYNC_CATEGORIES].sort()).toEqual(
       [
+        'abs_server',
         'book',
+        'book_data',
         'credentials',
+        'custom_translator',
+        'custom_tts',
         'dictionary',
         'font',
         'note',
@@ -236,6 +270,7 @@ describe('SYNC_CATEGORIES', () => {
         'settings',
         'stats',
         'texture',
+        'vocabulary',
       ].sort(),
     );
   });

@@ -1,12 +1,13 @@
 import { Dispatch, SetStateAction, useCallback } from 'react';
 import { Book } from '@/types/book';
 import { useEnv } from '@/context/EnvContext';
-import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useAppRouter } from '@/hooks/useAppRouter';
+import { hasFileSyncMirror, useMakeBookAvailable } from '@/hooks/useMakeBookAvailable';
 import { eventDispatcher } from '@/utils/event';
 import { navigateToReader, showReaderWindow } from '@/utils/nav';
+import { isAbsEbook, isAudiobook } from '@/utils/audiobook';
 
 interface UseOpenBookOptions {
   setLoading: Dispatch<SetStateAction<boolean>>;
@@ -26,51 +27,40 @@ interface UseOpenBookOptions {
 export const useOpenBook = ({ setLoading, handleBookDownload }: UseOpenBookOptions) => {
   const _ = useTranslation();
   const router = useAppRouter();
-  const { envConfig, appService } = useEnv();
+  const { appService } = useEnv();
   const { settings } = useSettingsStore();
-  const { updateBook } = useLibraryStore();
-
-  const makeBookAvailable = useCallback(
-    async (book: Book) => {
-      // A book with no cloud copy has nothing to fetch; `openBook` below already
-      // handles the case where such a book's local file is gone.
-      if (!book.uploadedAt) return true;
-      // The row's `downloadedAt` is not proof that the file is still here: a
-      // "Remove from Device Only" evicts the file, and an in-place original can
-      // be moved or deleted behind our back. Probe, and re-fetch from the cloud
-      // when it's really gone, instead of opening a reader that cannot load.
-      if (await appService?.isBookAvailable(book)) {
-        if (!book.downloadedAt || !book.coverDownloadedAt) {
-          book.downloadedAt = Date.now();
-          book.coverDownloadedAt = Date.now();
-          await updateBook(envConfig, book);
-        }
-        return true;
-      }
-      let available = false;
-      const loadingTimeout = setTimeout(() => setLoading(true), 200);
-      try {
-        available = await handleBookDownload(book, { queued: false });
-        await updateBook(envConfig, book);
-      } finally {
-        if (loadingTimeout) clearTimeout(loadingTimeout);
-        setLoading(false);
-      }
-      return available;
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [appService, envConfig, handleBookDownload, setLoading],
-  );
+  const makeBookAvailable = useMakeBookAvailable({ setLoading, handleBookDownload });
 
   const openBook = useCallback(
-    async (book: Book) => {
+    async (book: Book, cfi?: string, options?: { highlightSearchResult?: boolean }) => {
+      // A streaming audiobook has no local file and no document loader path -
+      // it opens in the full-screen player instead of the reader. Short-circuit
+      // before any of the file-availability logic below, which assumes a real
+      // file backs `book.filePath`.
+      if (isAudiobook(book)) {
+        router.push(`/player?id=${book.hash}`);
+        return;
+      }
       // In-place books point at a file outside Books/<hash>/ that the user (or
       // another app) may have moved, renamed, or deleted between sessions. Probe
       // the source before navigating: if it's gone, drop the stale record
       // instead of opening the reader only to fail and bounce back. Restricted
       // to purely-local in-place books — cloud-synced books (`uploadedAt`) still
       // go through `makeBookAvailable`'s on-demand download path.
-      if (book.filePath && !book.uploadedAt && !book.deletedAt) {
+      //
+      // This dispatch is the only automatic route into `handleBookDelete('both')`,
+      // which tombstones the book and lets the file sync GC its directory off the
+      // remote — so a device with a file mirror must never take it (#5265). A
+      // missing LOCAL file is not evidence that the user wants the REMOTE copy
+      // destroyed, and there the book is very likely still on the mirror;
+      // `makeBookAvailable` below fetches it back instead.
+      if (
+        book.filePath &&
+        !isAbsEbook(book) &&
+        !book.uploadedAt &&
+        !book.deletedAt &&
+        !hasFileSyncMirror()
+      ) {
         const available = await appService?.isBookAvailable(book);
         if (!available) {
           eventDispatcher.dispatch('toast', {
@@ -85,11 +75,15 @@ export const useOpenBook = ({ setLoading, handleBookDownload }: UseOpenBookOptio
       }
       const available = await makeBookAvailable(book);
       if (!available) return;
+      const params = new URLSearchParams();
+      if (cfi) params.set('cfi', cfi);
+      if (cfi && options?.highlightSearchResult) params.set('highlight', 'search');
+      const queryParams = params.size ? params.toString() : undefined;
       if (appService?.hasWindow && settings.openBookInNewWindow) {
-        showReaderWindow(appService, [book.hash]);
+        showReaderWindow(appService, [book.hash], queryParams);
       } else {
         setTimeout(() => {
-          navigateToReader(router, [book.hash]);
+          navigateToReader(router, [book.hash], queryParams);
         }, 0);
       }
     },

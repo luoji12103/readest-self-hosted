@@ -1,5 +1,6 @@
 import type { FieldEnvelope, FieldsObject, Manifest, ReplicaRow } from '@/types/replica';
 import type { ImportedDictionary } from '@/services/dictionaries/types';
+import { parsePluginDictionaryMetadata } from '@/services/dictionaries/plugins/record';
 
 export interface UnwrappedDictionaryFields {
   name?: string;
@@ -8,6 +9,7 @@ export interface UnwrappedDictionaryFields {
   addedAt?: number;
   unsupported?: boolean;
   unsupportedReason?: string;
+  plugin?: ImportedDictionary['plugin'];
 }
 
 const unwrapEnvelopeValue = (env: FieldEnvelope | undefined): unknown =>
@@ -26,17 +28,24 @@ export const unwrapDictionaryFields = (fields: FieldsObject): UnwrappedDictionar
   const addedAt = unwrapEnvelopeValue(fields['addedAt']);
   const unsupported = unwrapEnvelopeValue(fields['unsupported']);
   const unsupportedReason = unwrapEnvelopeValue(fields['unsupportedReason']);
+  const plugin = parsePluginDictionaryMetadata(unwrapEnvelopeValue(fields['plugin']));
 
   return {
     name: typeof name === 'string' ? name : undefined,
     kind:
-      kind === 'mdict' || kind === 'stardict' || kind === 'dict' || kind === 'slob'
+      kind === 'mdict' ||
+      kind === 'stardict' ||
+      kind === 'dict' ||
+      kind === 'slob' ||
+      kind === 'bgl' ||
+      kind === 'plugin'
         ? kind
         : undefined,
     lang: typeof lang === 'string' ? lang : undefined,
     addedAt: typeof addedAt === 'number' ? addedAt : undefined,
     unsupported: unsupported === true ? true : undefined,
     unsupportedReason: typeof unsupportedReason === 'string' ? unsupportedReason : undefined,
+    plugin,
   };
 };
 
@@ -74,6 +83,10 @@ export const filesFromManifest = (
       else if (lower.endsWith('.dict.dz') || lower.endsWith('.dict')) out.dict = f.filename;
     } else if (kind === 'slob') {
       if (lower.endsWith('.slob')) out.slob = f.filename;
+    } else if (kind === 'bgl') {
+      if (lower.endsWith('.bgl')) out.bgl = f.filename;
+    } else if (kind === 'plugin') {
+      if (!out.pluginSource) out.pluginSource = f.filename;
     }
   }
 
@@ -96,7 +109,7 @@ export const buildLocalDictFromRow = (
   bundleDir: string,
 ): ImportedDictionary | null => {
   const fields = unwrapDictionaryFields(row.fields_jsonb);
-  if (!fields.name || !fields.kind) return null;
+  if (!fields.name || !fields.kind || (fields.kind === 'plugin' && !fields.plugin)) return null;
 
   const dict: ImportedDictionary = {
     // dict.id is the cross-device-stable contentId (= replica_id).
@@ -113,6 +126,7 @@ export const buildLocalDictFromRow = (
   if (fields.lang !== undefined) dict.lang = fields.lang;
   if (fields.unsupported) dict.unsupported = true;
   if (fields.unsupportedReason) dict.unsupportedReason = fields.unsupportedReason;
+  if (fields.plugin) dict.plugin = fields.plugin;
   if (row.reincarnation) dict.reincarnation = row.reincarnation;
 
   return dict;

@@ -1,4 +1,5 @@
 import { localizeNumber } from './number';
+import type { BookProgress } from '@/types/book';
 import type { TOCItem } from '@/libs/document';
 
 interface ChapterTickSource {
@@ -66,8 +67,47 @@ export function formatProgress(
   }
 }
 
+/**
+ * The '{percent}%' readout driven by the continuous reading fraction instead
+ * of the page pair. The pair is foliate's location estimate floored to a
+ * size-per-location grid, so a percent derived from it stays put for several
+ * page turns and always reads low by up to one grid cell; the fraction is the
+ * same position before that flooring (chapter-local layout interpolated,
+ * section sizes byte-weighted). The display semantics are unchanged: still the
+ * book-level percent, with the same decimals rule as formatProgress (one
+ * decimal only mid-book on books with more than 100 locations, integer
+ * elsewhere, exactly 100% on the last page). Before the first relocate has
+ * populated `fraction`, falls back to the pair-based percent.
+ *
+ * Reflowable books only: for fixed-layout books foliate weights `fraction` by
+ * section byte size (image sizes in a CBZ), so callers pass `undefined` there
+ * to keep the page-count percent.
+ */
+export function formatProgressPercent(
+  fraction: number | undefined,
+  current: number | undefined,
+  total: number | undefined,
+  localize: boolean = false,
+  language: string = 'en',
+  fractionDigits: number = 1,
+): string {
+  if (total === undefined || total <= 0) return '';
+  if (fraction === undefined || !Number.isFinite(fraction)) {
+    return formatProgress(current, total, '{percent}%', localize, language, fractionDigits);
+  }
+  const atEnd = current !== undefined && current + 1 >= total;
+  if (atEnd) return '100%';
+  const digits = total > 100 ? fractionDigits : 0;
+  // Only the last page reads 100%: cap below it so rounding (e.g. 99.96 at one
+  // decimal) cannot print "100.0%" a page early.
+  const maxPercent = 100 - 10 ** -digits;
+  const percent = Math.min(maxPercent, Math.max(0, fraction * 100));
+  return `${percent.toFixed(digits)}%`;
+}
+
 export interface ReferencePageItem {
   label?: string;
+  index?: number;
   subitems?: ReferencePageItem[] | null;
 }
 
@@ -76,7 +116,7 @@ export interface ReferencePageInfo {
   total: number;
 }
 
-const collectLabels = (items: ReferencePageItem[]): string[] =>
+export const collectLabels = (items: ReferencePageItem[]): string[] =>
   items.flatMap((item) => [
     item.label?.trim() ?? '',
     ...(item.subitems?.length ? collectLabels(item.subitems) : []),
@@ -104,10 +144,18 @@ export function getReferencePageInfo({
 }): ReferencePageInfo | null {
   if (pageList?.length) {
     const labels = collectLabels(pageList).filter(Boolean);
-    // The last entries may be non-numeric (e.g. a roman-numeral index page),
-    // so the total is the highest numeric label, not the last one.
+    // PDF page lists contain one top-level entry per physical page and retain
+    // its zero-based index. Their labels can restart or switch numbering
+    // systems, so the physical count is authoritative. EPUB page lists are
+    // semantic anchors instead; keep their highest-numeric-label behavior
+    // because they can be sparse and may end in a non-numeric index page.
+    const hasPhysicalPageIndexes = pageList.every((item, index) => item.index === index);
     const numericLabels = labels.filter((label) => /^\d+$/.test(label));
-    const total = numericLabels.length ? Math.max(...numericLabels.map(Number)) : labels.length;
+    const total = hasPhysicalPageIndexes
+      ? pageList.length
+      : numericLabels.length
+        ? Math.max(...numericLabels.map(Number))
+        : labels.length;
     const current = pageItem?.label?.trim() || String(estimatePage(fraction, total));
     return { current, total };
   }
@@ -120,6 +168,43 @@ export function getReferencePageInfo({
   return null;
 }
 
+/**
+ * Merge policy for the user-entered reference page count (issue #5716).
+ *
+ * The count stands in for a page list the book doesn't ship, so it describes
+ * the BOOK — its print edition — not this screen. That makes it the one
+ * `viewSettings` key that has to cross devices, and both sync backends call
+ * this so the two can never drift apart: `useProgressSync.applyRemoteProgress`
+ * for the Readest cloud, `mergeBookConfig` for the file-sync providers.
+ *
+ * A device with no count always adopts a peer's, regardless of which config is
+ * newer — the common case is that the peer typed the count first and this
+ * device has simply read the book more recently. When both sides carry one the
+ * newer config wins.
+ *
+ * `remoteIsNewer` must be a STRICT `remote > local` comparison, so an equal
+ * timestamp keeps the local count. Both callers have to derive it the same way
+ * or the two backends pick different winners for the same pair of configs; a
+ * tie is ordinary rather than rare, because a remote-wins merge copies the
+ * remote `updatedAt` onto the local config.
+ *
+ * A missing remote count never clears a local one. Neither wire can tell
+ * "the user cleared it" from "written by a client that predates this merge"
+ * (`serializeConfig` drops every setting equal to the global default, and the
+ * default is 0), and silently wiping a number the user typed is the worse
+ * failure. The cost is that clearing the count doesn't propagate; the user
+ * re-clears it on the other device.
+ */
+export const resolveReferencePageCount = (
+  local: number | undefined,
+  remote: number | undefined,
+  remoteIsNewer: boolean,
+): number => {
+  if (!remote || remote <= 0) return local ?? 0;
+  if (!local || local <= 0) return remote;
+  return remoteIsNewer ? remote : local;
+};
+
 export function formatNumber(
   number: number | undefined,
   localize: boolean = false,
@@ -129,4 +214,24 @@ export function formatNumber(
     return '';
   }
   return localize ? localizeNumber(number, language) : String(number);
+}
+
+/** Logical location where the current TOC chapter ends, including chapters sharing a spine file. */
+export function getChapterEndLocation(
+  progress: BookProgress | null | undefined,
+  toc: TOCItem[] | null | undefined,
+): number | undefined {
+  if (!progress || !toc?.length) return undefined;
+  const flatten = (items: TOCItem[]): TOCItem[] =>
+    items.flatMap((item) => [item, ...flatten(item.subitems ?? [])]);
+  const items = flatten(toc);
+  const index = items.findIndex((item) => item.href === progress.sectionHref);
+  const start = items[index]?.location?.current;
+  if (index < 0 || start === undefined) return undefined;
+  const next = items
+    .slice(index + 1)
+    .find((item) => !item.location || item.location.current > start);
+  // Use the spine fallback until the next chapter's navigation location is baked.
+  if (next && !next.location) return undefined;
+  return Math.min(next?.location?.current ?? progress.pageinfo.total, progress.pageinfo.total);
 }

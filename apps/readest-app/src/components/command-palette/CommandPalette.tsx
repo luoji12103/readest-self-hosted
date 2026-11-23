@@ -126,6 +126,7 @@ const CommandPalette: React.FC = () => {
   return (
     // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
     <div
+      data-capture-blocking-overlay='true'
       className='fixed inset-0 z-[120] flex items-start justify-center bg-black/50 pt-[15vh]'
       onClick={handleBackdropClick}
     >
@@ -143,7 +144,7 @@ const CommandPalette: React.FC = () => {
           <input
             ref={inputRef}
             type='text'
-            className='placeholder:text-base-content/50 h-12 w-full bg-transparent text-base outline-none'
+            className='placeholder:text-base-content/50 h-12 w-full bg-transparent text-base outline-hidden'
             placeholder={_('Search settings and actions...')}
             value={query}
             onChange={(e) => setQuery(e.target.value)}

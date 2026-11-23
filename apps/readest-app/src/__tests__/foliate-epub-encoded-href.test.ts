@@ -116,7 +116,16 @@ describe('EPUB hrefs that percent-encode reserved characters (#5097)', () => {
 
     // Tapping the TOC row hands its href to `resolveHref`; it must land on the
     // chapter's spine index instead of resolving to nothing.
+    expect(toc[1]!.href).toBe('OEBPS/a&b.html');
     expect(epub.resolveHref(toc[1]!.href)?.index).toBe(1);
+
+    // The decoded href resolves; the still-encoded form a pre-#5097 nav cache
+    // would hold does not. `resolveHref` decodes with `decodeURI`, which leaves
+    // the reserved set encoded, so `OEBPS/a%26b.html` never matches the decoded
+    // manifest entry -> `goTo` silently no-ops. A stale cache carrying that
+    // encoded href is exactly the #5308 TOC-nav failure, which is why
+    // BOOK_NAV_VERSION is bumped (see book-nav-cache.test.ts) to invalidate it.
+    expect(epub.resolveHref('OEBPS/a%26b.html')).toBeNull();
   });
 
   // Issue #346, "Pictures in book (ePub) can not be displayed": a book with a
@@ -174,5 +183,28 @@ describe('EPUB hrefs that percent-encode reserved characters (#5097)', () => {
     for (const [i, name] of Object.values(names).entries()) {
       expect(loaded[i], `section for ${name}`).toContain(`body of ${name}`);
     }
+  });
+});
+
+// #6855: a link out of the book kept only its origin and path. Hrefs inside the
+// book drop the query, since a zip entry name has none, and so did every
+// external URL, so "https://duckduckgo.com/?q=Readest+review" opened as
+// "https://duckduckgo.com/".
+describe('external links in a chapter (#6855)', () => {
+  it('keeps the query and fragment of an external URL', async () => {
+    const { sections } = await openEpub({
+      'META-INF/container.xml': CONTAINER,
+      'OEBPS/content.opf': opf([{ id: 'chapter1', href: 'Text/ch1.html' }]),
+      'OEBPS/Text/ch1.html': chapter('Chapter 1'),
+    });
+
+    expect(sections[0]!.resolveHref('https://duckduckgo.com/?q=Readest+review')).toBe(
+      'https://duckduckgo.com/?q=Readest+review',
+    );
+    expect(sections[0]!.resolveHref('https://example.com/a?b=1&c=2#top')).toBe(
+      'https://example.com/a?b=1&c=2#top',
+    );
+    // a link inside the book still resolves to its zip entry, without a query
+    expect(sections[0]!.resolveHref('ch2.html?x=1#n1')).toBe('OEBPS/Text/ch2.html#n1');
   });
 });

@@ -1,10 +1,14 @@
+import { acknowledgeBookshelfOperation } from '@/services/bookshelves/journal';
 import { HlcGenerator } from '@/libs/crdt';
 import { LocalStorageHlcStore, type HlcSnapshotStore } from '@/libs/hlcStore';
 import { ReplicaSyncClient } from '@/libs/replicaSyncClient';
-import { markSettled, onSettled } from '@/utils/event';
+import { eventDispatcher, markSettled, onSettled } from '@/utils/event';
+import i18n from '@/i18n/i18n';
 import { ReplicaSyncManager, type CursorStore } from './replicaSyncManager';
 
 const REPLICA_SYNC_READY_EVENT = 'replica-sync-ready';
+
+const _ = (key: string) => i18n.t(key, { defaultValue: key });
 
 export interface ReplicaSyncInitOpts {
   deviceId: string;
@@ -71,6 +75,34 @@ export const initReplicaSync = (opts: ReplicaSyncInitOpts): ReplicaSyncContext =
     hlc,
     client,
     cursorStore: opts.cursorStore,
+    prepareRow: async (row) => {
+      if (row.kind !== 'bookshelf') return row;
+      const { getUserID } = await import('@/utils/access');
+      const { isSyncCategoryEnabled } = await import('./syncCategories');
+      if (!isSyncCategoryEnabled('bookshelf') || row.user_id !== (await getUserID())) return null;
+      // The journal keeps the original stamps so LWW still orders by edit time,
+      // but the server rejects a whole batch whose row-level stamp is more than
+      // a minute off its clock — which would wedge every push after an offline
+      // edit. Restamp the row envelope only; the fields keep their own `t`.
+      const updated_at_ts = hlc.next();
+      return {
+        ...row,
+        updated_at_ts,
+        ...(row.deleted_at_ts ? { deleted_at_ts: updated_at_ts } : {}),
+      };
+    },
+    onAcknowledged: (row) => {
+      if (row.kind === 'bookshelf') acknowledgeBookshelfOperation(row);
+    },
+    // The server refuses changes stamped more than a minute from its own time.
+    onClockSkew: () => {
+      eventDispatcher.dispatch('toast', {
+        type: 'error',
+        message: _(
+          "Some changes didn't sync because this device's clock is off. Set the date and time automatically, then try again.",
+        ),
+      });
+    },
   });
 
   instance = { manager, hlc, deviceId: opts.deviceId };

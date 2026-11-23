@@ -4,10 +4,12 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from api import (  # noqa: E402
+    LIST_PAGE_SIZE,
     AuthRequiredError,
     QuotaExceededError,
     ReadestAPIError,
@@ -139,6 +141,17 @@ class TokenRefreshTest(unittest.TestCase):
             client.pull_books()
 
 
+def _iso_ms(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
+def _rows(start, count):
+    """`count` book rows h<start>.. with synced_at at ms start+1, start+2, ..."""
+    return [
+        {'book_hash': 'h%d' % i, 'synced_at': _iso_ms(i + 1)} for i in range(start, start + count)
+    ]
+
+
 class SyncTest(unittest.TestCase):
     def test_pull_books(self):
         transport = FakeTransport()
@@ -148,9 +161,70 @@ class SyncTest(unittest.TestCase):
 
         req = transport.requests[0]
         self.assertEqual(req['method'], 'GET')
-        self.assertEqual(req['url'], f'{API_BASE}/sync?type=books&since=0')
+        self.assertEqual(req['url'], f'{API_BASE}/sync?type=books&since=0&limit=1000')
         self.assertEqual(req['headers']['authorization'], 'Bearer at')
         self.assertEqual(books, [{'book_hash': 'h1'}])
+
+    # A 10k-book cloud library cannot come back in one response (the server
+    # exceeded Cloudflare Worker limits serializing it — error 1102), so
+    # pull_books walks synced_at-ascending pages, advancing `since` to the
+    # newest row seen until a page comes back shorter than the limit.
+    def test_pull_books_pages_until_short_page(self):
+        transport = FakeTransport()
+        transport.queue(200, {'books': _rows(0, 1000)})  # ms 1..1000
+        transport.queue(200, {'books': _rows(1000, 500)})  # ms 1001..1500
+        client = make_client(transport, tokens=valid_tokens())
+        books = client.pull_books()
+
+        self.assertEqual(len(books), 1500)
+        self.assertEqual(len(transport.requests), 2)
+        self.assertEqual(
+            transport.requests[0]['url'], f'{API_BASE}/sync?type=books&since=0&limit=1000'
+        )
+        self.assertEqual(
+            transport.requests[1]['url'], f'{API_BASE}/sync?type=books&since=1000&limit=1000'
+        )
+
+    def test_pull_books_dedupes_rows_reread_at_the_cursor_boundary(self):
+        # The millisecond-truncated cursor re-includes rows whose synced_at
+        # shares the boundary timestamp; they must not appear twice.
+        transport = FakeTransport()
+        page1 = _rows(0, 1000)
+        page2 = [dict(page1[-1]), {'book_hash': 'h1000', 'synced_at': _iso_ms(2000)}]
+        transport.queue(200, {'books': page1})
+        transport.queue(200, {'books': page2})
+        client = make_client(transport, tokens=valid_tokens())
+        books = client.pull_books()
+
+        hashes = [b['book_hash'] for b in books]
+        self.assertEqual(len(hashes), len(set(hashes)))
+        self.assertEqual(len(books), 1001)
+
+    def test_pull_books_terminates_when_the_cursor_cannot_advance(self):
+        # A full page whose rows all share the cursor timestamp is already
+        # complete (the server tie-completes pages); asking again with the
+        # same cursor would loop forever.
+        transport = FakeTransport()
+        same_ms = [{'book_hash': 'h%d' % i, 'synced_at': _iso_ms(500)} for i in range(1000)]
+        transport.queue(200, {'books': same_ms})
+        client = make_client(transport, tokens=valid_tokens())
+        books = client.pull_books(since=500)
+
+        self.assertIn('limit=1000', transport.requests[0]['url'])
+        self.assertEqual(len(books), 1000)
+        self.assertEqual(len(transport.requests), 1)
+
+    def test_pull_books_handles_a_server_that_ignores_limit(self):
+        # Old servers return the full delta in one response; the follow-up
+        # request from the advanced cursor comes back empty and ends the walk.
+        transport = FakeTransport()
+        transport.queue(200, {'books': _rows(0, 1200)})
+        transport.queue(200, {'books': []})
+        client = make_client(transport, tokens=valid_tokens())
+        books = client.pull_books()
+
+        self.assertEqual(len(books), 1200)
+        self.assertEqual(len(transport.requests), 2)
 
     def test_push_books(self):
         transport = FakeTransport()
@@ -197,6 +271,49 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(req['method'], 'GET')
         self.assertEqual(req['url'], f'{API_BASE}/storage/list?bookHash=h')
         self.assertEqual(files, [{'file_key': 'u/Readest/Books/h/h.epub'}])
+
+    def test_list_all_files_paginates(self):
+        transport = FakeTransport()
+        transport.queue(200, {'files': [{'file_key': 'u/a'}], 'totalPages': 2})
+        transport.queue(200, {'files': [{'file_key': 'u/b'}], 'totalPages': 2})
+        client = make_client(transport, tokens=valid_tokens())
+        files = client.list_all_files()
+
+        self.assertEqual(files, [{'file_key': 'u/a'}, {'file_key': 'u/b'}])
+        urls = [req['url'] for req in transport.requests]
+        self.assertEqual(
+            urls,
+            [
+                f'{API_BASE}/storage/list?page=1&pageSize={LIST_PAGE_SIZE}',
+                f'{API_BASE}/storage/list?page=2&pageSize={LIST_PAGE_SIZE}',
+            ],
+        )
+
+    def test_list_all_files_follows_a_clamping_server(self):
+        # Servers cap pageSize and report totalPages for the size they served,
+        # so asking for more than they allow must not truncate the listing.
+        transport = FakeTransport()
+        for page in range(1, 4):
+            transport.queue(200, {'files': [{'file_key': 'u/%d' % page}], 'totalPages': 3})
+        client = make_client(transport, tokens=valid_tokens())
+
+        self.assertEqual(len(client.list_all_files()), 3)
+        self.assertEqual(len(transport.requests), 3)
+
+    def test_list_files_page_returns_total_pages(self):
+        transport = FakeTransport()
+        transport.queue(200, {'files': [{'file_key': 'u/a'}], 'totalPages': 7})
+        client = make_client(transport, tokens=valid_tokens())
+
+        self.assertEqual(client.list_files_page(1), ([{'file_key': 'u/a'}], 7))
+
+    def test_list_all_files_stops_on_single_page(self):
+        transport = FakeTransport()
+        transport.queue(200, {'files': [], 'totalPages': 0})
+        client = make_client(transport, tokens=valid_tokens())
+
+        self.assertEqual(client.list_all_files(), [])
+        self.assertEqual(len(transport.requests), 1)
 
     def test_delete_file(self):
         transport = FakeTransport()

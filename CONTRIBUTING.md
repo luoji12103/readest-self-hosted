@@ -2,6 +2,7 @@
 
 When contributing to `Readest`, whether on GitHub or in other community spaces:
 
+- Follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 - Be respectful, civil, and open-minded.
 - Before opening a new pull request, try searching through the [issue tracker](https://github.com/readest/readest/issues) for known issues or fixes.
 - If you want to make code changes based on your personal opinion(s), make sure you open an issue first describing the changes you want to make, and open a pull request only when your suggestions get approved by maintainers.
@@ -60,12 +61,20 @@ For Windows targets, “Build Tools for Visual Studio 2022” (or a higher editi
 #### Using Nix
 
 If you have Nix installed, you can leverage the included flake to enter a
-development shell to install and run all the necessary dependencies and commands:
+development shell to install and run all the necessary dependencies and commands.
+Run these from the repository root, where `flake.nix` lives:
 
 ```bash
-nix develop ./ops  # enter a dev shell for the web app
-nix develop ./ops#ios # enter a dev shell for the ios app
-nix develop ./ops#android # enter a dev shell for the android app
+nix develop           # enter a dev shell for the web and desktop app
+nix develop .#android # enter a dev shell for the android app
+nix develop .#ios     # enter a dev shell for the ios app (macOS only)
+```
+
+Then, simply run:
+
+```bash
+# copy vendors dist libs to public directory
+pnpm --filter @readest/readest-app setup-vendors
 ```
 
 ### 4. Build for Development

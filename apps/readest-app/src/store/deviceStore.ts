@@ -26,7 +26,11 @@ type DeviceControlState = {
   volumeKeysInterceptionCount: number;
   backKeyInterceptionCount: number;
   getScreenBrightness: () => Promise<number>; // 0.0 to 1.0
-  setScreenBrightness: (brightness: number) => Promise<void>; // brightness: 0.0 to 1.0
+  // brightness: 0.0 to 1.0. `persist` writes through to the system brightness
+  // (system mode) instead of a reader-only override handed back on background.
+  setScreenBrightness: (brightness: number, persist?: boolean) => Promise<void>;
+  lastScreenBrightness: number | null; // 0.0 to 1.0, null once released
+  syncScreenBrightness: () => Promise<void>;
   acquireVolumeKeyInterception: () => void;
   releaseVolumeKeyInterception: () => void;
   acquireBackKeyInterception: () => void;
@@ -36,10 +40,12 @@ type DeviceControlState = {
   acquirePageTurnerKeyInterception: () => void;
   releasePageTurnerKeyInterception: () => void;
   setKeyLearnMode: (enabled: boolean) => void;
+  ensureKeyForwarding: () => void;
   listenToNativeTouchEvents: () => void;
 };
 
 export const useDeviceControlStore = create<DeviceControlState>((set, get) => ({
+  lastScreenBrightness: null,
   volumeKeysIntercepted: false,
   backKeyIntercepted: false,
   volumeKeysInterceptionCount: 0,
@@ -114,6 +120,13 @@ export const useDeviceControlStore = create<DeviceControlState>((set, get) => ({
     interceptKeys({ learnMode: enabled });
   },
 
+  // Apple Pencil gestures are forwarded by the iOS bridge without any
+  // interception being acquired (#5501), so the JS-side forwarding handler
+  // must be installable on its own.
+  ensureKeyForwarding: () => {
+    window.onNativeKeyDown = handleNativeKeyDown;
+  },
+
   listenToNativeTouchEvents: () => {
     window.onNativeTouch = (event: NativeTouchEventType) => {
       return eventDispatcher.dispatch('native-touch', event);
@@ -125,7 +138,13 @@ export const useDeviceControlStore = create<DeviceControlState>((set, get) => ({
     return res.brightness;
   },
 
-  setScreenBrightness: async (brightness: number) => {
-    await setScreenBrightness({ brightness });
+  setScreenBrightness: async (brightness: number, persist = false) => {
+    set({ lastScreenBrightness: brightness >= 0 ? brightness : null });
+    await setScreenBrightness({ brightness, persist });
+  },
+
+  syncScreenBrightness: async () => {
+    const { brightness } = await getScreenBrightness();
+    set({ lastScreenBrightness: brightness >= 0 && brightness <= 1 ? brightness : null });
   },
 }));

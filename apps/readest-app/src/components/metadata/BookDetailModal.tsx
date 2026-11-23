@@ -11,6 +11,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useMetadataEdit } from './useMetadataEdit';
 import { DeleteAction } from '@/types/system';
 import { eventDispatcher } from '@/utils/event';
+import { isAbsOfflineCapable } from '@/utils/audiobook';
 import { isWebAppPlatform } from '@/services/environment';
 import DeleteConfirmAlert from '@/components/DeleteConfirmAlert';
 import Dialog from '@/components/Dialog';
@@ -29,7 +30,10 @@ interface BookDetailModalProps {
   handleBookDeleteCloudBackup?: (book: Book) => void;
   handleBookDeleteLocalCopy?: (book: Book) => void;
   handleBookPurge?: (book: Book) => void;
-  handleBookMetadataUpdate?: (book: Book, updatedMetadata: BookMetadata) => void;
+  handleBookMetadataUpdate?: (book: Book, updatedMetadata: BookMetadata, tags: string[]) => void;
+  handleBookOfflineDownload?: (book: Book) => void;
+  offlinePremiumLabel?: string;
+  onMetadataValueClick?: (type: 'tag' | 'subject', value: string) => void;
 }
 
 // Purge is no longer a standalone menu action — it is an opt-in toggle on the
@@ -54,6 +58,9 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
   handleBookDeleteLocalCopy,
   handleBookPurge,
   handleBookMetadataUpdate,
+  handleBookOfflineDownload,
+  offlinePremiumLabel,
+  onMetadataValueClick,
 }) => {
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
@@ -63,6 +70,7 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [editMode, setEditMode] = useState(false);
   const [bookMeta, setBookMeta] = useState<BookMetadata | null>(null);
+  const [bookTags, setBookTags] = useState<string[]>(book.tags ?? []);
   const [fileSize, setFileSize] = useState<number | null>(null);
   // The parent owns the `book` prop and does not re-pass it after a metadata
   // save, so the details view tracks the saved book locally to refresh its
@@ -72,6 +80,7 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
   // Initialize metadata edit hook
   const {
     editedMeta,
+    editedTags,
     fieldSources,
     lockedFields,
     fieldErrors,
@@ -86,7 +95,7 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
     handleSourceSelection,
     handleCloseSourceSelection,
     resetToOriginal,
-  } = useMetadataEdit(bookMeta);
+  } = useMetadataEdit(bookMeta, bookTags);
 
   const deleteConfigs: Record<DeleteMenuAction, DeleteConfig> = {
     both: {
@@ -127,6 +136,7 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
 
   useEffect(() => {
     setDisplayBook(book);
+    setBookTags(book.tags ?? []);
   }, [book]);
 
   const handleClose = () => {
@@ -147,11 +157,15 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
 
   const handleSaveMetadata = () => {
     if (editedMeta && handleBookMetadataUpdate) {
+      // The edit field keeps empty segments while typing; drop them and
+      // dedupe on save.
+      const savedTags = [...new Set(editedTags.map((tag) => tag.trim()).filter(Boolean))];
       setBookMeta({ ...editedMeta });
+      setBookTags(savedTags);
       // Capture the updated book before handleBookMetadataUpdate clears the
       // temporary cover fields on editedMeta, so the view refreshes its cover.
-      setDisplayBook(getBookWithUpdatedMetadata(book, editedMeta));
-      handleBookMetadataUpdate(book, editedMeta);
+      setDisplayBook(getBookWithUpdatedMetadata(book, editedMeta, savedTags));
+      handleBookMetadataUpdate(book, editedMeta, savedTags);
       setEditMode(false);
     }
   };
@@ -213,6 +227,11 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
     }
   };
 
+  const handleOfflineDownload = () => {
+    handleClose();
+    handleBookOfflineDownload?.(book);
+  };
+
   const handleReupload = async () => {
     handleClose();
     if (handleBookUpload) {
@@ -238,13 +257,14 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
             editMode ? 'sm:min-w-[600px] sm:max-w-[600px]' : 'sm:min-w-[480px] sm:max-w-[480px]',
             'sm:h-auto sm:max-h-[90%]',
           )}
-          contentClassName='!px-6 !py-4'
+          contentClassName='px-6! py-4!'
         >
           <div className='flex w-full select-text items-start justify-center'>
             {editMode && bookMeta ? (
               <BookDetailEdit
                 book={book}
                 metadata={editedMeta}
+                tags={editedTags}
                 fieldSources={fieldSources}
                 lockedFields={lockedFields}
                 fieldErrors={fieldErrors}
@@ -274,6 +294,13 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
                 onUpload={handleBookUpload ? handleReupload : undefined}
                 onShare={handleShare}
                 onExport={handleBookExport}
+                onDownloadOffline={
+                  handleBookOfflineDownload && isAbsOfflineCapable(book)
+                    ? handleOfflineDownload
+                    : undefined
+                }
+                offlinePremiumLabel={offlinePremiumLabel}
+                onMetadataValueClick={onMetadataValueClick}
               />
             )}
           </div>

@@ -1,0 +1,29 @@
+name: Check Nix Dependency Hashes
+
+on:
+  pull_request:
+    paths:
+      - 'pnpm-lock.yaml'
+      - 'Cargo.lock'
+      - 'Cargo.cef.lock'
+      - 'nix/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/nix-deps-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fod-hashes:
+    if: github.repository == 'readest/readest'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - name: verify pinned dependency hashes
+      # No substituters for the readest cache on purpose: the dependency
+      # fetches must actually run so that a stale hash fails here with the
+      # "specified:" / "got:" pair, instead of silently reusing an old cached
+      # store and failing much later on main with ERR_PNPM_NO_OFFLINE_TARBALL.
+      run: nix build -L --keep-going .#default.pnpmDeps .#default.tursoPluginDeps .#default.cargoDeps

@@ -8,10 +8,20 @@ vi.mock('@/services/wordlens/glossPacks', () => ({
   loadGlossIndex: vi.fn().mockResolvedValue(null),
 }));
 
+// The en-zh pack is Simplified; a Traditional hint converts glosses through the
+// bundled OpenCC tables. Stub the WASM so the variant chosen is observable.
+vi.mock('@/utils/simplecc', () => ({
+  initSimpleCC: vi.fn().mockResolvedValue(undefined),
+  runSimpleCC: vi.fn((text: string, variant: string) => `${variant}:${text}`),
+}));
+
 import { refreshSectionGlosses } from '@/app/reader/utils/wordlensSection';
 import { loadGlossIndex } from '@/services/wordlens/glossPacks';
+import type { GlossIndex } from '@/services/wordlens/glossIndex';
+import { runSimpleCC } from '@/utils/simplecc';
 
 const mockedLoad = vi.mocked(loadGlossIndex);
+const mockedConvert = vi.mocked(runSimpleCC);
 
 const viewSettings = (overrides: Partial<ViewSettings> = {}): ViewSettings =>
   ({
@@ -32,6 +42,7 @@ const ctx = (overrides: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   mockedLoad.mockClear();
   mockedLoad.mockResolvedValue(null);
+  mockedConvert.mockClear();
 });
 
 describe('refreshSectionGlosses gating', () => {
@@ -57,5 +68,186 @@ describe('refreshSectionGlosses gating', () => {
     const doc = document.implementation.createHTMLDocument('t');
     await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: '' }));
     expect(mockedLoad).not.toHaveBeenCalled();
+  });
+});
+
+describe('refreshSectionGlosses Traditional Chinese hints', () => {
+  // A fake en-zh index: one difficult word with a Simplified gloss.
+  const enZh = {
+    lookup: (word: string) =>
+      word.toLowerCase() === 'computer' ? { rank: 99999, gloss: '电脑' } : null,
+  } as unknown as GlossIndex;
+
+  const glossOf = async (hintLang: string, appLang = 'en') => {
+    mockedLoad.mockResolvedValue(enZh);
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>The computer</p>';
+    await refreshSectionGlosses(
+      doc,
+      viewSettings({ wordLensHintLang: hintLang }),
+      ctx({ appLang }),
+    );
+    return doc.querySelector('ruby.wl-gloss > rt')?.textContent ?? null;
+  };
+
+  it('keeps the Simplified gloss for zh-CN', async () => {
+    expect(await glossOf('zh-CN')).toBe('电脑');
+    expect(mockedConvert).not.toHaveBeenCalled();
+  });
+
+  it('converts with the Taiwan phrase table for zh-TW (same en-zh pack)', async () => {
+    expect(await glossOf('zh-TW')).toBe('s2twp:电脑');
+    expect(mockedLoad).toHaveBeenCalledWith(expect.anything(), 'en', 'zh', expect.anything());
+  });
+
+  it('converts with the Hong Kong table for zh-HK and plain s2t for zh-Hant', async () => {
+    expect(await glossOf('zh-HK')).toBe('s2hk:电脑');
+    expect(await glossOf('zh-Hant')).toBe('s2t:电脑');
+  });
+
+  it('honours the Traditional app locale when the hint is Auto', async () => {
+    expect(await glossOf('', 'zh-TW')).toBe('s2twp:电脑');
+    expect(await glossOf('', 'zh-Hant-TW')).toBe('s2twp:电脑'); // Android / iOS locale shape
+    expect(await glossOf('', 'zh-Hans-CN')).toBe('电脑');
+  });
+});
+
+describe('refreshSectionGlosses vocabulary marks (#6613)', () => {
+  const marks = (learning: [string, string | undefined][], mastered: string[] = []) => ({
+    learning: new Map(learning),
+    mastered: new Set(mastered),
+  });
+  const render = async (vs: ViewSettings, extra: Record<string, unknown>) => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>Captain Nemo smiled.</p>';
+    await refreshSectionGlosses(doc, vs, ctx({ appLang: 'zh-CN', ...extra }));
+    return [...doc.querySelectorAll('ruby.wl-gloss > rt')].map((rt) => rt.textContent);
+  };
+
+  it('hints a Learning word with a saved hint even when no pack is available', async () => {
+    mockedLoad.mockResolvedValue(null);
+    expect(await render(viewSettings(), { vocabulary: marks([['nemo', '尼莫']]) })).toEqual([
+      '尼莫',
+    ]);
+  });
+
+  it('draws nothing when Word Lens is off', async () => {
+    const vs = viewSettings({ wordLensEnabled: false });
+    expect(await render(vs, { vocabulary: marks([['nemo', '尼莫']]) })).toEqual([]);
+    expect(mockedLoad).not.toHaveBeenCalled();
+  });
+
+  // Marking a word can start a refresh; a reader may select text while the pack
+  // index loads, and drawing hints then would close the dictionary popup.
+  const selectDuringLoad = (doc: Document) => {
+    const fake = { isCollapsed: true, rangeCount: 0 };
+    vi.spyOn(doc, 'getSelection').mockReturnValue(fake as unknown as Selection);
+    mockedLoad.mockImplementation(async () => {
+      fake.isCollapsed = false;
+      fake.rangeCount = 1;
+      return null;
+    });
+    return () => {
+      fake.isCollapsed = true;
+      doc.dispatchEvent(new Event('selectionchange'));
+    };
+  };
+  const hintsIn = (doc: Document) =>
+    [...doc.querySelectorAll('ruby.wl-gloss > rt')].map((rt) => rt.textContent);
+
+  it('waits to draw hints when a selection starts while the pack loads', async () => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>Captain Nemo smiled.</p>';
+    const clearSelection = selectDuringLoad(doc);
+    const vocabulary = marks([['nemo', '尼莫']]);
+    await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: 'zh-CN', vocabulary }));
+    expect(hintsIn(doc)).toEqual([]);
+    clearSelection();
+    expect(hintsIn(doc)).toEqual(['尼莫']);
+  });
+
+  it('leaves drawn hints alone until a live selection clears', async () => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>Captain Nemo smiled.</p>';
+    const vocabulary = marks([['nemo', '尼莫']]);
+    await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: 'zh-CN', vocabulary }));
+    expect(hintsIn(doc)).toEqual(['尼莫']);
+    const fake = { isCollapsed: false, rangeCount: 1 };
+    vi.spyOn(doc, 'getSelection').mockReturnValue(fake as unknown as Selection);
+    const off = viewSettings({ wordLensEnabled: false });
+    await refreshSectionGlosses(doc, off, ctx({ appLang: 'zh-CN', vocabulary }));
+    expect(hintsIn(doc)).toEqual(['尼莫']);
+    fake.isCollapsed = true;
+    doc.dispatchEvent(new Event('selectionchange'));
+    await vi.waitFor(() => expect(hintsIn(doc)).toEqual([]));
+  });
+
+  it('drops a waiting draw once a newer refresh has run', async () => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>Captain Nemo smiled.</p>';
+    const clearSelection = selectDuringLoad(doc);
+    const vocabulary = marks([['nemo', '尼莫']]);
+    await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: 'zh-CN', vocabulary }));
+    const off = viewSettings({ wordLensEnabled: false });
+    await refreshSectionGlosses(doc, off, ctx({ appLang: 'zh-CN', vocabulary }));
+    clearSelection();
+    expect(hintsIn(doc)).toEqual([]);
+  });
+
+  it('hints a Learning phrase inside one text node (#7325)', async () => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>The matter is decreed, Divine aid is at hand.</p>';
+    const vocabulary = marks([['matter is decreed', 'test']]);
+    await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: 'zh-CN', vocabulary }));
+    expect(doc.querySelector('ruby.wl-gloss')?.firstChild?.textContent).toBe('matter is decreed');
+  });
+
+  it('keeps the word hints of a phrase split across inline markup', async () => {
+    const pack = {
+      lookup: (w: string) =>
+        w.toLowerCase() === 'cryptic' ? { rank: 99999, gloss: '晦涩' } : null,
+    } as unknown as GlossIndex;
+    mockedLoad.mockResolvedValue(pack);
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>A cryptic <i>note</i>.</p>';
+    const vocabulary = marks([['cryptic note', '密信']]);
+    await refreshSectionGlosses(doc, viewSettings(), ctx({ appLang: 'zh-CN', vocabulary }));
+    expect(hintsIn(doc)).toEqual(['晦涩']);
+  });
+
+  it('skips a Mastered word the pack would hint', async () => {
+    const pack = {
+      lookup: (w: string) => (w.toLowerCase() === 'smiled' ? { rank: 99999, gloss: '笑' } : null),
+    } as unknown as GlossIndex;
+    mockedLoad.mockResolvedValue(pack);
+    expect(await render(viewSettings(), {})).toEqual(['笑']);
+    expect(await render(viewSettings(), { vocabulary: marks([], ['smiled']) })).toEqual([]);
+  });
+});
+
+describe('whenSelectionClears', () => {
+  // Re-rendering hints unwraps <ruby> around the selected word, which collapses
+  // the selection and closes the dictionary popup the reader is using.
+  it('runs at once without a selection, otherwise after it collapses', async () => {
+    const { whenSelectionClears } = await import('@/app/reader/utils/wordlensSection');
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = '<p>Captain Nemo smiled.</p>';
+    const run = vi.fn();
+    const fake = { isCollapsed: false, rangeCount: 1 };
+    vi.spyOn(doc, 'getSelection').mockReturnValue(fake as unknown as Selection);
+
+    whenSelectionClears(doc, run);
+    expect(run).not.toHaveBeenCalled();
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(run).not.toHaveBeenCalled();
+    fake.isCollapsed = true;
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(run).toHaveBeenCalledTimes(1);
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(run).toHaveBeenCalledTimes(1);
+
+    const now = vi.fn();
+    whenSelectionClears(doc, now);
+    expect(now).toHaveBeenCalledTimes(1);
   });
 });

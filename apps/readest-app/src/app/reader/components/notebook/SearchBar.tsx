@@ -81,17 +81,6 @@ const SearchBar: React.FC<SearchBarProps> = ({
     }
   };
 
-  const filterNotes = (notes: BookNote[], query: string): BookNote[] => {
-    if (!query.trim()) return [];
-
-    const lowercaseQuery = query.toLowerCase();
-    return notes.filter((note) => {
-      const textMatch = note.text?.toLowerCase().includes(lowercaseQuery) || false;
-      const noteMatch = note.note?.toLowerCase().includes(lowercaseQuery) || false;
-      return textMatch || noteMatch;
-    });
-  };
-
   const handleSearchTermChange = (term: string) => {
     if (term.trim().length >= 1) {
       handleSearch(term);
@@ -108,9 +97,13 @@ const SearchBar: React.FC<SearchBarProps> = ({
     }
 
     const { booknotes: allNotes = [] } = config;
-    const validNotes = allNotes.filter((note) => !note.deletedAt);
-
-    const results = filterNotes(validNotes, term);
+    const query = term.trim().toLowerCase();
+    const results = allNotes.filter(
+      (note) =>
+        note.type === 'excerpt' &&
+        !note.deletedAt &&
+        (note.text?.toLowerCase().includes(query) || note.note?.toLowerCase().includes(query)),
+    );
     onSearchResultChange(results);
   };
 
@@ -131,8 +124,8 @@ const SearchBar: React.FC<SearchBarProps> = ({
           value={searchTerm}
           spellCheck={false}
           onChange={handleInputChange}
-          placeholder={_('Search notes and excerpts...')}
-          className='w-full bg-transparent p-2 font-sans text-sm font-light focus:outline-none'
+          placeholder={_('Search excerpts...')}
+          className='w-full bg-transparent p-2 font-sans text-sm font-light focus:outline-hidden'
         />
 
         {searchTerm && (

@@ -8,7 +8,7 @@
 
 use futures_util::TryStreamExt;
 use serde::{ser::Serializer, Serialize};
-use tauri::{command, ipc::Channel, AppHandle};
+use tauri::{command, ipc::Channel, AppHandle, Manager};
 use tauri_plugin_fs::FsExt;
 use tokio::{
     fs::File,
@@ -18,6 +18,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use read_progress_stream::ReadProgressStream;
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
@@ -98,32 +99,80 @@ fn has_disallowed_components(file_path: &str) -> bool {
             .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-/// The app's own storage always carries either the `Readest` data folder or the
-/// app's bundle identifier in its path — the Android sandbox
-/// (`/data/user/0/<identifier>/…`, including the cache dir) and the desktop
-/// identifier dirs (`…/<identifier>/…`). Those paths aren't in the global
-/// `fs_scope()` (their capability patterns are command-scoped), so `is_allowed`
-/// returns false for the app's own files. Accept these segments as a fallback,
-/// the way `dir_scanner::read_dir` does. `..` is already rejected, so foreign
-/// targets (e.g. `~/.ssh/id_rsa`) stay blocked.
-fn is_within_app_storage(file_path: &str, app_identifier: &str) -> bool {
-    file_path.contains("Readest") || file_path.contains(app_identifier)
+/// Resolve existing ancestors too, so a new download beneath a symlink is
+/// checked against the directory where it will actually be written.
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(ancestor)?;
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = ancestor.parent() else {
+                    return Err(error);
+                };
+                ancestor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
-/// Validate a webview-supplied `file_path` before any `File::create`/`File::open`.
-/// Without this, `download_file`/`upload_file` would write/read arbitrary local
-/// paths (e.g. `~/.ssh/id_rsa`, autostart entries) from any JS running in the
-/// privileged Tauri origin — see GHSA-55vr-pvq5-6fmg. We require an absolute,
-/// traversal-free path that is either granted by the fs scope (persisted dialog
-/// grants for custom/external roots) or lives inside the app's own storage.
-fn ensure_path_allowed(app: &AppHandle, file_path: &str) -> Result<()> {
+fn is_within_app_storage(file_path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| file_path.starts_with(root))
+}
+
+/// A custom data location keeps every file beneath a folder named `Readest`,
+/// which the `**/Readest/**/*` fs capability already grants to the fs plugin.
+/// Match a whole path component so `Readest-agent.plist` stays foreign.
+fn is_within_data_dir(file_path: &Path) -> bool {
+    file_path.components().any(|c| c.as_os_str() == "Readest")
+}
+
+/// Refuse `..` before resolving, so neither traversal nor a symlink can carry
+/// a path out of the folder its spelling names.
+fn resolve_request(file_path: &str) -> std::result::Result<PathBuf, Error> {
     if has_disallowed_components(file_path) {
         return Err(Error::Forbidden(file_path.to_string()));
     }
-    if app.fs_scope().is_allowed(std::path::Path::new(file_path))
-        || is_within_app_storage(file_path, &app.config().identifier)
+    Ok(resolve_path(Path::new(file_path))?)
+}
+
+/// Authorize the resolved path against user grants or real application roots.
+/// Callers use the returned path for I/O, never the untrusted spelling.
+pub(crate) fn ensure_path_allowed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    file_path: &str,
+) -> std::result::Result<PathBuf, Error> {
+    let resolved = resolve_request(file_path)?;
+    let scope = app.fs_scope();
+    if scope.is_forbidden(&resolved) {
+        return Err(Error::Forbidden(file_path.to_string()));
+    }
+    let roots: Vec<PathBuf> = [
+        app.path().app_data_dir(),
+        app.path().app_local_data_dir(),
+        app.path().app_config_dir(),
+        app.path().app_cache_dir(),
+    ]
+    .into_iter()
+    .filter_map(|root| root.ok().and_then(|root| resolve_path(&root).ok()))
+    .collect();
+    if scope.is_allowed(&resolved)
+        || is_within_app_storage(&resolved, &roots)
+        || is_within_data_dir(&resolved)
     {
-        return Ok(());
+        return Ok(resolved);
     }
     Err(Error::Forbidden(file_path.to_string()))
 }
@@ -145,10 +194,93 @@ pub struct ProgressPayload {
     transfer_speed: u64,
 }
 
+fn request(
+    client: &reqwest::Client,
+    url: &str,
+    body: Option<&String>,
+    headers: &HashMap<String, String>,
+) -> reqwest::RequestBuilder {
+    let mut request = match body {
+        Some(body) => client.post(url).body(body.clone()),
+        None => client.get(url),
+    };
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    request
+}
+
+/// Sends a request through `client`. With `verified` (the request accepts
+/// invalid certificates and `client` follows no redirects), redirects are
+/// followed here hop by hop: hops within the origin stay on `client`, and the
+/// first hop to another origin continues on the verified client without
+/// credentials, as reqwest does for any cross-host redirect.
+async fn send(
+    client: &reqwest::Client,
+    verified: Option<&reqwest::Client>,
+    url: &str,
+    body: Option<&String>,
+    headers: &HashMap<String, String>,
+) -> Result<reqwest::Response> {
+    use reqwest::StatusCode;
+
+    let Some(verified) = verified else {
+        return Ok(request(client, url, body, headers).send().await?);
+    };
+    let start = reqwest::Url::parse(url).map_err(|e| Error::ContentLength(e.to_string()))?;
+    let mut url = start.clone();
+    // A request is a POST exactly when it carries a body (see `request`).
+    let mut body = body;
+    for _ in 0..=10 {
+        let response = request(client, url.as_str(), body, headers).send().await?;
+        let status = response.status();
+        if !matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
+            return Ok(response);
+        }
+        let Some(next) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .and_then(|location| url.join(location).ok())
+        else {
+            return Ok(response);
+        };
+        if !matches!(
+            status,
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+        ) {
+            body = None;
+        }
+        url = next;
+        if url.origin() != start.origin() {
+            let headers: HashMap<String, String> = headers
+                .iter()
+                .filter(|(key, _)| {
+                    !["authorization", "cookie", "proxy-authorization"]
+                        .iter()
+                        .any(|name| key.eq_ignore_ascii_case(name))
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            return Ok(request(verified, url.as_str(), body, &headers)
+                .send()
+                .await?);
+        }
+    }
+    Err(Error::ContentLength("too many redirects".into()))
+}
+
 #[command]
 #[allow(clippy::too_many_arguments)] // Tauri command surface mirrors the JS caller's options.
-pub async fn download_file(
-    app: AppHandle,
+pub async fn download_file<R: tauri::Runtime>(
+    app: AppHandle<R>,
     url: &str,
     file_path: &str,
     headers: HashMap<String, String>,
@@ -161,35 +293,33 @@ pub async fn download_file(
     use std::cmp::min;
     use tokio::io::AsyncSeekExt;
 
-    ensure_path_allowed(&app, file_path)?;
+    let allowed_path = ensure_path_allowed(&app, file_path)?;
+    let file_path = allowed_path.as_path();
 
     const PART_SIZE: u64 = 1024 * 1024;
 
-    let client = reqwest::ClientBuilder::new()
-        .danger_accept_invalid_certs(skip_ssl_verification.unwrap_or(false))
-        .danger_accept_invalid_hostnames(skip_ssl_verification.unwrap_or(false))
-        .build()?;
+    let relaxed = skip_ssl_verification.unwrap_or(false);
+    let mut builder = reqwest::ClientBuilder::new()
+        .danger_accept_invalid_certs(relaxed)
+        .danger_accept_invalid_hostnames(relaxed);
+    let mut verified = None;
+    if relaxed {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+        verified = Some(reqwest::Client::new());
+    }
+    let client = builder.build()?;
     let force_single = single_threaded.unwrap_or(false);
 
     async fn single_threaded_download(
         client: &reqwest::Client,
+        verified: Option<&reqwest::Client>,
         url: &str,
-        file_path: &str,
+        file_path: &Path,
         headers: &HashMap<String, String>,
         body: &Option<String>,
         on_progress: Channel<ProgressPayload>,
     ) -> Result<HashMap<String, String>> {
-        let mut request = if let Some(body) = body {
-            client.post(url).body(body.clone())
-        } else {
-            client.get(url)
-        };
-
-        for (key, value) in headers {
-            request = request.header(key, value);
-        }
-
-        let response = request.send().await?;
+        let response = send(client, verified, url, body.as_ref(), headers).await?;
         if !response.status().is_success() {
             return Err(Error::HttpErrorCode(
                 response.status().as_u16(),
@@ -224,16 +354,22 @@ pub async fn download_file(
     }
 
     if force_single {
-        return single_threaded_download(&client, url, file_path, &headers, &body, on_progress)
-            .await;
+        return single_threaded_download(
+            &client,
+            verified.as_ref(),
+            url,
+            file_path,
+            &headers,
+            &body,
+            on_progress,
+        )
+        .await;
     }
 
     // Check if server supports range requests
-    let mut range_req = client.get(url).header("Range", "bytes=0-0");
-    for (key, value) in headers.iter() {
-        range_req = range_req.header(key, value);
-    }
-    let range_resp = range_req.send().await?;
+    let mut range_headers = headers.clone();
+    range_headers.insert("Range".into(), "bytes=0-0".into());
+    let range_resp = send(&client, verified.as_ref(), url, None, &range_headers).await?;
     let accept_ranges = range_resp
         .headers()
         .get("accept-ranges")
@@ -256,8 +392,16 @@ pub async fn download_file(
     }
 
     if !accept_ranges || total == 0 {
-        return single_threaded_download(&client, url, file_path, &headers, &body, on_progress)
-            .await;
+        return single_threaded_download(
+            &client,
+            verified.as_ref(),
+            url,
+            file_path,
+            &headers,
+            &body,
+            on_progress,
+        )
+        .await;
     }
 
     // Multi-part download with range access
@@ -271,6 +415,7 @@ pub async fn download_file(
     stream::iter(0..part_count)
         .for_each_concurrent(8, |i| {
             let client = client.clone();
+            let verified = verified.clone();
             let file = Arc::clone(&file);
             let progress = Arc::clone(&progress);
             let headers = headers.clone();
@@ -282,12 +427,10 @@ pub async fn download_file(
                 let end = min(start + PART_SIZE - 1, total - 1);
                 let range_header = format!("bytes={start}-{end}");
 
-                let mut req = client.get(&url).header("Range", range_header);
-                for (key, value) in headers {
-                    req = req.header(key, value);
-                }
+                let mut headers = headers;
+                headers.insert("Range".into(), range_header);
 
-                let resp = match req.send().await {
+                let resp = match send(&client, verified.as_ref(), &url, None, &headers).await {
                     Ok(r) => r,
                     Err(_) => return,
                 };
@@ -326,15 +469,16 @@ pub async fn download_file(
 }
 
 #[command]
-pub async fn upload_file(
-    app: AppHandle,
+pub async fn upload_file<R: tauri::Runtime>(
+    app: AppHandle<R>,
     url: &str,
     file_path: &str,
     method: &str,
     headers: HashMap<String, String>,
     on_progress: Channel<ProgressPayload>,
 ) -> Result<String> {
-    ensure_path_allowed(&app, file_path)?;
+    let allowed_path = ensure_path_allowed(&app, file_path)?;
+    let file_path = allowed_path.as_path();
 
     let file = File::open(file_path).await?;
     let file_len = file.metadata().await.unwrap().len();
@@ -384,29 +528,95 @@ fn file_to_body(channel: Channel<ProgressPayload>, file: File, file_len: u64) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{has_disallowed_components, is_within_app_storage};
+    use super::{
+        has_disallowed_components, is_within_app_storage, is_within_data_dir, resolve_path,
+        resolve_request, send,
+    };
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn app_storage_fallback_accepts_app_paths() {
-        let id = "com.bilingify.readest";
-        // Covers, dictionaries, books, gloss packs — under the `Readest` data dir.
+    fn data_dir_authorizes_custom_library_locations() {
+        // Custom data locations always keep their files beneath a `Readest`
+        // folder (#6383): iCloud Drive, Android shared storage, portable Windows.
+        for path in [
+            "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/Resources/Readest/Readest/Books/h/book.epub",
+            "/storage/emulated/0/Books/Readest/Readest/Books/h/book.epub",
+            "/Users/x/Apps/Readest-portable/Readest/Books/h/book.epub",
+            "/Users/x/Readest",
+        ] {
+            assert!(is_within_data_dir(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/Users/x/Library/LaunchAgents/Readest-agent.plist",
+            "/Users/x/Apps/Readest-portable/secrets.txt",
+            "/Users/x/.ssh/id_rsa",
+        ] {
+            assert!(!is_within_data_dir(Path::new(path)), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_does_not_authorize_escapes_from_a_readest_folder() {
+        let temp = std::env::temp_dir().join(format!("readest-data-dir-{}", std::process::id()));
+        let data = temp.join("Readest");
+        let secret = temp.join("secret");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("key"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&secret, data.join("escape")).unwrap();
+        let allowed = |path: &Path| {
+            resolve_request(path.to_str().unwrap()).is_ok_and(|p| is_within_data_dir(&p))
+        };
+        // `..` is refused before resolution, existing or not.
+        assert!(!allowed(&data.join("../secret/key")));
+        assert!(!allowed(&data.join("Books/../../secret/key")));
+        // A symlink is judged by where it lands, for reads and new downloads.
+        assert!(!allowed(&data.join("escape/key")));
+        assert!(!allowed(&data.join("escape/new/file.epub")));
+        assert!(allowed(&data.join("Books/new.epub")));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn app_storage_does_not_authorize_brand_names_in_foreign_paths() {
+        let roots = [PathBuf::from(
+            "/Users/victim/Library/Application Support/com.bilingify.readest",
+        )];
+        for path in [
+            "/Users/victim/Library/LaunchAgents/Readest-agent.plist",
+            "/Users/victim/Documents/com.bilingify.readest-secrets.txt",
+            "/Users/victim/Library/Application Support/com.bilingify.readest-other/file",
+        ] {
+            assert!(!is_within_app_storage(Path::new(path), &roots));
+        }
         assert!(is_within_app_storage(
-            "/data/user/0/com.bilingify.readest/Readest/Books/abc/cover.png",
-            id
+            Path::new("/Users/victim/Library/Application Support/com.bilingify.readest/Readest/Books/book.epub"),
+            &roots,
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinks_before_authorizing_new_downloads() {
+        let temp = std::env::temp_dir().join(format!("readest-path-scope-{}", std::process::id()));
+        let app = temp.join("app");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, app.join("escape")).unwrap();
+        let roots = [std::fs::canonicalize(&app).unwrap()];
+        let target = resolve_path(&app.join("escape/new/file.epub")).unwrap();
+        assert!(!is_within_app_storage(&target, &roots));
         assert!(is_within_app_storage(
-            "/data/user/0/com.bilingify.readest/Readest/Dictionaries/x/d.mdx",
-            id
+            &resolve_path(&app.join("Books/new.epub")).unwrap(),
+            &roots
         ));
-        // Cache-dir downloads (e.g. OPDS) carry no `Readest` segment but are still
-        // inside the app sandbox, matched via the bundle identifier.
-        assert!(is_within_app_storage(
-            "/data/user/0/com.bilingify.readest/cache/opds-book.epub",
-            id
-        ));
-        // Foreign targets carry neither segment and stay blocked.
-        assert!(!is_within_app_storage("/home/user/.ssh/id_rsa", id));
-        assert!(!is_within_app_storage("/etc/passwd", id));
+        std::os::unix::fs::symlink(temp.join("missing"), app.join("dangling")).unwrap();
+        assert!(resolve_path(&app.join("dangling/file.epub")).is_err());
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -436,5 +646,125 @@ mod tests {
         assert!(!has_disallowed_components(
             "C:\\Users\\x\\AppData\\Roaming\\Readest\\Books\\h.epub"
         ));
+    }
+
+    /// Serves one response per connection on 127.0.0.1 and returns the
+    /// requests it received, lowercased.
+    async fn serve(
+        responses: impl FnOnce(u16) -> Vec<String> + Send + 'static,
+    ) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses(port) {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 4096];
+                let count = stream.read(&mut bytes).await.unwrap();
+                requests.push(String::from_utf8_lossy(&bytes[..count]).to_lowercase());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (port, server)
+    }
+
+    fn redirect(status: &str, location: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const BOOK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbook";
+
+    /// The download's relaxed and verified clients, told apart by user agent,
+    /// with books.example.org and cdn.example.org both on the test server.
+    fn clients(port: u16) -> (reqwest::Client, reqwest::Client) {
+        let client = |agent: &str| {
+            reqwest::Client::builder()
+                .resolve("books.example.org", ([127, 0, 0, 1], port).into())
+                .resolve("cdn.example.org", ([127, 0, 0, 1], port).into())
+                .no_proxy()
+                .user_agent(agent)
+        };
+        (
+            client("relaxed")
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            client("verified").build().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn relaxed_download_verifies_a_redirect_to_another_origin() {
+        let (port, server) = serve(|port| {
+            vec![
+                redirect("302 Found", "/moved"),
+                redirect("302 Found", &format!("http://cdn.example.org:{port}/book")),
+                BOOK.to_string(),
+            ]
+        })
+        .await;
+        let url = format!("http://books.example.org:{port}/get");
+        let (relaxed, verified) = clients(port);
+        let headers = HashMap::from([
+            ("Authorization".to_string(), "Basic dTpw".to_string()),
+            ("X-Device".to_string(), "reader".to_string()),
+        ]);
+
+        let response = send(&relaxed, Some(&verified), &url, None, &headers)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text().await.unwrap(), "book");
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].starts_with("get /get ") && requests[0].contains("user-agent: relaxed")
+        );
+        assert!(
+            requests[1].starts_with("get /moved ") && requests[1].contains("user-agent: relaxed")
+        );
+        assert!(requests[2].starts_with("get /book "));
+        assert!(
+            requests[2].contains("user-agent: verified"),
+            "{}",
+            requests[2]
+        );
+        assert!(!requests[2].contains("authorization:"));
+        assert!(requests[2].contains("x-device: reader"));
+    }
+
+    #[tokio::test]
+    async fn relaxed_download_keeps_a_post_turned_get_across_origins() {
+        let (port, server) = serve(|port| {
+            vec![
+                redirect("303 See Other", "/done"),
+                redirect(
+                    "307 Temporary Redirect",
+                    &format!("http://cdn.example.org:{port}/book"),
+                ),
+                BOOK.to_string(),
+            ]
+        })
+        .await;
+        let url = format!("http://books.example.org:{port}/export");
+        let (relaxed, verified) = clients(port);
+        let body = "{\"token\":\"secret\"}".to_string();
+
+        let response = send(
+            &relaxed,
+            Some(&verified),
+            &url,
+            Some(&body),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.text().await.unwrap(), "book");
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("post /export "));
+        assert!(requests[1].starts_with("get /done "));
+        assert!(requests[2].starts_with("get /book "), "{}", requests[2]);
+        assert!(!requests[2].contains("secret"));
     }
 }

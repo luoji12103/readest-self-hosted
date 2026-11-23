@@ -52,6 +52,20 @@ export const isCaselessLang = (lang: string | null | undefined): boolean => {
   ].includes(normalizedLang);
 };
 
+/**
+ * True when the active UI language uses a script with no upper/lower case
+ * distinction (CJK, Arabic-script, Hebrew, major Indic scripts, Thai,
+ * Tibetan). Use this to opt out of UI rules that depend on the `uppercase`
+ * CSS property for emphasis — those rules render as no-ops in caseless
+ * scripts and the affected text needs alternate visual weight (typically a
+ * larger font-size). Reads the active i18next locale from localStorage and
+ * falls back to navigator.language.
+ */
+export const isCaselessUILang = () => {
+  const uiLanguage = localStorage?.getItem('i18nextLng') || navigator.language || '';
+  return isCaselessLang(uiLanguage);
+};
+
 const ZH_SCRIPTS_MAPPING: Record<string, string> = {
   zh: 'zh-Hans',
   'zh-cn': 'zh-Hans',
@@ -148,13 +162,30 @@ export const inferLangFromScript = (text: string, lang: string): string => {
 
 export const detectLanguage = (content: string): string => {
   try {
-    const iso6393Lang = franc(content.substring(0, 1000));
-    const iso6391Lang = code6393to6391(iso6393Lang) || 'en';
-    return iso6391Lang;
+    const sample = content.substring(0, 1000);
+    const iso6393Lang = franc(sample);
+    const iso6391Lang = code6393to6391(iso6393Lang);
+    if (iso6391Lang) return iso6391Lang;
+    // franc returns "und" for short CJK text such as a TXT title line. Defaulting
+    // to English there sends the caller down the wrong path (e.g. TXT chapter
+    // detection never applies the Chinese regexps), so read the script instead.
+    // See issue #6172.
+    return inferLangFromScript(sample, '') || 'en';
   } catch {
     console.warn('Language detection failed, defaulting to en.');
     return 'en';
   }
+};
+
+// A PDF rarely declares a language, and its text layer is always tagged `en`, so
+// Read Aloud picks the voice from the page being read. Short pages (a cover, a
+// heading) are left alone: too little text to tell English from its neighbours.
+export const getPDFSpeechLang = (primaryLang: string | undefined, pageText: string): string => {
+  if (isValidLang(primaryLang) && !['en', 'eng'].includes(normalizedLangCode(primaryLang))) {
+    return primaryLang!;
+  }
+  const text = pageText.replace(/\s+/g, ' ').trim();
+  return text.length >= 100 ? detectLanguage(text) : 'en';
 };
 
 export const getLanguageInfo = (lang: string) => {
@@ -162,7 +193,7 @@ export const getLanguageInfo = (lang: string) => {
   try {
     const canonical = Intl.getCanonicalLocales(lang)[0]!;
     const locale = new Intl.Locale(canonical) as LocaleWithTextInfo;
-    const isCJK = ['zh', 'ja', 'kr'].includes(locale.language);
+    const isCJK = ['zh', 'ja', 'ko'].includes(locale.language);
     const direction = (locale.getTextInfo?.() ?? locale.textInfo)?.direction;
     return { canonical, locale, isCJK, direction };
   } catch (e) {

@@ -9,6 +9,7 @@
 
 The **en↔中文** packs use dedicated dictionaries (highest quality there); **all other
 pairs** (es/fr/de/pt/it/ru ↔ en) use the lightweight WikDict + FrequencyWords stack.
+**en→vi**, **en→hu** and **en→ar** have no WikDict dictionary and use the kaikki.org raw wiktextract dump instead.
 
 ## Sources
 
@@ -20,6 +21,12 @@ pairs** (es/fr/de/pt/it/ru ↔ en) use the lightweight WikDict + FrequencyWords 
   https://github.com/drkameleon/complete-hsk-vocabulary
 - **WikDict** (bilingual glosses for es/fr/de/pt/it/ru ↔ en) — CC-BY-SA 3.0,
   derived from DBnary / Wiktionary. https://www.wikdict.com/
+- **kaikki.org raw wiktextract dump** of the English Wiktionary (English→Vietnamese,
+  English→Hungarian and English→Arabic glosses, from the `translations` of each
+  `lang_code: en` entry) —
+  CC-BY-SA 4.0. https://kaikki.org/dictionary/rawdata.html — the per-language
+  `kaikki.org-dictionary-<Language>.jsonl` files are post-processed for the website and
+  deprecated (tatuylonen/wiktextract#1178); only the raw dump is meant for reuse.
 - **FrequencyWords** (difficulty ranking; word-frequency lists from OpenSubtitles/OPUS)
   — CC-BY-SA 4.0. https://github.com/hermitdave/FrequencyWords
 - **lemmatization-lists** (form→lemma mappings used to lemmatize non-English source
@@ -46,6 +53,11 @@ node scripts/build-wordlens-data.mjs build-wikdict es en es_50k.txt es-en.sqlite
 node scripts/build-wordlens-data.mjs build-wikdict en es en_50k.txt en-es.sqlite3 20000
 # (repeat for fr/de/pt/it/ru ↔ en)
 
-# For maximum coverage, the kaikki Wiktionary dump can be used instead of WikDict:
-node scripts/build-wordlens-data.mjs build es en es_50k.txt /path/to/es-extract.jsonl 20000
+# For maximum coverage — and for en→vi / en→hu / en→ar, which WikDict does not cover at all — the kaikki
+# raw wiktextract dump (raw-wiktextract-data.jsonl.gz: every language, read gzipped, filtered
+# by lang_code) can be used instead of WikDict:
+node scripts/build-wordlens-data.mjs build es en es_50k.txt /path/to/raw-wiktextract-data.jsonl.gz 20000
+node scripts/build-wordlens-data.mjs build en vi en_50k.txt /path/to/raw-wiktextract-data.jsonl.gz 20000
+node scripts/build-wordlens-data.mjs build en hu en_50k.txt /path/to/raw-wiktextract-data.jsonl.gz 20000
+node scripts/build-wordlens-data.mjs build en ar en_50k.txt /path/to/raw-wiktextract-data.jsonl.gz 20000
 ```

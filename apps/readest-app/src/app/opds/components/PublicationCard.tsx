@@ -10,7 +10,7 @@ interface PublicationCardProps {
   baseURL: string;
   onClick: () => void;
   resolveURL: (url: string, base: string) => string;
-  onGenerateCachedImageUrl: (url: string) => Promise<string>;
+  onGenerateCachedImageUrl: (url: string, cacheVersion?: string) => Promise<string>;
 }
 
 export function PublicationCard({
@@ -51,13 +51,14 @@ export function PublicationCard({
 
   return (
     <div role='none' onClick={onClick} className='card cursor-pointer transition-shadow'>
-      <figure className='bg-base-200 relative aspect-[28/41] overflow-hidden rounded shadow-md'>
+      <figure className='bg-base-200 relative aspect-[28/41] overflow-hidden rounded-sm shadow-md'>
         <CachedImage
           src={imageUrl}
           alt={publication.metadata?.title || 'Book cover'}
           fill
           className='object-cover'
           sizes='(max-width: 640px) 50vw, (max-width: 1024px) 33vw, 25vw'
+          cacheVersion={publication.metadata?.updated}
           onGenerateCachedImageUrl={onGenerateCachedImageUrl}
         />
       </figure>

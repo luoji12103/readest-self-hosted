@@ -47,6 +47,7 @@ export interface TTSAudioBufferSourceNode {
 
 export interface TTSAudioContext {
   readonly currentTime: number;
+  readonly outputLatency?: number;
   readonly state: string; // 'running' | 'suspended' | 'interrupted' | 'closed'
   readonly destination: unknown;
   onstatechange: (() => void) | null;
@@ -65,6 +66,15 @@ export interface ChunkTiming {
   mediaScale: number;
   // Silence scheduled after this chunk; the caller rate-scales it.
   gapSec: number;
+}
+
+export interface SessionOptions {
+  // Silence to leave between the previous session's last sample and this
+  // session's first one, scheduled on the audio clock. A paragraph is one
+  // session, so this is the inter-paragraph pause: putting it here (rather
+  // than sleeping between sessions) lets the next paragraph's synthesis and
+  // decode run *inside* the pause instead of extending it (#5750).
+  startAfterPreviousSec?: number;
 }
 
 export type WebAudioPlayerEvent =
@@ -125,21 +135,26 @@ export const ensureSharedAudioContext = async (): Promise<void> => {
   }
 };
 
-// Inaudible background keep-alive for direct-speak engines (Android system TTS).
+// Inaudible background keep-alive for a page that must stay schedulable.
 //
-// When the screen locks the WebView page becomes hidden, and Chromium throttles
-// (and eventually freezes) a hidden page's timers and task queues — which stalls
-// the JS-driven per-sentence auto-advance loop that direct-speak engines rely on
-// (their audio renders in the external TTS engine, not the WebView). A page that
-// is emitting audio is exempt from that throttling: that is precisely why Edge
-// TTS keeps reading with the screen off (its speech is audible WebAudio output)
-// while system TTS stops after a page. Merely having a running-but-idle context
-// does NOT earn the exemption — Chromium keys off actual, non-silent output — so
-// we play a continuous 40 Hz tone at ~-62 dBFS: below the reach of phone
-// speakers and masked to inaudibility by the speech, but non-silent enough to
-// keep the page "audible" and its timers alive. See #4408.
+// When the app is backgrounded (or the screen locks) the WebView page becomes
+// hidden, and Chromium throttles — then outright freezes — a hidden page's
+// timers and task queues. A page that is emitting audio is exempt: that is
+// precisely why Edge TTS keeps reading with the screen off (its speech is
+// audible WebAudio output) while system TTS stops after a page. Merely having a
+// running-but-idle context does NOT earn the exemption — Chromium keys off
+// actual, non-silent output — so we play a continuous 40 Hz tone at ~-62 dBFS:
+// below the reach of phone speakers and masked to inaudibility by the speech,
+// but non-silent enough to keep the page "audible" and its timers alive.
+//
+// Two things depend on it: the JS-driven per-sentence auto-advance loop that
+// direct-speak engines rely on while playing (#4408), and — for EVERY engine —
+// the media-session transport handlers of a *paused* session, which live in the
+// page even though the notification itself is served by the native foreground
+// service (#5561).
 const KEEP_ALIVE_FREQ_HZ = 40;
 const KEEP_ALIVE_GAIN = 0.0008;
+let keepAliveCtx: AudioContext | null = null;
 let keepAliveOsc: OscillatorNode | null = null;
 let keepAliveGain: GainNode | null = null;
 
@@ -147,9 +162,15 @@ export const startAudioKeepAlive = (): void => {
   if (typeof AudioContext === 'undefined') return;
   if (keepAliveOsc) return;
   try {
-    const ctx = getSharedContext() as unknown as AudioContext;
-    // The gesture handler already resumed the shared context; nudge it best-
-    // effort in case autoplay policy left it suspended.
+    // A context of its OWN, never the shared one: buffered engines suspend the
+    // shared context to pause (WebAudioPlayer.pauseContext), which would
+    // silence the tone exactly when a paused session needs it — and resuming
+    // that context to feed the tone would un-pause the speech.
+    if (!keepAliveCtx) keepAliveCtx = new AudioContext();
+    const ctx = keepAliveCtx;
+    // TTS only ever starts from a user gesture, so the page has sticky
+    // activation and the context comes up running; nudge it best-effort in
+    // case autoplay policy left it suspended.
     if (ctx.state !== 'running') void ctx.resume();
     const osc = ctx.createOscillator();
     osc.frequency.value = KEEP_ALIVE_FREQ_HZ;
@@ -171,9 +192,15 @@ export const stopAudioKeepAlive = (): void => {
     keepAliveOsc?.stop();
     keepAliveOsc?.disconnect();
     keepAliveGain?.disconnect();
+    // Close rather than suspend: an idle-but-running context still renders
+    // silence to an open output stream, and unlike the shared context this one
+    // has no other use. A later start() builds a fresh one, which is also the
+    // path that has to work when Pause arrives with the app already hidden.
+    void keepAliveCtx?.close();
   } catch (err) {
     console.warn('[TTS] audio keep-alive stop failed', err);
   }
+  keepAliveCtx = null;
   keepAliveOsc = null;
   keepAliveGain = null;
 };
@@ -185,6 +212,10 @@ export class WebAudioPlayer implements TTSAudioPlayer {
   #generation = 0;
   #session: PlayerSession | null = null;
   #userPaused = false;
+  // Audio-clock time the last naturally-ended session stopped sounding, or 0
+  // when there is nothing to hand over (first session, or one that was aborted
+  // mid-playback by a stop/seek/skip). Consumed by the next startSession.
+  #carryOverEndTime = 0;
 
   constructor(createContext?: () => TTSAudioContext) {
     this.#createContext = createContext ?? getSharedContext;
@@ -214,14 +245,18 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     return buffer;
   }
 
-  startSession(onEvent: (event: WebAudioPlayerEvent) => void): number {
+  startSession(onEvent: (event: WebAudioPlayerEvent) => void, opts?: SessionOptions): number {
     this.abortSession();
     const generation = ++this.#generation;
+    // Consume the handover once: a session that is later aborted must not pass
+    // the same deadline on to the one after it.
+    const carryOver = this.#carryOverEndTime;
+    this.#carryOverEndTime = 0;
     this.#session = {
       generation,
       onEvent,
       chunks: [],
-      nextStartTime: 0,
+      nextStartTime: carryOver > 0 ? carryOver + Math.max(0, opts?.startAfterPreviousSec ?? 0) : 0,
       ended: false,
       endedEmitted: false,
       waiters: [],
@@ -253,8 +288,11 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     console.log(
       `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${buffer.duration.toFixed(2)}`,
     );
-    if (chunk.index === 0) {
-      session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
+    // The first chunk, or one whose predecessor already ended while its audio
+    // was still being fetched: no onended is left to announce it.
+    const previous = session.chunks[chunk.index - 1];
+    if (!previous || previous.ended) {
+      session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
     }
   }
 
@@ -272,6 +310,11 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     const session = this.#session;
     if (!session) return;
     this.#session = null;
+    // A session cut short (stop, seek, skip to another sentence) has no end to
+    // hand over: its scheduled tail never sounds, so the next session must
+    // start from the live clock. The handover between two paragraphs aborts
+    // too, but only after session-end already recorded the real end time.
+    if (!session.endedEmitted) this.#carryOverEndTime = 0;
     for (const chunk of session.chunks) {
       chunk.source.onended = null;
       try {
@@ -333,13 +376,17 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (!session || session.generation !== generation || !ctx) return null;
     const first = session.chunks[0];
     if (!first) return null;
-    const t = ctx.currentTime;
+    // What the speakers play now: the clock runs ahead of them by the output
+    // latency, which would light each word before it is heard.
+    const t = ctx.currentTime - (ctx.outputLatency ?? 0);
     let active = first;
     for (const chunk of session.chunks) {
       if (chunk.startTime <= t) active = chunk;
       else break;
     }
-    const within = Math.min(Math.max(t - active.startTime, 0), active.duration);
+    // Negative only before the first chunk starts, so its first word waits
+    // for its audio instead of lighting during the pause before it.
+    const within = Math.min(t - active.startTime, active.duration);
     return {
       chunkIndex: active.index,
       mediaTimeSec: active.timing.trimStartSec + within * active.timing.mediaScale,
@@ -387,6 +434,11 @@ export class WebAudioPlayer implements TTSAudioPlayer {
     if (!session.ended || session.endedEmitted) return;
     if (session.chunks.some((c) => !c.ended)) return;
     session.endedEmitted = true;
+    // Hand the audio clock to the next session. The last chunk's own trailing
+    // gap is dropped: it was never sounded (nothing follows it in this
+    // session), and the next session brings its own inter-paragraph pause.
+    const last = session.chunks[session.chunks.length - 1];
+    this.#carryOverEndTime = last ? last.startTime + last.duration : 0;
     session.onEvent({ type: 'session-end' });
   }
 

@@ -17,6 +17,36 @@ msgstr "Readest"
 msgid "Keeps your KOReader and Readest devices in sync."
 msgstr "รักษาการซิงค์ระหว่างอุปกรณ์ KOReader และ Readest ของคุณ"
 
+msgid "Downloading %1 of %2…"
+msgstr "กำลังดาวน์โหลด %1 จาก %2…"
+
+msgid "%1 MB downloaded"
+msgstr "ดาวน์โหลดแล้ว %1 MB"
+
+msgid "No downloads in progress."
+msgstr "ไม่มีการดาวน์โหลดที่กำลังดำเนินการ"
+
+msgid "Run in background"
+msgstr "ทำงานในเบื้องหลัง"
+
+msgid "Cancel download"
+msgstr "ยกเลิกการดาวน์โหลด"
+
+msgid "Download cancelled. %1 of %2 downloaded."
+msgstr "ยกเลิกการดาวน์โหลดแล้ว ดาวน์โหลด %1 จาก %2 แล้ว"
+
+msgid "Downloaded %1 of %2 (skipped %3)."
+msgstr "ดาวน์โหลด %1 จาก %2 แล้ว (ข้าม %3)"
+
+msgid "Downloaded %1 of %2."
+msgstr "ดาวน์โหลด %1 จาก %2 แล้ว"
+
+msgid "Set Home folder in File Manager first to enable downloads."
+msgstr "ตั้งค่าโฟลเดอร์หลักในตัวจัดการไฟล์ก่อนเพื่อเปิดใช้งานการดาวน์โหลด"
+
+msgid "No books to download."
+msgstr "ไม่มีหนังสือให้ดาวน์โหลด"
+
 msgid "Library view"
 msgstr "มุมมองคลัง"
 
@@ -68,8 +98,14 @@ msgstr "จากน้อยไปมาก"
 msgid "Actions"
 msgstr "การกระทำ"
 
+msgid "Sync now"
+msgstr "ซิงค์ตอนนี้"
+
 msgid "Download all books"
 msgstr "ดาวน์โหลดหนังสือทั้งหมด"
+
+msgid "Download progress"
+msgstr "ความคืบหน้าการดาวน์โหลด"
 
 msgid "Rescan library"
 msgstr "สแกนคลังใหม่"
@@ -104,6 +140,12 @@ msgstr "ค้นหาในคลัง"
 msgid "Search title or author"
 msgstr "ค้นหาชื่อหรือผู้แต่ง"
 
+msgid "Books synced"
+msgstr "ซิงค์หนังสือแล้ว"
+
+msgid "Books sync failed"
+msgstr "ซิงค์หนังสือไม่สำเร็จ"
+
 msgid "Cover Browser plugin required for full Library rendering. Falling back to plain list."
 msgstr "ต้องใช้ปลั๊กอิน Cover Browser เพื่อแสดงคลังเต็มรูปแบบ กลับไปใช้รายการธรรมดา"
 
@@ -116,18 +158,6 @@ msgstr "ดาวน์โหลดหนังสือเล่มนี้จ
 msgid "Download"
 msgstr "ดาวน์โหลด"
 
-msgid "Set Home folder in File Manager first to enable downloads."
-msgstr "ตั้งค่าโฟลเดอร์หลักในตัวจัดการไฟล์ก่อนเพื่อเปิดใช้งานการดาวน์โหลด"
-
-msgid "Downloading…"
-msgstr "กำลังดาวน์โหลด…"
-
-msgid "Cloud copy unavailable."
-msgstr "ไม่มีสำเนาบนคลาวด์"
-
-msgid "Download failed."
-msgstr "ดาวน์โหลดไม่สำเร็จ"
-
 msgid "No cover available on Readest."
 msgstr "ไม่มีปกบน Readest"
 
@@ -137,20 +167,8 @@ msgstr "ดาวน์โหลดปกไม่สำเร็จ"
 msgid "Could not delete the file."
 msgstr "ลบไฟล์ไม่ได้"
 
-msgid "No books to download."
-msgstr "ไม่มีหนังสือให้ดาวน์โหลด"
-
-msgid "Downloading %1 of %2…"
-msgstr "กำลังดาวน์โหลด %1 จาก %2…"
-
-msgid "Download cancelled. %1 of %2 downloaded."
-msgstr "ยกเลิกการดาวน์โหลดแล้ว ดาวน์โหลด %1 จาก %2 แล้ว"
-
-msgid "Downloaded %1 of %2 (skipped %3)."
-msgstr "ดาวน์โหลด %1 จาก %2 แล้ว (ข้าม %3)"
-
-msgid "Downloaded %1 of %2."
-msgstr "ดาวน์โหลด %1 จาก %2 แล้ว"
+msgid "Download group"
+msgstr "ดาวน์โหลดกลุ่ม"
 
 msgid "Removing from cloud…"
 msgstr "กำลังลบจากคลาวด์…"
@@ -166,6 +184,12 @@ msgstr "ลบหนังสือเล่มนี้จากคลาวด
 
 msgid "Remove"
 msgstr "ลบ"
+
+msgid "Remove from Library, Keep File"
+msgstr "ลบออกจากคลัง เก็บไฟล์ไว้"
+
+msgid "Remove this book from your library and the cloud? The file stays on this device."
+msgstr "ลบหนังสือเล่มนี้ออกจากคลังและคลาวด์หรือไม่? ไฟล์จะยังอยู่ในอุปกรณ์นี้"
 
 msgid "Remove from Cloud Only"
 msgstr "ลบจากคลาวด์เท่านั้น"
@@ -190,6 +214,9 @@ msgstr "เกินโควตาที่จัดเก็บ"
 
 msgid "Upload failed."
 msgstr "อัปโหลดไม่สำเร็จ"
+
+msgid "Send to nearby Readest devices"
+msgstr "ส่งไปยังอุปกรณ์ Readest ที่อยู่ใกล้เคียง"
 
 msgid "Download Book"
 msgstr "ดาวน์โหลดหนังสือ"
@@ -236,8 +263,8 @@ msgstr "ดึงคำอธิบาย Readest จากอุปกรณ์
 msgid "Full sync all readest annotations"
 msgstr "ซิงค์คำอธิบาย Readest ทั้งหมดแบบเต็ม"
 
-msgid "Add to Readest"
-msgstr "เพิ่มลง Readest"
+msgid "Add to Readest library"
+msgstr "เพิ่มลงในคลัง Readest"
 
 msgid "Sign in to Readest first."
 msgstr "กรุณาลงชื่อเข้าใช้ Readest ก่อน"
@@ -266,14 +293,14 @@ msgstr "ไม่มีหนังสือที่เปิดอยู่"
 msgid "Uploaded to Readest:"
 msgstr "อัปโหลดไปยัง Readest แล้ว:"
 
+msgid "Auto sync"
+msgstr "ซิงค์อัตโนมัติ"
+
 msgid "Log in Readest Account"
 msgstr "เข้าสู่ระบบบัญชี Readest"
 
 msgid "Log out as %1"
 msgstr "ออกจากระบบในชื่อ %1"
-
-msgid "Auto sync"
-msgstr "ซิงค์อัตโนมัติ"
 
 msgid "Readest library"
 msgstr "คลัง Readest"
@@ -284,20 +311,14 @@ msgstr "ส่งสถิติเดี๋ยวนี้"
 msgid "Pull stats now"
 msgstr "ดึงสถิติเดี๋ยวนี้"
 
-msgid "Push books now"
-msgstr "ส่งหนังสือเดี๋ยวนี้"
-
-msgid "Pull books now"
-msgstr "ดึงหนังสือเดี๋ยวนี้"
-
-msgid "Upload current book to Readest"
-msgstr "อัปโหลดหนังสือปัจจุบันไปยัง Readest"
-
 msgid "Push reading progress now"
 msgstr "ส่งความคืบหน้าการอ่านตอนนี้"
 
 msgid "Pull reading progress now"
 msgstr "ดึงความคืบหน้าการอ่านตอนนี้"
+
+msgid "Upload current book to Readest"
+msgstr "อัปโหลดหนังสือปัจจุบันไปยัง Readest"
 
 msgid "Push annotations now"
 msgstr "ส่งคำอธิบายตอนนี้"
@@ -311,6 +332,9 @@ msgstr "ซิงค์คำอธิบายทั้งหมดแบบเ
 msgid "Sync info"
 msgstr "ข้อมูลการซิงค์"
 
+msgid "Receive via Nearby BookDrop"
+msgstr "รับผ่าน Nearby BookDrop"
+
 msgid "Check for update (v%1)"
 msgstr "ตรวจสอบการอัปเดต (v%1)"
 
@@ -319,9 +343,6 @@ msgstr "ตรวจสอบการอัปเดต"
 
 msgid "Please login first"
 msgstr "โปรดเข้าสู่ระบบก่อน"
-
-msgid "Please configure Readest settings first"
-msgstr "โปรดกำหนดค่า Readest ก่อน"
 
 msgid "(none)"
 msgstr "(ไม่มี)"
@@ -344,11 +365,89 @@ msgstr "ข้อมูลการซิงค์"
 msgid "Library not initialized"
 msgstr "ยังไม่ได้เริ่มต้นคลัง"
 
-msgid "Books synced"
-msgstr "ซิงค์หนังสือแล้ว"
+msgid "Set a Readest download folder or a KOReader home folder first."
+msgstr "กรุณาตั้งค่าโฟลเดอร์ดาวน์โหลดของ Readest หรือโฟลเดอร์หลักของ KOReader ก่อน"
 
-msgid "Books sync failed"
-msgstr "ซิงค์หนังสือไม่สำเร็จ"
+msgid "Nearby BookDrop error: could not find a free port."
+msgstr "ข้อผิดพลาด Nearby BookDrop: ไม่พบพอร์ตที่ว่าง"
+
+msgid "Nearby BookDrop failed to start."
+msgstr "เริ่มการทำงาน Nearby BookDrop ไม่สำเร็จ"
+
+msgid "Starting Nearby BookDrop…"
+msgstr "กำลังเริ่ม Nearby BookDrop…"
+
+msgid "Nearby BookDrop will start when Wi-Fi connects."
+msgstr "Nearby BookDrop จะเริ่มทำงานเมื่อเชื่อมต่อ Wi-Fi"
+
+msgid "… and %1 more"
+msgstr "…และอีก %1 รายการ"
+
+msgid "%1 wants to send you %2 file(s) (%3):"
+msgstr "%1 ต้องการส่งไฟล์ %2 ไฟล์ให้คุณ (%3):"
+
+msgid "Accept"
+msgstr "ยอมรับ"
+
+msgid "Decline"
+msgstr "ปฏิเสธ"
+
+msgid "Receiving %1 file(s) from %2…"
+msgstr "กำลังรับไฟล์ %1 ไฟล์จาก %2…"
+
+msgid "Nearby BookDrop: received %1 file(s), %2 failed."
+msgstr "Nearby BookDrop: รับไฟล์แล้ว %1 ไฟล์ ล้มเหลว %2 ไฟล์"
+
+msgid "Nearby BookDrop transfer cancelled."
+msgstr "ยกเลิกการถ่ายโอน Nearby BookDrop แล้ว"
+
+msgid "Nearby BookDrop: received %1 file(s)."
+msgstr "Nearby BookDrop: รับไฟล์แล้ว %1 ไฟล์"
+
+msgid "Nearby BookDrop not available on this device"
+msgstr "ไม่รองรับ Nearby BookDrop บนอุปกรณ์นี้"
+
+msgid "Scanning for nearby devices…"
+msgstr "กำลังค้นหาอุปกรณ์ใกล้เคียง…"
+
+msgid "No nearby devices found. Make sure the other device has Nearby BookDrop or LocalSend open."
+msgstr "ไม่พบอุปกรณ์ใกล้เคียง โปรดตรวจสอบว่าอุปกรณ์อีกเครื่องเปิด Nearby BookDrop หรือ LocalSend อยู่"
+
+msgid "Rescan"
+msgstr "สแกนใหม่"
+
+msgid "Send to…"
+msgstr "ส่งไปยัง…"
+
+msgid "Sending…"
+msgstr "กำลังส่ง…"
+
+msgid "Sending… %1%"
+msgstr "กำลังส่ง… %1%"
+
+msgid "Sent %1 file(s)."
+msgstr "ส่งไฟล์แล้ว %1 ไฟล์"
+
+msgid "The other device declined the transfer."
+msgstr "อุปกรณ์อีกเครื่องปฏิเสธการถ่ายโอน"
+
+msgid "Transfer cancelled."
+msgstr "ยกเลิกการถ่ายโอนแล้ว"
+
+msgid "Send failed: %1"
+msgstr "ส่งไม่สำเร็จ: %1"
+
+msgid "Nearby BookDrop error: %1"
+msgstr "ข้อผิดพลาด Nearby BookDrop: %1"
+
+msgid "Nearby BookDrop off"
+msgstr "Nearby BookDrop ปิดอยู่"
+
+msgid "Visible as %1"
+msgstr "แสดงเป็น %1"
+
+msgid "(limited discovery)"
+msgstr "(การค้นพบจำกัด)"
 
 msgid "Checking for update…"
 msgstr "กำลังตรวจสอบการอัปเดต…"
@@ -410,9 +509,6 @@ msgstr "ซิงค์เต็มรูปแบบ: กำลังดึง�
 msgid "Pulling annotations..."
 msgstr "กำลังดึงคำอธิบาย…"
 
-msgid "Authentication failed, please login again"
-msgstr "การยืนยันตัวตนล้มเหลว โปรดเข้าสู่ระบบอีกครั้ง"
-
 msgid "Failed to pull annotations"
 msgstr "ดึงคำอธิบายไม่สำเร็จ"
 
@@ -422,11 +518,20 @@ msgstr "ไม่พบคำอธิบายใหม่"
 msgid "%1 annotations pulled"
 msgstr "ดึงคำอธิบาย %1 รายการ"
 
+msgid "Your Readest session has expired. Please log in again."
+msgstr "เซสชัน Readest ของคุณหมดอายุแล้ว โปรดเข้าสู่ระบบอีกครั้ง"
+
+msgid "Authentication failed, please login again"
+msgstr "การยืนยันตัวตนล้มเหลว โปรดเข้าสู่ระบบอีกครั้ง"
+
 msgid "Login"
 msgstr "เข้าสู่ระบบ"
 
 msgid "Please enter both email and password"
 msgstr "โปรดป้อนทั้งอีเมลและรหัสผ่าน"
+
+msgid "Sign in with a code"
+msgstr "ลงชื่อเข้าใช้ด้วยรหัส"
 
 msgid "Please configure Supabase URL and API key first"
 msgstr "โปรดกำหนดค่า URL ของ Supabase และคีย์ API ก่อน"
@@ -434,11 +539,17 @@ msgstr "โปรดกำหนดค่า URL ของ Supabase และค
 msgid "Logging in..."
 msgstr "กำลังเข้าสู่ระบบ…"
 
+msgid "Login failed: %1"
+msgstr "เข้าสู่ระบบไม่สำเร็จ: %1"
+
 msgid "Successfully logged in to Readest"
 msgstr "เข้าสู่ระบบ Readest สำเร็จ"
 
-msgid "Login failed: %1"
-msgstr "เข้าสู่ระบบไม่สำเร็จ: %1"
+msgid "Scan the QR code with a phone signed in to Readest, or open %1 and enter this code:\n\n%2"
+msgstr "สแกนคิวอาร์โค้ดด้วยโทรศัพท์ที่ลงชื่อเข้าใช้ Readest อยู่ หรือเปิด %1 แล้วป้อนรหัสนี้:\n\n%2"
+
+msgid "The code expired. Please try again."
+msgstr "รหัสหมดอายุแล้ว โปรดลองอีกครั้ง"
 
 msgid "Logged out from Readest"
 msgstr "ออกจากระบบ Readest แล้ว"
@@ -467,8 +578,65 @@ msgstr "ดึงความคืบหน้าการอ่านไม่
 msgid "Reading progress synchronized"
 msgstr "ซิงค์ความคืบหน้าการอ่านแล้ว"
 
+msgid "Saved reading position cannot be used with this copy of the book"
+msgstr "ไม่สามารถใช้ตำแหน่งการอ่านที่บันทึกไว้กับสำเนาหนังสือนี้ได้"
+
 msgid "No saved reading progress found for this book"
 msgstr "ไม่พบความคืบหน้าการอ่านที่บันทึกไว้สำหรับหนังสือเล่มนี้"
+
+msgid "Sync was cancelled."
+msgstr "ยกเลิกการซิงค์แล้ว"
+
+msgid "The connection timed out. Please try again."
+msgstr "การเชื่อมต่อหมดเวลา โปรดลองอีกครั้ง"
+
+msgid "The network is unreachable. Please check the internet connection."
+msgstr "ไม่สามารถเข้าถึงเครือข่ายได้ โปรดตรวจสอบการเชื่อมต่ออินเทอร์เน็ต"
+
+msgid "The server could not be found. Please check the internet connection."
+msgstr "ไม่พบเซิร์ฟเวอร์ โปรดตรวจสอบการเชื่อมต่ออินเทอร์เน็ต"
+
+msgid "The server refused the connection. Please try again later."
+msgstr "เซิร์ฟเวอร์ปฏิเสธการเชื่อมต่อ โปรดลองอีกครั้งในภายหลัง"
+
+msgid "The connection was interrupted. Please try again."
+msgstr "การเชื่อมต่อถูกขัดจังหวะ โปรดลองอีกครั้ง"
+
+msgid "A secure connection to the server could not be established."
+msgstr "ไม่สามารถสร้างการเชื่อมต่อที่ปลอดภัยกับเซิร์ฟเวอร์ได้"
+
+msgid "Authentication failed. Please log in again."
+msgstr "การยืนยันตัวตนล้มเหลว โปรดเข้าสู่ระบบอีกครั้ง"
+
+msgid "The account changed during sync."
+msgstr "บัญชีเปลี่ยนไประหว่างการซิงค์"
+
+msgid "The file was not found in the cloud."
+msgstr "ไม่พบไฟล์บนคลาวด์"
+
+msgid "The local file is missing."
+msgstr "ไม่พบไฟล์ในเครื่อง"
+
+msgid "An internal error occurred. Please try again."
+msgstr "เกิดข้อผิดพลาดภายใน โปรดลองอีกครั้ง"
+
+msgid "Access denied."
+msgstr "การเข้าถึงถูกปฏิเสธ"
+
+msgid "Not found on the server."
+msgstr "ไม่พบบนเซิร์ฟเวอร์"
+
+msgid "The file is too large."
+msgstr "ไฟล์มีขนาดใหญ่เกินไป"
+
+msgid "Too many requests. Please try again later."
+msgstr "มีคำขอมากเกินไป โปรดลองอีกครั้งในภายหลัง"
+
+msgid "The server is temporarily unavailable. Please try again later."
+msgstr "เซิร์ฟเวอร์ไม่พร้อมใช้งานชั่วคราว โปรดลองอีกครั้งในภายหลัง"
+
+msgid "The request failed. Please try again."
+msgstr "คำขอล้มเหลว โปรดลองอีกครั้ง"
 
 msgid "Reading statistics are up to date"
 msgstr "สถิติการอ่านเป็นปัจจุบันแล้ว"

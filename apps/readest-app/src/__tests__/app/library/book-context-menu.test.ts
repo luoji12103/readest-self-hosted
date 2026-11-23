@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { getBookContextMenuItemIds } from '@/app/library/utils/libraryUtils';
+import { buildFeedBookUrl } from '@/services/rss/feedBookUrl';
 import { Book } from '@/types/book';
 
 const createBook = (overrides: Partial<Book> = {}): Book => ({
@@ -28,6 +29,51 @@ describe('getBookContextMenuItemIds', () => {
       'share',
       'delete',
     ]);
+  });
+
+  it('offers an offline download for Audiobookshelf audiobooks and ebooks (#6256)', () => {
+    const audiobook = createBook({ format: 'ABS', filePath: 'abs://srv/item' });
+    const ebook = createBook({
+      format: 'ABS',
+      filePath: 'abs://srv/item',
+      metadata: { absMediaType: 'ebook' } as never,
+    });
+    expect(getBookContextMenuItemIds(audiobook, { absOffline: true })).toContain('offlineDownload');
+    expect(getBookContextMenuItemIds(ebook, { absOffline: true })).toContain('offlineDownload');
+    // Web builds have nowhere to keep the files.
+    expect(getBookContextMenuItemIds(audiobook)).not.toContain('offlineDownload');
+
+    const downloaded = { ...audiobook, absDownloadedAt: 1 };
+    const ids = getBookContextMenuItemIds(downloaded, { absOffline: true });
+    expect(ids).toContain('offlineRemove');
+    expect(ids).not.toContain('offlineDownload');
+  });
+
+  it('never offers an offline download for podcasts or regular books', () => {
+    const podcast = createBook({
+      format: 'ABS',
+      filePath: 'abs://srv/item',
+      metadata: { absMediaType: 'podcast' } as never,
+    });
+    const podcastWithoutMirror = createBook({
+      format: 'ABS',
+      filePath: 'abs://srv/item',
+      absMediaType: 'podcast',
+    });
+    const offlineIds = ['offlineDownload', 'offlineRemove'];
+    for (const book of [podcast, podcastWithoutMirror, createBook({ downloadedAt: 1 })]) {
+      const ids = getBookContextMenuItemIds(book, { absOffline: true });
+      expect(ids.filter((id) => offlineIds.includes(id))).toEqual([]);
+    }
+  });
+
+  it('offers sendNearby for a local book only when LocalSend is enabled', () => {
+    const local = createBook({ downloadedAt: 1 });
+    expect(getBookContextMenuItemIds(local, { localSend: true })).toContain('sendNearby');
+    expect(getBookContextMenuItemIds(local)).not.toContain('sendNearby');
+    // Cloud-only books have no local file to send.
+    const cloudOnly = createBook({ uploadedAt: 1 });
+    expect(getBookContextMenuItemIds(cloudOnly, { localSend: true })).not.toContain('sendNearby');
   });
 
   it('shows markUnread + markAbandoned + clearStatus for a finished book', () => {
@@ -98,6 +144,26 @@ describe('getBookContextMenuItemIds', () => {
 
   it('omits download/upload/share for a book that is neither downloaded nor uploaded', () => {
     const book = createBook({ filePath: '/some/external/file.epub' });
+    expect(getBookContextMenuItemIds(book)).toEqual([
+      'select',
+      'group',
+      'markFinished',
+      'markAbandoned',
+      'showDetails',
+      'showInFinder',
+      'searchGoodreads',
+      'delete',
+    ]);
+  });
+
+  // Issue #5307 — a feed subscription has no file anywhere: the cloud has
+  // nothing to upload it to and nothing to hand a share link. Offering those
+  // actions only produces a failed transfer.
+  it('omits download/upload/share for a feed book (issue #5307)', () => {
+    const book = createBook({
+      downloadedAt: 1,
+      url: buildFeedBookUrl('https://www.saastr.com/feed/'),
+    });
     expect(getBookContextMenuItemIds(book)).toEqual([
       'select',
       'group',

@@ -5,6 +5,7 @@ import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import RSVPOverlay from '@/app/reader/components/rsvp/RSVPOverlay';
 import type { RSVPController, RsvpState } from '@/services/rsvp';
+import type { Insets } from '@/types/misc';
 
 beforeAll(() => {
   if (!Element.prototype.scrollIntoView) {
@@ -37,8 +38,16 @@ vi.mock('@/app/reader/components/annotator/DictionarySheet', () => ({
 }));
 
 vi.mock('@/app/reader/components/annotator/DictionaryPopup', () => ({
-  default: ({ word, onDismiss }: { word: string; onDismiss: () => void }) => (
-    <div data-testid='rsvp-dict-popup' data-word={word}>
+  default: ({
+    word,
+    capture,
+    onDismiss,
+  }: {
+    word: string;
+    capture?: unknown;
+    onDismiss: () => void;
+  }) => (
+    <div data-testid='rsvp-dict-popup' data-word={word} data-capture={JSON.stringify(capture)}>
       <button aria-label='close-dict' onClick={onDismiss}>
         x
       </button>
@@ -102,22 +111,77 @@ const buildController = (state: RsvpState) => {
   return controller;
 };
 
-const renderOverlay = (state: RsvpState, fontFamily?: string) => {
+const renderOverlay = (
+  state: RsvpState,
+  fontFamily?: string,
+  gridInsets: Insets = { top: 0, bottom: 0, left: 0, right: 0 },
+  extra: Partial<React.ComponentProps<typeof RSVPOverlay>> = {},
+) => {
   const controller = buildController(state);
+  const onClose = vi.fn();
   const result = render(
     <RSVPOverlay
-      gridInsets={{ top: 0, bottom: 0, left: 0, right: 0 }}
+      gridInsets={gridInsets}
       controller={controller as unknown as RSVPController}
       chapters={[]}
       currentChapterHref={null}
       fontFamily={fontFamily}
-      onClose={vi.fn()}
+      onClose={onClose}
       onChapterSelect={vi.fn()}
       onRequestNextPage={vi.fn()}
+      {...extra}
     />,
   );
-  return { ...result, controller };
+  return { ...result, controller, onClose };
 };
+
+describe('RSVPOverlay — capture lifecycle', () => {
+  afterEach(() => cleanup());
+
+  test('marks its mounted full-screen surface as capture-blocking', () => {
+    const state = buildState({
+      words: [{ text: 'hello', orpIndex: 1, pauseMultiplier: 1 }],
+    });
+
+    const { getByTestId } = renderOverlay(state);
+
+    expect(getByTestId('rsvp-overlay').getAttribute('data-capture-blocking-overlay')).toBe('true');
+  });
+});
+
+describe('RSVPOverlay — safe area insets', () => {
+  afterEach(() => cleanup());
+
+  const wordState = () =>
+    buildState({ words: [{ text: 'hello', orpIndex: 1, pauseMultiplier: 1 }], currentIndex: 0 });
+
+  test('pads the full-screen surface horizontally so landscape notches never clip it', () => {
+    const { getByTestId } = renderOverlay(wordState(), undefined, {
+      top: 0,
+      right: 44,
+      bottom: 21,
+      left: 59,
+    });
+
+    const overlay = getByTestId('rsvp-overlay');
+    expect(overlay.style.paddingLeft).toBe('59px');
+    expect(overlay.style.paddingRight).toBe('44px');
+  });
+
+  test('keeps the existing vertical inset treatment', () => {
+    const { getByTestId } = renderOverlay(wordState(), undefined, {
+      top: 47,
+      right: 0,
+      bottom: 34,
+      left: 0,
+    });
+
+    const overlay = getByTestId('rsvp-overlay');
+    expect(overlay.style.paddingTop).toBe('47px');
+    // Bottom bars only need a fraction of the home-indicator inset.
+    expect(overlay.style.paddingBottom).toBe(`${34 * 0.33}px`);
+  });
+});
 
 describe('RSVPOverlay — context panel performance', () => {
   afterEach(() => cleanup());
@@ -494,6 +558,23 @@ describe('RSVPOverlay — dictionary lookup (#4475)', () => {
     expect(popup!.getAttribute('data-word')).toBe('serendipity');
   });
 
+  test('saves the lookup to the vocabulary under the book (#789)', () => {
+    const book = { lang: 'en', hash: 'b1', title: 'Dune', author: 'Herbert' };
+    const { container } = renderOverlay(wordsState(), undefined, undefined, {
+      vocabularyBook: book,
+    });
+    const panel = container.querySelector('[data-testid="rsvp-context-panel"]') as HTMLElement;
+    mockSelection('serendipity', panel);
+    fireEvent.mouseUp(panel);
+    fireEvent.click(container.querySelector('[aria-label="Look up"]') as HTMLElement);
+    const popup = container.querySelector('[data-testid="rsvp-dict-popup"]')!;
+    const capture = JSON.parse(popup.getAttribute('data-capture')!);
+    expect(capture).toMatchObject({
+      lang: 'en',
+      occurrence: { sentence: 'serendipity', bookHash: 'b1', bookTitle: 'Dune' },
+    });
+  });
+
   test('clicking outside the popup dismisses it', () => {
     const { container } = renderOverlay(wordsState());
     const panel = container.querySelector('[data-testid="rsvp-context-panel"]') as HTMLElement;
@@ -623,5 +704,97 @@ describe('RSVPOverlay — start delay setting (#4478)', () => {
     expect(select).not.toBeNull();
     fireEvent.change(select, { target: { value: '0' } });
     expect(controller.setStartDelay).toHaveBeenCalledWith(0);
+  });
+});
+
+describe('RSVPOverlay — fine-grained WPM entry (#5820)', () => {
+  afterEach(() => cleanup());
+
+  const wordState = () =>
+    buildState({
+      words: [{ text: 'hello', orpIndex: 1, pauseMultiplier: 1 }],
+      currentIndex: 0,
+      wpm: 300,
+    });
+
+  const openWpmDropdown = (container: HTMLElement) => {
+    fireEvent.click(container.querySelector('[aria-label="Select reading speed"]') as HTMLElement);
+    const dropdown = container.querySelector('[data-testid="rsvp-wpm-dropdown"]') as HTMLElement;
+    const input = dropdown.querySelector('[aria-label="Words per minute"]') as HTMLInputElement;
+    return { dropdown, input };
+  };
+
+  test('the dropdown offers a numeric field prefilled with the current speed', () => {
+    const { container } = renderOverlay(wordState());
+    const { input } = openWpmDropdown(container);
+
+    expect(input).not.toBeNull();
+    expect(input.value).toBe('300');
+    // Digits-only soft keyboard on phones — the whole point of #5820.
+    expect(input.inputMode).toBe('numeric');
+  });
+
+  test('typing an exact value and pressing Enter sets that speed', () => {
+    const { container, controller } = renderOverlay(wordState());
+    const { input } = openWpmDropdown(container);
+
+    input.focus();
+    fireEvent.change(input, { target: { value: '325' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(controller.setWpm).toHaveBeenCalledWith(325);
+  });
+
+  test('leaving the field commits the typed value', () => {
+    const { container, controller } = renderOverlay(wordState());
+    const { input } = openWpmDropdown(container);
+
+    fireEvent.change(input, { target: { value: '380' } });
+    fireEvent.blur(input);
+
+    expect(controller.setWpm).toHaveBeenCalledWith(380);
+  });
+
+  test('Escape in the field discards the draft without committing', () => {
+    const { container, controller } = renderOverlay(wordState());
+    const { input } = openWpmDropdown(container);
+
+    fireEvent.change(input, { target: { value: '999' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(input.value).toBe('300');
+    expect(controller.setWpm).not.toHaveBeenCalled();
+  });
+
+  test('the fine +/- buttons nudge by 10 WPM rather than the 50 WPM coarse step', () => {
+    const { container, controller } = renderOverlay(wordState());
+    const { dropdown } = openWpmDropdown(container);
+
+    fireEvent.click(dropdown.querySelector('[aria-label="Increase speed"]') as HTMLElement);
+    expect(controller.setWpm).toHaveBeenLastCalledWith(310);
+    fireEvent.click(dropdown.querySelector('[aria-label="Decrease speed"]') as HTMLElement);
+    expect(controller.setWpm).toHaveBeenLastCalledWith(290);
+
+    // The transport's coarse steppers were not what fired.
+    expect(controller.increaseSpeed).not.toHaveBeenCalled();
+    expect(controller.decreaseSpeed).not.toHaveBeenCalled();
+  });
+
+  // The overlay listens for its shortcuts on `document` in the capture phase,
+  // which would otherwise steal arrows (speed), Space (play) and Escape (close
+  // the whole session) from the caret while a speed is being typed.
+  test('keys typed in the field never reach the RSVP shortcuts', () => {
+    const { container, controller, onClose } = renderOverlay(wordState());
+    const { input } = openWpmDropdown(container);
+
+    fireEvent.keyDown(input, { key: 'ArrowLeft' });
+    fireEvent.keyDown(input, { key: 'ArrowRight' });
+    fireEvent.keyDown(input, { key: ' ' });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(controller.decreaseSpeed).not.toHaveBeenCalled();
+    expect(controller.increaseSpeed).not.toHaveBeenCalled();
+    expect(controller.togglePlayPause).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

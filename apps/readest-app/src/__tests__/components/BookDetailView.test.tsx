@@ -1,28 +1,49 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/react';
+import { render, cleanup, fireEvent, waitFor } from '@testing-library/react';
 
 import { Book } from '@/types/book';
 import BookDetailView from '@/components/metadata/BookDetailView';
 import { DropdownProvider } from '@/context/DropdownContext';
 
+const mocks = vi.hoisted(() => ({
+  toDataUrl: vi.fn(async (url: string) => `data:image/png;base64,${url}`),
+}));
+
 vi.mock('@/hooks/useTranslation', () => ({
   useTranslation: () => (s: string) => s,
 }));
 
-vi.mock('@/store/settingsStore', () => ({
-  useSettingsStore: () => ({
+vi.mock('@/store/settingsStore', () => {
+  const state = {
     settings: {
       metadataSeriesCollapsed: true,
       // The "File Path" entry lives under the Metadata section; tests below
       // depend on it being expanded by default so the row is in the DOM.
       metadataOthersCollapsed: false,
-      metadataDescriptionCollapsed: true,
+      metadataDescriptionCollapsed: false,
+      libraryHideCovers: false,
     },
-  }),
-}));
+  };
+  const useSettingsStore = (selector?: (s: typeof state) => unknown) =>
+    selector ? selector(state) : state;
+  return { useSettingsStore };
+});
 
 vi.mock('@/context/EnvContext', () => ({
   useEnv: () => ({ envConfig: {}, appService: null }),
+}));
+
+// Pulled in by the cover viewer (reader's ImageViewer); not under test here.
+vi.mock('@/store/themeStore', () => ({
+  useThemeStore: () => ({ safeAreaInsets: null, systemUIVisible: false, statusBarHeight: 0 }),
+}));
+
+vi.mock('@/hooks/useKeyDownActions', () => ({
+  useKeyDownActions: () => {},
+}));
+
+vi.mock('@/libs/document', () => ({
+  convertBlobUrlToDataUrl: mocks.toDataUrl,
 }));
 
 vi.mock('@/helpers/settings', () => ({
@@ -101,9 +122,9 @@ describe('BookDetailView delete dropdown layout', () => {
     const menu = container.querySelector('.delete-menu');
     expect(menu).toBeTruthy();
     expect(menu!.className).not.toContain('dropdown-center');
-    // It should keep position: relative via the !relative override so it
+    // It should keep position: relative via the relative! override so it
     // anchors against the centered parent.
-    expect(menu!.className).toContain('!relative');
+    expect(menu!.className).toContain('relative!');
   });
 });
 
@@ -198,5 +219,129 @@ describe('BookDetailView file path row', () => {
   it('omits the file path row for hash-copy books (no filePath)', () => {
     const { queryByText } = renderView({ book: makeBook() });
     expect(queryByText('File Path')).toBeNull();
+  });
+});
+
+describe('BookDetailView page count', () => {
+  // An opened book carries the reader's total in book.progress ([current,
+  // total], #5516); before that, the count recorded at import stands in (#6662).
+  it('shows the import-time page count of a book that has never been opened', () => {
+    const { getByText } = renderView({ book: makeBook({ pageCount: 212 }) });
+
+    expect(getByText('212')).toBeTruthy();
+  });
+
+  it('shows the total page count of an opened book', () => {
+    const { getByText } = renderView({ book: makeBook({ progress: [42, 317] }) });
+
+    expect(getByText('Pages')).toBeTruthy();
+    expect(getByText('317')).toBeTruthy();
+  });
+
+  it('falls back to Unknown for a book that has never been opened', () => {
+    const { getByText } = renderView({ book: makeBook() });
+
+    const label = getByText('Pages');
+    expect(label.parentElement!.textContent).toContain('Unknown');
+  });
+});
+
+describe('BookDetailView tags and subjects', () => {
+  it('normalizes clicked tag and subject values before shelf navigation', () => {
+    const onMetadataValueClick = vi.fn();
+    const { getByText } = renderView({
+      book: makeBook({ tags: [' Favorite '] }),
+      metadata: {
+        title: 'Test Book',
+        author: 'Test Author',
+        language: 'en',
+        subject: ['History'],
+      },
+      onMetadataValueClick,
+    });
+
+    fireEvent.click(getByText('History'));
+    expect(onMetadataValueClick).toHaveBeenCalledWith('subject', 'History');
+    fireEvent.click(getByText('Favorite'));
+    expect(onMetadataValueClick).toHaveBeenCalledWith('tag', 'Favorite');
+  });
+});
+
+// #5813: the Book Details thumbnail must open the cover full screen in the
+// reader's image viewer (same zoom/pan/save as an in-book illustration).
+describe('BookDetailView cover viewer', () => {
+  const findViewer = () => document.body.querySelector('[aria-label="Image viewer"]');
+
+  it('opens the cover full screen in the image viewer when tapped', async () => {
+    const { container } = renderView({ book: makeBook({ coverImageUrl: 'blob:cover-full' }) });
+
+    const cover = container.querySelector('button[aria-label="View Book Cover"]');
+    expect(cover).toBeTruthy();
+    fireEvent.click(cover!);
+
+    await waitFor(() => expect(findViewer()).toBeTruthy());
+    expect(mocks.toDataUrl).toHaveBeenCalledWith('blob:cover-full');
+    expect(findViewer()!.querySelector('img')!.getAttribute('src')).toBe(
+      'data:image/png;base64,blob:cover-full',
+    );
+
+    // Closing the viewer returns to the details view, which stays open.
+    fireEvent.click(findViewer()!.querySelector('button[aria-label="Close"]')!);
+    expect(findViewer()).toBeNull();
+    expect(container.querySelector('button[aria-label="View Book Cover"]')).toBeTruthy();
+  });
+});
+
+describe('BookDetailView offline Audiobookshelf download (#6256)', () => {
+  const absBook = (overrides?: Partial<Book>) =>
+    makeBook({
+      format: 'ABS',
+      filePath: 'abs://srv1/item1',
+      downloadedAt: null,
+      uploadedAt: null,
+      ...overrides,
+    });
+
+  it('offers the download with a Premium badge for users who need to upgrade', () => {
+    const onDownloadOffline = vi.fn();
+    const { getByRole, getByText } = renderView({
+      book: absBook(),
+      onDownloadOffline,
+      offlinePremiumLabel: 'Premium',
+    });
+
+    fireEvent.click(getByRole('button', { name: /Download for Offline/ }));
+    expect(onDownloadOffline).toHaveBeenCalledTimes(1);
+    expect(getByText('Premium')).toBeTruthy();
+  });
+
+  it('swaps the download for Remove from Device Only once the book is on the device', () => {
+    const { queryByRole, container, getByText } = renderView({
+      book: absBook({ absDownloadedAt: 1 }),
+      onDownloadOffline: vi.fn(),
+    });
+
+    expect(queryByRole('button', { name: /Download for Offline/ })).toBeNull();
+    fireEvent.click(container.querySelector('button[aria-label="Delete Book Options"]')!);
+    expect(getByText('Remove from Device Only').closest('button')!.disabled).toBe(false);
+  });
+});
+
+describe('BookDetailView untrusted description', () => {
+  it('removes executable markup while preserving description formatting', () => {
+    const { container } = renderView({
+      metadata: {
+        title: 'Test Book',
+        author: 'Test Author',
+        language: 'en',
+        description:
+          '<strong>Book summary</strong><img src="x" onerror="alert(1)"><a href="javascript:alert(1)">link</a><iframe srcdoc="evil"></iframe>',
+      },
+    });
+    const description = container.querySelector('.prose')!;
+    expect(description.querySelector('strong')?.textContent).toBe('Book summary');
+    expect(description.querySelector('img')?.hasAttribute('onerror')).toBe(false);
+    expect(description.querySelector('a')?.hasAttribute('href')).toBe(false);
+    expect(description.querySelector('iframe')).toBeNull();
   });
 });

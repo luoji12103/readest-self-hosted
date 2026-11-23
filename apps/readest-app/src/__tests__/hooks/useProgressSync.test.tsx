@@ -38,16 +38,26 @@ const h = vi.hoisted(() => {
     syncConfigsMock: vi.fn(async () => {}),
     syncBooksMock: vi.fn(async () => {}),
     saveConfigMock: vi.fn(async () => {}),
+    setConfigMock: vi.fn(),
     setViewSettingsMock: vi.fn(),
     recreateViewerMock: vi.fn(),
     cfiCompareMock: vi.fn((_a: string, _b: string) => 0),
-    view: { renderer: { getContents: () => [], primaryIndex: 0 }, goTo: vi.fn() },
+    getCFIFromXPointerMock: vi.fn(async (..._args: unknown[]) => ''),
+    view: {
+      renderer: { getContents: () => [], primaryIndex: 0 },
+      goTo: vi.fn(),
+      goToFraction: vi.fn(),
+    },
     state: {
       syncedConfigs: [] as unknown[] | null,
-      progress: { location: 'cfi-loc' } as { location: string } | null,
-      viewSettings: { proofreadRules: [] } as { proofreadRules: unknown[] } | null,
+      progress: { location: 'cfi-loc' } as { location: string; fraction?: number } | null,
+      viewSettings: { proofreadRules: [] } as {
+        proofreadRules: unknown[];
+        referencePageCount?: number;
+      } | null,
+      bookDoc: {} as unknown,
     },
-    eventListeners: new Map<string, Set<(e: CustomEvent) => void>>(),
+    eventListeners: new Map<string, Set<(e: CustomEvent) => void | Promise<void>>>(),
   };
 });
 
@@ -74,9 +84,9 @@ vi.mock('@/context/EnvContext', () => ({
 vi.mock('@/store/bookDataStore', () => ({
   useBookDataStore: h.makeStore({
     getConfig: () => h.config,
-    setConfig: vi.fn(),
+    setConfig: h.setConfigMock,
     saveConfig: h.saveConfigMock,
-    getBookData: () => ({ book: h.book }),
+    getBookData: () => ({ book: h.book, bookDoc: h.state.bookDoc }),
   }),
 }));
 
@@ -104,15 +114,31 @@ vi.mock('@/store/settingsStore', () => ({
 }));
 
 vi.mock('@/store/libraryStore', () => ({
-  useLibraryStore: h.makeStore({ library: [h.libraryBook] }),
+  useLibraryStore: h.makeStore({
+    library: [h.libraryBook],
+    getBookByHash: vi.fn((hash: string) =>
+      hash === h.libraryBook.hash ? h.libraryBook : undefined,
+    ),
+  }),
 }));
 
 vi.mock('@/utils/serializer', () => ({
-  serializeConfig: () => JSON.stringify({ progress: [5, 100], location: 'cfi-loc' }),
+  serializeConfig: () =>
+    JSON.stringify({
+      progress: [5, 100],
+      location: 'cfi-loc',
+      audiobook: {
+        version: 1,
+        files: [{ path: 'h1/audiobook/private.m4b' }],
+        chapters: [],
+        mappings: [],
+        createdAt: 1,
+      },
+    }),
 }));
 
 vi.mock('@/utils/xcfi', () => ({
-  getCFIFromXPointer: vi.fn(async () => ''),
+  getCFIFromXPointer: (...args: unknown[]) => h.getCFIFromXPointerMock(...args),
   getXPointerFromCFI: vi.fn(async () => ({ xpointer: '' })),
 }));
 
@@ -130,17 +156,19 @@ vi.mock('@/utils/event', () => ({
     off: (name: string, fn: (e: CustomEvent) => void) => {
       h.eventListeners.get(name)?.delete(fn);
     },
-    dispatch: (name: string, detail: unknown) => {
+    // Awaits each listener in turn, like the real eventDispatcher.dispatch.
+    dispatch: async (name: string, detail: unknown) => {
       const listeners = h.eventListeners.get(name);
       if (!listeners) return;
       const event = new CustomEvent(name, { detail });
-      for (const fn of [...listeners]) fn(event);
+      for (const fn of [...listeners]) await fn(event);
     },
   },
 }));
 
 import { useProgressSync } from '@/app/reader/hooks/useProgressSync';
 import { SYNC_PROGRESS_INTERVAL_SEC } from '@/services/constants';
+import { getXPointerFromCFI } from '@/utils/xcfi';
 
 const flushAutoSync = async () => {
   await act(async () => {
@@ -154,14 +182,22 @@ beforeEach(() => {
   h.syncConfigsMock.mockClear();
   h.syncBooksMock.mockClear();
   h.saveConfigMock.mockClear();
+  h.setConfigMock.mockClear();
   h.setViewSettingsMock.mockClear();
   h.recreateViewerMock.mockClear();
   h.view.goTo.mockClear();
+  h.view.goToFraction.mockClear();
   h.cfiCompareMock.mockReset();
   h.cfiCompareMock.mockReturnValue(0);
+  h.getCFIFromXPointerMock.mockReset();
+  h.getCFIFromXPointerMock.mockResolvedValue('');
+  h.book.format = 'PDF';
+  h.config.location = 'cfi-loc';
+  h.config.updatedAt = 1000;
   h.state.syncedConfigs = [];
   h.state.progress = { location: 'cfi-loc' };
   h.state.viewSettings = { proofreadRules: [] };
+  h.state.bookDoc = {};
   h.eventListeners.clear();
 });
 
@@ -198,6 +234,16 @@ describe('useProgressSync', () => {
 
     expect(h.syncConfigsMock).toHaveBeenCalledWith(expect.any(Array), 'h1', 'm1', 'push');
     expect(h.syncBooksMock).not.toHaveBeenCalled();
+  });
+
+  test('does not upload the device-local audiobook association', async () => {
+    renderHook(() => useProgressSync('h1-view1'));
+    await flushAutoSync();
+
+    const push = h.syncConfigsMock.mock.calls.find((call) => (call as unknown[])[3] === 'push') as
+      | unknown[]
+      | undefined;
+    expect((push?.[0] as unknown[])?.[0]).not.toHaveProperty('audiobook');
   });
 
   test('retries the first pull on failure with backoff, then releases the gate', async () => {
@@ -278,6 +324,28 @@ describe('useProgressSync', () => {
     expect(h.view.goTo).toHaveBeenCalledWith('epubcfi(/6/24!/4/20/1:58)');
   });
 
+  test('navigates to the synced location when the local config has no location yet', async () => {
+    // First open on this device: nothing has been read here, so the local
+    // config carries no CFI. The remote position is trivially ahead and must
+    // move the reader without consulting CFI.compare.
+    const config = h.config as { location?: string };
+    const savedLocation = config.location;
+    config.location = undefined;
+    h.cfiCompareMock.mockReturnValue(1);
+    h.state.syncedConfigs = [
+      { bookHash: 'h1', metaHash: 'm1', location: 'epubcfi(/6/24!/4/20/1:58)', updatedAt: 3000 },
+    ];
+    try {
+      renderHook(() => useProgressSync('h1-view1'));
+      await advance(0);
+
+      expect(h.view.goTo).toHaveBeenCalledWith('epubcfi(/6/24!/4/20/1:58)');
+      expect(h.cfiCompareMock).not.toHaveBeenCalled();
+    } finally {
+      config.location = savedLocation;
+    }
+  });
+
   test('sync-book-progress event resets and re-runs the pull chain', async () => {
     h.state.syncedConfigs = null;
     renderHook(() => useProgressSync('h1-view1'));
@@ -302,6 +370,113 @@ describe('useProgressSync', () => {
     await advance(1500);
     expect(pullCallCount()).toBe(callsBeforeRefresh + 2);
   });
+
+  test('resuming an open book pulls and applies progress read on another device', async () => {
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+    const initialPulls = pullCallCount();
+
+    const visibility = vi.spyOn(document, 'visibilityState', 'get');
+    try {
+      visibility.mockReturnValue('hidden');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        await flushMicrotasks();
+      });
+      expect(pullCallCount()).toBe(initialPulls);
+      // Save a pending local turn before Android can suspend its timer.
+      expect(pushCallCount()).toBe(1);
+
+      h.syncConfigsMock.mockClear();
+      visibility.mockReturnValue('visible');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        await flushMicrotasks();
+      });
+      expect(pullCallCount()).toBe(1);
+      expect(pushCallCount()).toBe(0);
+
+      // A new response must be applied even though the book's initial pull
+      // already succeeded before the app went into the background.
+      h.cfiCompareMock.mockReturnValue(-1);
+      h.state.syncedConfigs = [{ bookHash: 'h1', location: 'remote-ahead' }];
+      rerender();
+      await advance(0);
+      expect(h.view.goTo).toHaveBeenCalledWith('remote-ahead');
+      await advance(20_000);
+      expect(pullCallCount()).toBe(1);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  test('foreground pull retries after a failed request and cleans up on unmount', async () => {
+    const { unmount } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+    const initialPulls = pullCallCount();
+
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flushMicrotasks();
+    });
+    expect(pullCallCount()).toBe(initialPulls + 1);
+    await advance(1500);
+    expect(pullCallCount()).toBe(initialPulls + 2);
+
+    unmount();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await advance(20_000);
+    expect(pullCallCount()).toBe(initialPulls + 2);
+  });
+
+  for (const responseBeforeCompletion of [true, false]) {
+    test(`queues a resume pull across an in-flight request (response first: ${responseBeforeCompletion})`, async () => {
+      let finishPull!: () => void;
+      h.state.syncedConfigs = null;
+      h.syncConfigsMock.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishPull = resolve;
+          }),
+      );
+      const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+      await advance(0);
+      const visibility = vi.spyOn(document, 'visibilityState', 'get');
+      visibility.mockReturnValueOnce('hidden').mockReturnValue('visible');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        document.dispatchEvent(new Event('visibilitychange'));
+        await flushMicrotasks();
+      });
+      visibility.mockRestore();
+      expect(pullCallCount()).toBe(1);
+
+      if (!responseBeforeCompletion) {
+        await act(async () => {
+          finishPull();
+          await flushMicrotasks();
+        });
+      }
+      h.state.syncedConfigs = [];
+      rerender();
+      if (responseBeforeCompletion) {
+        await act(async () => {
+          finishPull();
+          await flushMicrotasks();
+        });
+      }
+      await advance(0);
+      expect(pullCallCount()).toBe(2);
+
+      h.cfiCompareMock.mockReturnValue(-1);
+      h.state.syncedConfigs = [{ bookHash: 'h1', location: 'remote-after-resume' }];
+      rerender();
+      await advance(0);
+      expect(h.view.goTo).toHaveBeenCalledWith('remote-after-resume');
+      await advance(20_000);
+      expect(pullCallCount()).toBe(2);
+    });
+  }
 
   test('merges synced book-scope proofread rules into local config by id', async () => {
     // Local has a book rule; the remote config carries a different book rule
@@ -335,6 +510,104 @@ describe('useProgressSync', () => {
     expect(mergedRules.map((r) => r.id).sort()).toEqual(['local', 'remote']);
     expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
     expect(h.recreateViewerMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Issue #5716: a reference page count typed on one device never reached the
+  // others, because the pull applies only proofreadRules out of a remote
+  // config's viewSettings. The count describes the book's print edition, so it
+  // has to travel like reading state does.
+  test('adopts a synced reference page count into local view settings', async () => {
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [] };
+    h.state.syncedConfigs = [
+      {
+        bookHash: 'h1',
+        metaHash: 'm1',
+        updatedAt: 5000,
+        viewSettings: { referencePageCount: 350 },
+      },
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).toHaveBeenCalledTimes(1);
+    const applied = h.setViewSettingsMock.mock.calls[0]![1] as { referencePageCount?: number };
+    expect(applied.referencePageCount).toBe(350);
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+    // The footer reads the count straight off viewSettings, so there is no
+    // reason to tear down and rebuild the view the way a rule change needs.
+    expect(h.recreateViewerMock).not.toHaveBeenCalled();
+  });
+
+  test('a peer without a reference page count never clears the local one', async () => {
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [], referencePageCount: 350 };
+    h.state.syncedConfigs = [{ bookHash: 'h1', metaHash: 'm1', updatedAt: 5000, viewSettings: {} }];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('an equal config timestamp keeps the local page count', async () => {
+    // Pinned on both backends so they can never pick different winners for the
+    // same pair of configs; the file-sync twin lives in sync/file/merge.test.ts.
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [], referencePageCount: 350 };
+    h.state.syncedConfigs = [
+      {
+        bookHash: 'h1',
+        metaHash: 'm1',
+        updatedAt: h.config.updatedAt,
+        viewSettings: { referencePageCount: 400 },
+      },
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('does not rewrite the config when neither side has a page count', async () => {
+    // An unset key and a 0 both mean "no count". Treating them as different
+    // would rewrite viewSettings and bump updatedAt on every single book open.
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [] };
+    h.state.syncedConfigs = [{ bookHash: 'h1', metaHash: 'm1', updatedAt: 5000, viewSettings: {} }];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setViewSettingsMock).not.toHaveBeenCalled();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('adds the read-aloud packs a peer recorded, without bumping updatedAt', async () => {
+    // Recording audio must never move reading progress: the packs merge as a
+    // union into the local config, with no save that would bump updatedAt.
+    h.cfiCompareMock.mockReturnValue(0);
+    h.state.viewSettings = { proofreadRules: [] };
+    const updatedAt = h.config.updatedAt;
+    const config = h.config as typeof h.config & { ttsPacks?: Record<string, string[]> };
+    config.ttsPacks = { webdav: ['1-a.mp3'] };
+    h.state.syncedConfigs = [
+      {
+        bookHash: 'h1',
+        metaHash: 'm1',
+        updatedAt: 1,
+        ttsPacks: { webdav: ['2-b.mp3'], readest: [] },
+      },
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.setConfigMock).toHaveBeenCalledWith('h1-view1', {
+      ttsPacks: { webdav: ['1-a.mp3', '2-b.mp3'], readest: [] },
+    });
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+    expect(h.config.updatedAt).toBe(updatedAt);
+    delete config.ttsPacks;
   });
 
   test('does not touch the view when synced proofread rules match local', async () => {
@@ -383,5 +656,547 @@ describe('useProgressSync', () => {
     // The pending push is flushed immediately — Device A's last local position
     // reaches the cloud before the reader tears down.
     expect(pushCallCount()).toBeGreaterThanOrEqual(1);
+  });
+
+  // #7041: the server keeps its row unless the pushed updatedAt is newer, and
+  // the auto-save stamps updatedAt ~1.5s after the last turn. A close inside
+  // that window pushed the previous push's updatedAt, the push lost the tie,
+  // and the next open's forward-only pull jumped back to the old position.
+  test('sync-book-progress saves the position before pushing it', async () => {
+    const order: string[] = [];
+    const mutable = h as { view: typeof h.view | null };
+    const view = h.view;
+    let finishSave!: () => void;
+    // The close clears the view state while the save is still on disk; the
+    // push must not need the view.
+    h.eventListeners.set(
+      'flush-progress-save',
+      new Set([
+        () => {
+          order.push('save');
+          mutable.view = null;
+          return new Promise<void>((resolve) => {
+            finishSave = () => {
+              order.push('saved');
+              resolve();
+            };
+          });
+        },
+      ]),
+    );
+    h.syncConfigsMock.mockImplementation(async (...args: unknown[]) => {
+      if (args[3] === 'push') order.push('push');
+    });
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    h.state.progress = { location: 'cfi-loc-back' };
+    await act(async () => {
+      rerender();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      h.eventListeners
+        .get('sync-book-progress')
+        ?.forEach(
+          (fn) =>
+            void fn(new CustomEvent('sync-book-progress', { detail: { bookKey: 'h1-view1' } })),
+        );
+      await flushMicrotasks();
+    });
+    // Nothing is pushed while the save is still being written.
+    expect(order).toEqual(['save']);
+    await act(async () => {
+      finishSave();
+      await flushMicrotasks();
+    });
+
+    mutable.view = view;
+    expect(order).toEqual(['save', 'saved', 'push']);
+    h.syncConfigsMock.mockImplementation(async () => {});
+  });
+
+  // The debounce can expire while the save is on disk; that push would carry
+  // the old updatedAt and be dropped, leaving nothing to push once saved.
+  test('a debounced push that comes due during the save waits for it', async () => {
+    const order: string[] = [];
+    let finishSave!: () => void;
+    h.eventListeners.set(
+      'flush-progress-save',
+      new Set([
+        () => {
+          order.push('save');
+          return new Promise<void>((resolve) => {
+            finishSave = () => {
+              order.push('saved');
+              resolve();
+            };
+          });
+        },
+      ]),
+    );
+    h.syncConfigsMock.mockImplementation(async (...args: unknown[]) => {
+      if (args[3] === 'push') order.push('push');
+    });
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    h.state.progress = { location: 'cfi-loc-back' };
+    await act(async () => {
+      rerender();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      h.eventListeners
+        .get('sync-book-progress')
+        ?.forEach(
+          (fn) =>
+            void fn(new CustomEvent('sync-book-progress', { detail: { bookKey: 'h1-view1' } })),
+        );
+      await flushMicrotasks();
+    });
+    await advance(SYNC_PROGRESS_INTERVAL_SEC * 1000 + 100);
+    expect(order).toEqual(['save']);
+    await act(async () => {
+      finishSave();
+      await flushMicrotasks();
+    });
+
+    expect(order).toEqual(['save', 'saved', 'push']);
+    h.syncConfigsMock.mockImplementation(async () => {});
+  });
+
+  // The manual Sync pull must not start until the flushed push has reached the
+  // server: a pull answered first would bring back the old, further position.
+  test('sync-book-progress pulls only after the flushed push completes', async () => {
+    const order: string[] = [];
+    let finishPush!: () => void;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+    h.syncConfigsMock.mockImplementation(async (...args: unknown[]) => {
+      order.push(args[3] as string);
+      if (args[3] === 'push') {
+        await new Promise<void>((resolve) => {
+          finishPush = () => {
+            order.push('pushed');
+            resolve();
+          };
+        });
+      }
+    });
+
+    h.state.progress = { location: 'cfi-loc-back' };
+    await act(async () => {
+      rerender();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      h.eventListeners
+        .get('sync-book-progress')
+        ?.forEach(
+          (fn) =>
+            void fn(new CustomEvent('sync-book-progress', { detail: { bookKey: 'h1-view1' } })),
+        );
+      await flushMicrotasks();
+    });
+    expect(order).toEqual(['push']);
+    await act(async () => {
+      finishPush();
+      await flushMicrotasks();
+    });
+    expect(order).toEqual(['push', 'pushed', 'pull']);
+    h.syncConfigsMock.mockImplementation(async () => {});
+  });
+
+  // Coming back before the deactivation's save finished used to cancel the
+  // push it was about to flush, leaving the last position unpushed.
+  test('a quick return to the app keeps the deactivation push', async () => {
+    let finishSave!: () => void;
+    h.eventListeners.set(
+      'flush-progress-save',
+      new Set([
+        () =>
+          new Promise<void>((resolve) => {
+            finishSave = resolve;
+          }),
+      ]),
+    );
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+    h.state.progress = { location: 'cfi-loc-back' };
+    await act(async () => {
+      rerender();
+      await flushMicrotasks();
+    });
+    h.syncConfigsMock.mockClear();
+
+    const visibility = vi.spyOn(document, 'visibilityState', 'get');
+    try {
+      visibility.mockReturnValue('hidden');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        await flushMicrotasks();
+      });
+      visibility.mockReturnValue('visible');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        finishSave();
+        await flushMicrotasks();
+      });
+      expect(pushCallCount()).toBe(1);
+      expect(pullCallCount()).toBe(1);
+      const kinds = h.syncConfigsMock.mock.calls.map((c) => (c as unknown[])[3]);
+      expect(kinds).toEqual(['push', 'pull']);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  // #7041: closing the book destroys its views before the close-time push, so
+  // the XPointer can no longer come from a rendered section. Skipping it left
+  // the previous push's XPointer beside the new location, and the next pull
+  // (which takes the further of the two) jumped back to the old position.
+  test('a push after the views are gone converts the XPointer from the book', async () => {
+    h.book.format = 'EPUB';
+    const config = h.config as { xpointer?: string };
+    config.xpointer = '/body/DocFragment[20]/body/p[3]';
+    vi.mocked(getXPointerFromCFI).mockResolvedValueOnce({
+      xpointer: '/body/DocFragment[7]/body/p[1]',
+    });
+    try {
+      const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+      await advance(0);
+      h.state.progress = { location: 'cfi-loc-back' };
+      await act(async () => {
+        rerender();
+        await flushMicrotasks();
+      });
+      await flushAutoSync();
+
+      expect(getXPointerFromCFI).toHaveBeenCalledWith(
+        'cfi-loc',
+        undefined,
+        0,
+        h.state.bookDoc,
+        'EPUB',
+      );
+      expect(config.xpointer).toBe('/body/DocFragment[7]/body/p[1]');
+    } finally {
+      delete config.xpointer;
+    }
+  });
+
+  // Same jump as above when the conversion itself fails: the previous push's
+  // XPointer would go out beside the new location.
+  test('a push whose XPointer conversion fails does not carry the previous XPointer', async () => {
+    h.book.format = 'EPUB';
+    const config = h.config as { xpointer?: string };
+    config.xpointer = '/body/DocFragment[20]/body/p[3]';
+    vi.mocked(getXPointerFromCFI).mockRejectedValueOnce(new Error('no section'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+      await advance(0);
+      h.state.progress = { location: 'cfi-loc-back' };
+      await act(async () => {
+        rerender();
+        await flushMicrotasks();
+      });
+      await flushAutoSync();
+
+      expect(pushCallCount()).toBe(1);
+      expect(config.xpointer).toBe('');
+    } finally {
+      warn.mockRestore();
+      delete config.xpointer;
+    }
+  });
+});
+
+describe('useProgressSync — duplicate copies (#7092)', () => {
+  const exact = (updatedAt = 2000) => ({
+    bookHash: 'h1',
+    metaHash: 'm1',
+    location: 'exact-location',
+    progress: [10, 100],
+    updatedAt,
+  });
+  const sibling = (updatedAt: number, current = 60) => ({
+    bookHash: 'h2',
+    metaHash: 'm1',
+    location: 'sibling-location',
+    progress: [current, 100],
+    updatedAt,
+  });
+
+  test.each([
+    1999, 2000,
+  ])('ignores a sibling no newer than this file’s cloud save (%i)', async (updatedAt) => {
+    h.state.syncedConfigs = [sibling(updatedAt), exact()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('ignores a sibling older than a local save even when it beats the cloud save', async () => {
+    h.state.syncedConfigs = [exact(500), sibling(999)];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('an old furthest copy does not mask a more recent eligible copy', async () => {
+    h.state.syncedConfigs = [sibling(1500, 90), sibling(3000, 40), exact()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).toHaveBeenCalledWith(0.4);
+    expect(h.view.goTo).not.toHaveBeenCalled();
+  });
+
+  test('still restores a newer sibling by fraction on a first open', async () => {
+    h.state.syncedConfigs = [sibling(3000)];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).toHaveBeenCalledWith(0.6);
+    expect(h.view.goTo).not.toHaveBeenCalled();
+  });
+
+  test('an initial-page autosave does not block a slow first sibling pull', async () => {
+    h.config.updatedAt = 0;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(2000);
+
+    // Autosave stamps the unchanged initial page while the pull is pending.
+    h.config.updatedAt = 4000;
+    h.state.syncedConfigs = [sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).toHaveBeenCalledWith(0.6);
+  });
+
+  test('direction detection before the first relocation does not block sibling recovery', async () => {
+    h.config.location = '';
+    h.config.updatedAt = 0;
+    h.state.progress = null;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+
+    // docLoadHandler detects RTL/vertical writing before the first relocate.
+    h.config.updatedAt = 4000;
+    h.config.location = 'cfi-start';
+    h.state.progress = { location: 'cfi-start', fraction: 0.01 };
+    rerender();
+    await advance(0);
+
+    h.state.syncedConfigs = [sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).toHaveBeenCalledWith(0.6);
+  });
+
+  test('the fresh-copy exception expires after the first response', async () => {
+    h.config.updatedAt = 0;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    h.config.updatedAt = 4000;
+    h.state.syncedConfigs = [];
+    rerender();
+    await advance(0);
+
+    await act(async () => {
+      for (const listener of h.eventListeners.get('sync-book-progress') ?? []) {
+        await listener(new CustomEvent('sync-book-progress', { detail: { bookKey: 'h1-view1' } }));
+      }
+    });
+    h.state.syncedConfigs = [sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('a saved move during the first pull still rejects an older sibling', async () => {
+    h.config.updatedAt = 0;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(2000);
+
+    h.config.location = 'user-destination';
+    h.config.updatedAt = 4000;
+    h.state.progress = { location: 'user-destination', fraction: 0.1 };
+    h.state.syncedConfigs = [sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('returning to the initial location does not revive the first-pull exception', async () => {
+    h.config.updatedAt = 0;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+
+    h.config.location = 'user-destination';
+    h.config.updatedAt = 4000;
+    h.state.progress = { location: 'user-destination', fraction: 0.1 };
+    rerender();
+    await advance(0);
+
+    h.config.location = 'cfi-loc';
+    h.config.updatedAt = 5000;
+    h.state.progress = { location: 'cfi-loc', fraction: 0.05 };
+    h.state.syncedConfigs = [sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('a slow first pull still respects an exact cloud purge', async () => {
+    h.config.updatedAt = 0;
+    h.state.syncedConfigs = null;
+    const { rerender } = renderHook(() => useProgressSync('h1-view1'));
+    await advance(2000);
+
+    h.config.updatedAt = 5000;
+    h.state.syncedConfigs = [{ ...exact(4000), location: null, progress: null }, sibling(3000)];
+    rerender();
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('still applies the exact file’s forward location when a stale sibling is further', async () => {
+    h.cfiCompareMock.mockReturnValue(-1);
+    h.state.syncedConfigs = [sibling(1500, 90), exact()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goTo).toHaveBeenCalledWith('exact-location');
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('a purged cloud position is not restored from an older copy', async () => {
+    h.state.syncedConfigs = [{ ...exact(4000), location: null, progress: null }, sibling(3000)];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+    expect(h.view.goTo).not.toHaveBeenCalled();
+  });
+
+  test('does not move backward for a newer sibling', async () => {
+    h.state.progress = { location: 'cfi-loc', fraction: 0.8 };
+    h.state.syncedConfigs = [sibling(3000), exact()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #5625. The Readest KOReader plugin pushes `progress` + `xpointer` and
+// never a `location`, so the CREngine XPointer is the ONLY precise handle on
+// the remote position. When converting it throws — a chapter whose XHTML isn't
+// well-formed used to make `createDocument()` hand back a body-less
+// `parsererror` document — the rejection escaped `applyRemoteProgress`
+// entirely: the reader stayed put, the proofread merge never ran, and the
+// debounced auto-push then overwrote the newer Kobo position with the older
+// local one.
+describe('useProgressSync — KOReader-origin config (#5625)', () => {
+  // [current, total] as CREngine paginates it, matching the reported payload.
+  const KO_PROGRESS: [number, number] = [176, 411];
+  const koConfig = (extra: Record<string, unknown> = {}) => ({
+    bookHash: 'h1',
+    metaHash: 'm1',
+    progress: KO_PROGRESS,
+    xpointer: '/body/DocFragment[14]/body/p[45]/text().0',
+    updatedAt: 3000,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    h.book.format = 'EPUB';
+    h.state.progress = { location: 'cfi-loc', fraction: 0.05 };
+  });
+
+  // #5980: the XPointer's own DocFragment picks the section. CREngine's
+  // [page, total] is its own pagination and is never comparable to foliate's
+  // byte-size section table, so it must not reach the converter at all — it
+  // survives only as the last-resort target below when conversion fails.
+  test('never feeds the KOReader page fraction into the converter', async () => {
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.getCFIFromXPointerMock).toHaveBeenCalledTimes(1);
+    expect(h.getCFIFromXPointerMock.mock.calls[0]!).toHaveLength(4);
+  });
+
+  test('has no fraction fallback when the remote config carries its own CFI', async () => {
+    // A Readest-origin config: its [page, total] is foliate's pagination, and
+    // its own CFI is the precise handle, so a failed XPointer conversion must
+    // not trigger an approximate jump.
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.syncedConfigs = [koConfig({ location: 'epubcfi(/6/24!/4/20/1:58)' })];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+  });
+
+  test('a failed XPointer conversion still lets the rest of the pull run', async () => {
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.viewSettings = {
+      proofreadRules: [{ id: 'local', scope: 'book', pattern: 'a', updatedAt: 100 }],
+    };
+    h.state.syncedConfigs = [
+      koConfig({
+        viewSettings: {
+          proofreadRules: [{ id: 'remote', scope: 'book', pattern: 'b', updatedAt: 200 }],
+        },
+      }),
+    ];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    // The throw used to reject applyRemoteProgress before this point.
+    expect(h.setViewSettingsMock).toHaveBeenCalledTimes(1);
+  });
+
+  // #5980: the koplugin's [page, total] is CREngine's own pagination. Jumping
+  // by it is a guess that routinely lands in the wrong chapter, and a wrong
+  // sync is worse than no sync. #5625's real damage was the auto-push
+  // overwriting the newer remote position; the pull continuing (config merge,
+  // proofread merge) is what prevents that, not moving the reader.
+  test('does not jump by the reported fraction when the XPointer cannot be converted', async () => {
+    h.getCFIFromXPointerMock.mockRejectedValue(new Error('Failed to convert XPointer'));
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
+    expect(h.view.goTo).not.toHaveBeenCalled();
+  });
+
+  test('jumps to the converted CFI and never to a fraction', async () => {
+    h.getCFIFromXPointerMock.mockResolvedValue('epubcfi(/6/30!/4/90/1:0)');
+    h.cfiCompareMock.mockReturnValue(-1);
+    h.state.syncedConfigs = [koConfig()];
+    renderHook(() => useProgressSync('h1-view1'));
+    await advance(0);
+
+    expect(h.view.goTo).toHaveBeenCalledWith('epubcfi(/6/30!/4/90/1:0)');
+    expect(h.view.goToFraction).not.toHaveBeenCalled();
   });
 });

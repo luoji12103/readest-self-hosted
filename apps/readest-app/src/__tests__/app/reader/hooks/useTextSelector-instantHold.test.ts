@@ -86,6 +86,7 @@ const setup = () => {
 };
 
 const doc = {
+  documentElement: document.createElement('html'),
   getSelection: () => null,
   createRange: () => ({
     setStart: () => {},
@@ -188,7 +189,7 @@ describe('useTextSelector instant-highlight still-hold gate', () => {
 
 // The system long-press selection is suppressed NATIVELY while
 // instant-highlight mode is on (TextSelectionSuppressor in the native-bridge
-// iOS plugin, driven by setTextSelectionSuppressed from FoliateViewer): no JS
+// iOS plugin, driven by setSelectionSuppressed from FoliateViewer): no JS
 // or stylesheet layer can win that race — user-select breaks
 // caretRangeFromPoint on iOS WebKit (see the guard test in
 // style-get-styles.test.ts) and selectstart never fires for long-press

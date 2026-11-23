@@ -43,6 +43,7 @@ M.UIManager = {
     close = function(self, widget)
         table.insert(self._closed, widget)
     end,
+    setDirty = function() end,
     nextTick = function(self, fn)
         table.insert(self._scheduled, { delay = 0, fn = fn })
     end,
@@ -60,19 +61,43 @@ M.UIManager = {
 
 -- Drain the scheduled queue, running each task once. Tasks that schedule
 -- further work (uploadCurrentBook hashes on nextTick, then continues) are
--- picked up on the next drain pass.
-function M.UIManager:drain()
-    local pending = self._scheduled
+-- picked up on the next drain pass. With `max_delay`, later tasks stay queued.
+function M.UIManager:drain(max_delay)
+    local pending, ran = self._scheduled, 0
     self._scheduled = {}
     for _, task in ipairs(pending) do
-        task.fn()
+        if max_delay and task.delay > max_delay then
+            table.insert(self._scheduled, task)
+        else
+            task.fn()
+            ran = ran + 1
+        end
     end
-    return #pending
+    return ran
 end
 
 -- `util.partialMD5` is swapped per-spec; default returns a deterministic hash.
+-- The split helpers mirror KOReader's frontend/util.lua so hash-source
+-- assertions exercise the same filename handling production sees.
 M.util = {
     partialMD5 = function(_file) return "stub-md5" end,
+    splitFilePathName = function(file)
+        if file == nil or file == "" then return "", "" end
+        if string.find(file, "/") == nil then return "", file end
+        return file:match("(.*/)(.*)")
+    end,
+    splitFileNameSuffix = function(file)
+        if file == nil or file == "" then return "", "" end
+        if string.find(file, "%.") == nil then return file, "" end
+        return file:match("(.*)%.(.*)")
+    end,
+    splitToArray = function(str, sep)
+        local result = {}
+        for piece in (str .. sep):gmatch("(.-)" .. sep) do
+            if piece ~= "" then table.insert(result, piece) end
+        end
+        return result
+    end,
 }
 
 -- The Library widget is a heavy KOReader UI module (menus, painters, FFI
@@ -87,6 +112,48 @@ M.LibraryWidget = {
     open = function() end,
 }
 
+-- Hoisted so specs can flip connectivity (M.NetworkMgr._online) and observe
+-- which NetworkMgr path a call took. willRerunWhenOnline / goOnlineToRun are
+-- the paths that bring Wi-Fi up (modal on Kobo/Kindle), so specs count them.
+M.NetworkMgr = {
+    _online = true,
+    _route = true,
+    _willRerunWhenOnline_calls = 0,
+    _goOnlineToRun_calls = 0,
+    isOnline = function(self) return self._online end,
+    isConnected = function(self) return self._online end,
+    hasDefaultRoute = function(self) return self._route end,
+    willRerunWhenOnline = function(self)
+        self._willRerunWhenOnline_calls = self._willRerunWhenOnline_calls + 1
+        return false
+    end,
+    goOnlineToRun = function(self, cb)
+        self._goOnlineToRun_calls = self._goOnlineToRun_calls + 1
+        cb()
+    end,
+}
+
+-- Bare plugin instance (skips init(): no menu/dispatcher/meta wiring) whose
+-- three pull methods are faked to record their calls, for specs that observe
+-- what a lifecycle event (open / wake / network back) schedules.
+function M.makePullPlugin(ReadestSync, opts)
+    local plugin = setmetatable({
+        settings = {
+            auto_sync = opts.auto_sync,
+            access_token = opts.access_token,
+            localsend_enabled = false,
+        },
+        ui = { document = opts.document },
+        pull_calls = {},
+    }, { __index = ReadestSync })
+    for _, method in ipairs({ "pullBookConfig", "pullBookNotes", "pullBookStats" }) do
+        plugin[method] = function(self, interactive)
+            table.insert(self.pull_calls, { method = method, interactive = interactive })
+        end
+    end
+    return plugin
+end
+
 function M.reset()
     for i = #M.Dispatcher._registered, 1, -1 do
         M.Dispatcher._registered[i] = nil
@@ -95,6 +162,12 @@ function M.reset()
         for i = #list, 1, -1 do list[i] = nil end
     end
     M.util.partialMD5 = function(_file) return "stub-md5" end
+    M.UIManager.quit_calls = 0
+    M.UIManager.quit = function(self) self.quit_calls = self.quit_calls + 1 end
+    M.NetworkMgr._online = true
+    M.NetworkMgr._route = true
+    M.NetworkMgr._willRerunWhenOnline_calls = 0
+    M.NetworkMgr._goOnlineToRun_calls = 0
     M.LibraryWidget._menu = nil
     M.LibraryWidget._store = nil
     M.LibraryWidget._current_user = nil
@@ -109,6 +182,9 @@ package.preload["ui/event"] = function()
 end
 package.preload["ui/widget/infomessage"] = function()
     return { new = function(_, o) return o or {} end }
+end
+package.preload["ui/widget/confirmbox"] = function()
+    return { new = function(self, o) return setmetatable(o or {}, { __index = self }) end }
 end
 package.preload["ui/widget/keyvaluepage"] = function()
     return { new = function(_, o) return o or {} end }
@@ -126,17 +202,23 @@ package.preload["ui/widget/container/widgetcontainer"] = function()
         end,
     }
 end
-package.preload["ui/network/manager"] = function()
-    return {
-        willRerunWhenOnline = function() return false end,
-        goOnlineToRun = function(_, cb) cb() end,
-    }
-end
+package.preload["ui/network/manager"] = function() return M.NetworkMgr end
 package.preload["ffi/sha2"] = function()
-    return { base64_to_bin = function(s) return s end }
+    return {
+        base64_to_bin = function(s) return s end,
+        -- Marker instead of real md5: hash-source parity specs assert the
+        -- exact input string, which is what must match Readest's TS side —
+        -- md5 itself is the same everywhere.
+        md5 = function(s) return "md5:" .. s end,
+    }
 end
 package.preload["ffi/util"] = function()
     return { template = function(s) return s end }
+end
+-- KOReader bundles its own lfs build; specs run against the host's
+-- luafilesystem, which speaks the same API surface we use (attributes).
+package.preload["libs/libkoreader-lfs"] = function()
+    return require("lfs")
 end
 package.preload["readest_i18n"] = function()
     return function(s) return s end

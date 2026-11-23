@@ -1,7 +1,25 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, cleanup, fireEvent, act } from '@testing-library/react';
+import { render, cleanup, fireEvent, act, waitFor } from '@testing-library/react';
 
 import ImageViewer from '@/app/reader/components/ImageViewer';
+
+// jsdom has no canvas, so the ink probe (which reads the bitmap) is stubbed;
+// each test says what the image's pixels are.
+const { probeImageInkMock } = vi.hoisted(() => {
+  const probe = vi.fn();
+  probe.mockResolvedValue(null);
+  return { probeImageInkMock: probe };
+});
+vi.mock('@/app/reader/utils/imageRenderStyle', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/app/reader/utils/imageRenderStyle')>();
+  return { ...actual, probeImageInk: probeImageInkMock };
+});
+
+afterEach(() => {
+  cleanup();
+  probeImageInkMock.mockReset();
+  probeImageInkMock.mockResolvedValue(null);
+});
 
 vi.mock('@/hooks/useTranslation', () => ({
   useTranslation: () => (s: string) => s,
@@ -20,7 +38,7 @@ vi.mock('@/context/EnvContext', () => ({
 // ZoomControls reaches into the theme store and Tauri window APIs; stub it out.
 vi.mock('@/app/reader/components/ZoomControls', () => ({
   __esModule: true,
-  default: () => null,
+  default: () => <div data-testid='zoom-controls' />,
 }));
 
 afterEach(cleanup);
@@ -84,6 +102,306 @@ describe('ImageViewer', () => {
     expect(img.style.transition).not.toBe('none');
   });
 
+  // Zoom percentage is relative to the image's own resolution (#5362).
+  //
+  // `scale` is relative to the fit-to-screen size, so on its own it says
+  // nothing about how much of the image's detail is actually on screen: fitting
+  // a 1600px illustration into an 800-device-pixel box paints it at half its
+  // resolution while the badge claimed "100%". Because the fit size and the
+  // device pixel ratio differ per device, the same book showed a different
+  // amount of detail on every device at the same reported zoom, and always less
+  // than the extracted file in an external viewer. 100% now means one image
+  // pixel per device pixel — no interpolation, identical detail everywhere.
+  const measuredViewer = ({
+    naturalWidth,
+    fitWidth,
+    dpr,
+  }: {
+    naturalWidth: number;
+    fitWidth: number;
+    dpr: number;
+  }) => {
+    Object.defineProperty(window, 'devicePixelRatio', { value: dpr, configurable: true });
+    const { container } = render(
+      <ImageViewer src='blob:test-image' onClose={vi.fn()} gridInsets={gridInsets} />,
+    );
+    const img = container.querySelector('img')!;
+    Object.defineProperty(img, 'naturalWidth', { value: naturalWidth, configurable: true });
+    Object.defineProperty(img, 'naturalHeight', { value: naturalWidth, configurable: true });
+    // jsdom has no layout; give the viewer container a square viewport so the
+    // (square) image's computed fit size equals `fitWidth`.
+    const viewer = container.querySelector('[aria-label="Image viewer"]') as HTMLElement;
+    viewer.getBoundingClientRect = () =>
+      ({
+        width: fitWidth,
+        height: fitWidth,
+        top: 0,
+        left: 0,
+        right: fitWidth,
+        bottom: fitWidth,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    act(() => {
+      fireEvent.load(img);
+    });
+    return { container, img };
+  };
+
+  const zoomPercent = (container: HTMLElement) =>
+    Number(container.querySelector('[aria-label="Zoom level"]')!.textContent!.replace('%', ''));
+
+  it('reports the fraction of the image resolution actually shown when fit to screen', () => {
+    // 1600 image px painted across 400 CSS px * dpr 2 = 800 device px: half the
+    // image's detail is on screen, so the badge must not claim 100%.
+    const { container } = measuredViewer({ naturalWidth: 1600, fitWidth: 400, dpr: 2 });
+
+    expect(zoomPercent(container)).toBe(50);
+  });
+
+  it('double-click zooms to exactly 1:1 (100% = one image pixel per device pixel)', () => {
+    // Pixel-perfect needs scale 1200 / (400 * 1) = 3, which the old fixed 2x
+    // double-click could never land on.
+    const { container, img } = measuredViewer({ naturalWidth: 1200, fitWidth: 400, dpr: 1 });
+
+    act(() => {
+      fireEvent.doubleClick(img);
+    });
+
+    expect(img.style.transform).toContain('scale(3)');
+    expect(zoomPercent(container)).toBe(100);
+  });
+
+  it('keeps 1:1 reachable for images larger than the old zoom ceiling', () => {
+    // 1:1 needs scale 50 here, far past the old MAX_SCALE of 8 — the full
+    // resolution of a large illustration was simply unreachable.
+    const { img } = measuredViewer({ naturalWidth: 20000, fitWidth: 400, dpr: 1 });
+
+    act(() => {
+      fireEvent.wheel(img, { deltaY: -20000, ctrlKey: true, clientX: 100, clientY: 100 });
+    });
+
+    const reachedScale = Number(/scale\(([\d.]+)\)/.exec(img.style.transform)![1]);
+    expect(reachedScale).toBeGreaterThanOrEqual(50);
+  });
+
+  // iOS WebKit rasterizes the image at its *layout* size and only stretches
+  // that raster for `transform: scale`, so zooming in showed a fit-to-screen
+  // resolution image no matter how much detail the source had (#5633).
+  // Chromium re-rasterizes at the transformed scale, which is why the same
+  // code was sharp on Android. The viewer must commit a settled zoom into the
+  // image's layout size so WebKit repaints it with enough pixels, and keep the
+  // transform only for the in-flight gesture.
+  describe('committing zoom into the layout size (#5633)', () => {
+    it('commits a settled discrete zoom into the layout size', () => {
+      vi.useFakeTimers();
+      try {
+        // pixelPerfectScale = 1600 / (400 * 2) = 2, which is also what
+        // double-click zooms to.
+        const { img } = measuredViewer({ naturalWidth: 1600, fitWidth: 400, dpr: 2 });
+
+        expect(img.style.width).toBe('400px');
+
+        act(() => {
+          fireEvent.doubleClick(img);
+        });
+        // The gesture itself rides on the transform.
+        expect(img.style.transform).toContain('scale(2)');
+
+        act(() => {
+          vi.advanceTimersByTime(1000);
+        });
+        // Settled: the zoom lives in the layout size, the transform is unity.
+        expect(img.style.width).toBe('800px');
+        expect(img.style.transform).toContain('scale(1)');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps a streaming wheel pinch on the transform, then commits up to 1:1', () => {
+      vi.useFakeTimers();
+      try {
+        const { img } = measuredViewer({ naturalWidth: 1600, fitWidth: 400, dpr: 2 });
+
+        act(() => {
+          // Far past pixel-perfect (2): caps at maxScale 8.
+          fireEvent.wheel(img, { deltaY: -20000, ctrlKey: true, clientX: 200, clientY: 200 });
+        });
+        // Mid-gesture: layout still at fit size, zoom entirely on the transform.
+        expect(img.style.width).toBe('400px');
+        expect(img.style.transform).toContain('scale(8)');
+
+        // Two steps: the wheel gesture first settles (200ms), which is what
+        // arms the commit timer; then the commit fires.
+        act(() => {
+          vi.advanceTimersByTime(500);
+        });
+        act(() => {
+          vi.advanceTimersByTime(500);
+        });
+        // Committed layout is clamped to the image's own resolution (1:1);
+        // beyond that the transform magnifies, as extra raster pixels would
+        // add memory but no detail.
+        expect(img.style.width).toBe('800px');
+        expect(img.style.transform).toContain('scale(4)');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('caps the committed raster size for huge images', () => {
+      vi.useFakeTimers();
+      try {
+        // 1:1 would need a 20000px-wide layout; committing that would OOM the
+        // iOS WebContent process (cf. #5118), so the layout caps at 4096
+        // device px on the long side.
+        const { img } = measuredViewer({ naturalWidth: 20000, fitWidth: 400, dpr: 1 });
+
+        act(() => {
+          fireEvent.wheel(img, { deltaY: -20000, ctrlKey: true, clientX: 200, clientY: 200 });
+        });
+
+        act(() => {
+          vi.advanceTimersByTime(500);
+        });
+        act(() => {
+          vi.advanceTimersByTime(500);
+        });
+        expect(img.style.width).toBe('4096px');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // #6154: the close/save/zoom buttons sit over the top-right corner of the
+  // artwork, where they can cover the image itself. They are chrome, so the
+  // tap that already clears the caption and the arrows clears them too.
+  describe('top-right controls', () => {
+    const zoomControls = (container: HTMLElement) =>
+      container.querySelector('[data-testid="zoom-controls"]');
+
+    it('toggles the controls when the image is tapped', () => {
+      const { container } = render(
+        <ImageViewer src='blob:test-image' onClose={vi.fn()} gridInsets={gridInsets} />,
+      );
+      const img = container.querySelector('img')!;
+      expect(zoomControls(container)).toBeTruthy();
+
+      fireEvent.click(img);
+      expect(zoomControls(container)).toBeNull();
+
+      fireEvent.click(img);
+      expect(zoomControls(container)).toBeTruthy();
+    });
+
+    // The zoom badge and the arrows hide themselves 2s after a zoom, so their
+    // state no longer matches the chrome's. A single tap must still hide
+    // everything rather than bring the auto-hidden pieces back.
+    it('hides every chrome element with one tap after the zoom badge timed out', () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = render(
+          <ImageViewer
+            src='blob:test-image'
+            caption='A caption'
+            onClose={vi.fn()}
+            onNext={vi.fn()}
+            gridInsets={gridInsets}
+          />,
+        );
+        const img = container.querySelector('img')!;
+
+        act(() => {
+          fireEvent.doubleClick(img);
+        });
+        act(() => {
+          vi.advanceTimersByTime(2000);
+        });
+        expect(container.querySelector('[aria-label="Zoom level"]')).toBeNull();
+
+        act(() => {
+          fireEvent.click(img);
+        });
+        expect(zoomControls(container)).toBeNull();
+        expect(container.querySelector('.image-caption')).toBeNull();
+        expect(container.querySelector('[aria-label="Next Image"]')).toBeNull();
+        expect(container.querySelector('[aria-label="Zoom level"]')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // #5232: EPUBs often keep the caption or table description of an
+  // illustration in the image's `alt` attribute, which was invisible once the
+  // image was opened full screen.
+  describe('image description caption', () => {
+    const caption = 'Tabella di come creare una buona abitudine';
+
+    it('shows the image description over the zoomed image', () => {
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          caption={caption}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+
+      expect(container.querySelector('.image-caption')?.textContent).toBe(caption);
+      // The zoomed image carries the book's own description too, instead of the
+      // placeholder used when the book provides none.
+      expect(container.querySelector('img')!.getAttribute('alt')).toBe(caption);
+    });
+
+    it('renders nothing when the image has no description', () => {
+      const { container } = render(
+        <ImageViewer src='blob:test-image' onClose={vi.fn()} gridInsets={gridInsets} />,
+      );
+
+      expect(container.querySelector('.image-caption')).toBeNull();
+    });
+
+    // The caption sits over the bottom of the image, so tapping the image must
+    // get it out of the way (and bring it back).
+    it('toggles the caption when the image is tapped', () => {
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          caption={caption}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      const img = container.querySelector('img')!;
+
+      fireEvent.click(img);
+      expect(container.querySelector('.image-caption')).toBeNull();
+
+      fireEvent.click(img);
+      expect(container.querySelector('.image-caption')?.textContent).toBe(caption);
+    });
+
+    it('does not close the viewer when the caption itself is tapped', () => {
+      const onClose = vi.fn();
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          caption={caption}
+          onClose={onClose}
+          gridInsets={gridInsets}
+        />,
+      );
+
+      fireEvent.click(container.querySelector('.image-caption')!);
+
+      expect(onClose).not.toHaveBeenCalled();
+    });
+  });
+
   // Trackpad pinch flicker (#4742): on macOS a trackpad pinch-to-zoom arrives
   // as a rapid stream of ctrl+wheel events. With the 0.05s transition left on,
   // each event restarts the in-flight transition from its interpolated
@@ -113,5 +431,114 @@ describe('ImageViewer', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // A drawing whose white background is transparency is propped up by the page
+  // (a plate, a filter); the bare bitmap on the dimmed backdrop is not the same
+  // picture. See ImageRenderStyle.
+  describe('reproducing the page rendering', () => {
+    it('paints the plate and filter the page used', () => {
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          renderStyle={{ filter: 'invert(100%)', plate: 'rgb(255, 255, 255)' }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      const img = container.querySelector('img')!;
+      expect(img.style.backgroundColor).toBe('rgb(255, 255, 255)');
+      expect(img.style.filter).toBe('invert(100%)');
+    });
+
+    it('adds no plate of its own when the page named one and the image is opaque', () => {
+      // With a page plate there is nothing to decide; without one and without
+      // any ink reading, the image is left alone.
+      const { container } = render(
+        <ImageViewer
+          src='blob:test-image'
+          renderStyle={{ filter: 'none', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      expect(container.querySelector('img')!.style.backgroundColor).toBe('');
+    });
+
+    // The report that started this: the page's plate comes from the book's
+    // night CSS, which a section loaded under the previous theme never gets —
+    // so the page hands over nothing, and the viewer used to show dark ink on
+    // the app's dark background.
+    it('reads the bitmap and pads a transparent drawing when the page gave no plate', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer
+          src='data:image/png;base64,AA=='
+          renderStyle={{ filter: 'none', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      await waitFor(() =>
+        expect(container.querySelector('img')!.style.backgroundColor).toBe('rgb(255, 255, 255)'),
+      );
+    });
+
+    it('leaves an inverted drawing unpadded, where white would erase it', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer
+          src='data:image/png;base64,AA=='
+          renderStyle={{ filter: 'invert(1)', plate: null }}
+          onClose={vi.fn()}
+          gridInsets={gridInsets}
+        />,
+      );
+      await waitFor(() => expect(probeImageInkMock).toHaveBeenCalled());
+      expect(container.querySelector('img')!.style.backgroundColor).toBe('');
+    });
+
+    // A book cover or a dictionary illustration passes no render style: there is
+    // no page to match, so even a transparent dark-ink image is left as it is.
+    it('leaves an image the reader did not lay out untouched', async () => {
+      probeImageInkMock.mockResolvedValue({ transparentRatio: 0.7, darkInkRatio: 0.95 });
+      const { container } = render(
+        <ImageViewer src='data:image/png;base64,AA==' onClose={vi.fn()} gridInsets={gridInsets} />,
+      );
+      await act(async () => {});
+      expect(probeImageInkMock).not.toHaveBeenCalled();
+      const img = container.querySelector('img')!;
+      expect(img.style.backgroundColor).toBe('');
+      expect(img.style.filter).toBe('');
+    });
+  });
+});
+
+// #6558: the viewer offers the same right-click menu as an image in the book.
+describe('ImageViewer image context menu', () => {
+  it('right-clicking the image opens Copy Image / Save Image', () => {
+    const { container, getAllByRole } = render(
+      <ImageViewer src='data:image/png;base64,AA==' onClose={vi.fn()} gridInsets={gridInsets} />,
+    );
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    act(() => {
+      container.querySelector('img')!.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+    expect(getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Copy Image',
+      'Save Image',
+    ]);
+  });
+
+  it('dismissing the menu keeps the viewer open', () => {
+    const onClose = vi.fn();
+    const { container, queryByRole } = render(
+      <ImageViewer src='data:image/png;base64,AA==' onClose={onClose} gridInsets={gridInsets} />,
+    );
+    fireEvent.contextMenu(container.querySelector('img')!);
+    fireEvent.click(document.querySelector('.overlay')!);
+    expect(queryByRole('menuitem')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

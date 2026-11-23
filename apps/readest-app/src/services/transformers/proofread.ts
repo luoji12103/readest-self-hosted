@@ -1,5 +1,5 @@
 import * as CFI from 'foliate-js/epubcfi.js';
-import type { Transformer } from './types';
+import type { Transformer, TransformContext } from './types';
 import { ProofreadRule } from '@/types/book';
 import { useSettingsStore } from '@/store/settingsStore';
 
@@ -9,6 +9,8 @@ interface NormalizedPattern {
 }
 
 const isUnicodeWordChar = (char: string): boolean => /[\p{L}\p{N}_]/u.test(char || '');
+const isUnicodePunctuationOnly = (text: string): boolean =>
+  /^\p{P}+$/u.test(text) && !isUnicodeWordChar(text);
 const hasUnicodeChars = (text: string): boolean => /[^\x00-\x7F]/.test(text);
 
 // Scripts that don't use spaces between words (no word boundaries)
@@ -84,8 +86,16 @@ function isValidMatch(text: string, match: RegExpExecArray, rule: ProofreadRule)
     if (!isExactMatch) return false;
   }
 
-  // Skip word boundary check for scripts without word boundaries (CJK, Thai, Lao, Khmer, Myanmar, Tibetan)
-  if (hasUnicodeChars(rule.pattern) && !isPureNoWordBoundaryScript(rule.pattern)) {
+  // Unicode punctuation has no word boundary of its own. Inspect the matched
+  // text rather than the pattern so regex classes such as `[«»]` work without
+  // changing the established behavior for symbols, combining marks, or words.
+  // Scripts without word boundaries (CJK, Thai, Lao, Khmer, Myanmar, Tibetan)
+  // continue to use the existing adjacent-character exception below.
+  if (
+    hasUnicodeChars(rule.pattern) &&
+    !isUnicodePunctuationOnly(match[0]) &&
+    !isPureNoWordBoundaryScript(rule.pattern)
+  ) {
     const charBefore = text[match.index - 1] ?? '';
     const charAfter = text[match.index + match[0].length] ?? '';
     // Only check word boundaries if adjacent chars are from scripts that use word boundaries
@@ -183,6 +193,27 @@ function applyReplacementSingle(
   }
 }
 
+// Spine step of a CFI: everything before the first indirection (`!`), or the
+// whole path for a section CFI, which has none. `sections[i].cfi` is
+// `epubcfi(/6/14)` and a selection made in it is `epubcfi(/6/14!/4/2,...)`.
+const cfiSpineStep = (cfi?: string): string | undefined =>
+  cfi?.match(/^epubcfi\((.*?)(?:!|\)$)/)?.[1];
+
+/**
+ * Whether a selection-scoped rule belongs to the section being transformed.
+ * The rule's own CFI names its spine item, so prefer that: `sectionHref` holds
+ * the TOC href at the reading position, which resolves to the nearest
+ * preceding nav entry and therefore names a different file whenever a spine
+ * item has no TOC entry of its own (#6148). Formats without spine CFIs
+ * (markdown, where section ids are the spine index) fall back to the href.
+ */
+const inThisSection = (rule: ProofreadRule, ctx: TransformContext): boolean => {
+  const ruleSpine = cfiSpineStep(rule.cfi);
+  const ctxSpine = cfiSpineStep(ctx.sectionCfi);
+  if (ruleSpine && ctxSpine) return ruleSpine === ctxSpine;
+  return ctx.sectionHref?.split('#')[0] === rule.sectionHref?.split('#')[0];
+};
+
 function getTextNodes(doc: Document): Text[] {
   const walker = document.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT, {
     acceptNode: (node) => {
@@ -241,11 +272,7 @@ export const proofreadTransformer: Transformer = {
     const ordered = [...byScope.selection, ...byScope.book, ...byScope.library];
 
     for (const rule of ordered) {
-      if (rule.scope === 'selection') {
-        const ruleBase = rule.sectionHref?.split('#')[0];
-        const ctxBase = ctx.sectionHref?.split('#')[0];
-        if (ctxBase !== ruleBase) continue;
-      }
+      if (rule.scope === 'selection' && !inThisSection(rule, ctx)) continue;
       if (rule.scope === 'selection') {
         applyReplacementSingle(doc, rule);
       } else {

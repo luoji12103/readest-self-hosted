@@ -1,7 +1,11 @@
-import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
-import { isTauriAppPlatform } from '@/services/environment';
+import { browserFetch as tauriFetch } from '@/services/webBrowser/browserFetch';
 import { imageFetchHeaders } from './httpHeaders';
 import type { EpubImage } from './types';
+
+// Not `isTauriAppPlatform` from services/environment: that module reaches
+// appService → bookService → the conversion worker, so this module (bundled
+// into send-conversion.worker) would spawn its own worker and hang the build.
+const isTauriAppPlatform = () => process.env['NEXT_PUBLIC_APP_PLATFORM'] === 'tauri';
 
 // On Tauri we go through the Rust HTTP client (no browser-CORS); on web
 // we use the native fetch — the bundler is only ever invoked from a
@@ -11,10 +15,11 @@ import type { EpubImage } from './types';
 // paywalled / member-only CDN hosts — without that, an authenticated
 // Substack image returns a placeholder. In Tauri we also fold in the
 // full image-fetch header set (UA + Sec-Ch-Ua + Sec-Fetch-* + Referer)
+// and use the browser's native cookie store, including HttpOnly cookies,
 // so CDNs that gate images on the browser shape — NYT, WSJ, paywalled
 // CDNs — cooperate.
 const httpFetch = (url: string, referer: string | null, init?: RequestInit): Promise<Response> => {
-  if (!isTauriAppPlatform()) {
+  if (!isTauriAppPlatform() || url.startsWith('data:')) {
     return globalThis.fetch(url, { credentials: 'include', ...init });
   }
   const baseHeaders = imageFetchHeaders(referer);
@@ -181,6 +186,40 @@ function mimeFromContentType(contentType: string | null, url: string): string {
   return 'application/octet-stream';
 }
 
+/**
+ * Whether an asset URL is worth a fetch.
+ *
+ * `http(s):` and `data:` always are. `file:` is the interesting case: an
+ * extension page holding "Allow access to file URLs" *can* read local
+ * files, which is what lets a page saved with a `<name>_files/` folder keep
+ * its images instead of degrading to alt text. That capability is also a
+ * disclosure risk, since the EPUB we build gets uploaded, so it is fenced
+ * twice:
+ *
+ *   1. The page being clipped must itself be local. A remote page pointing
+ *      an `<img>` at `file:///…` must never cause a disk read.
+ *   2. The asset must live under the page's own directory. `new URL` has
+ *      already normalized away any `..`, so a prefix test is sufficient to
+ *      keep a crafted local page from harvesting the rest of the disk. A
+ *      page sitting at the filesystem root gets nothing — its "directory"
+ *      is `/`, which would otherwise mean everything.
+ */
+function isFetchableAssetUrl(url: string, pageUrl: string): boolean {
+  if (/^(https?|data):/i.test(url)) return true;
+  if (!/^file:/i.test(url)) return false;
+  let page: URL;
+  let asset: URL;
+  try {
+    page = new URL(pageUrl);
+    asset = new URL(url);
+  } catch {
+    return false;
+  }
+  if (page.protocol !== 'file:' || asset.protocol !== 'file:') return false;
+  const dir = page.pathname.slice(0, page.pathname.lastIndexOf('/') + 1);
+  return dir.length > 1 && asset.pathname.startsWith(dir);
+}
+
 interface FetchedAsset {
   url: string;
   path: string;
@@ -188,8 +227,15 @@ interface FetchedAsset {
   mime: string;
 }
 
-async function fetchAsset(url: string, referer: string | null): Promise<FetchedAsset | null> {
+async function fetchAsset(
+  url: string,
+  referer: string | null,
+  signal?: AbortSignal,
+): Promise<FetchedAsset | null> {
+  signal?.throwIfAborted();
   const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
   const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await httpFetch(url, referer, { signal: ac.signal, redirect: 'follow' });
@@ -205,6 +251,7 @@ async function fetchAsset(url: string, referer: string | null): Promise<FetchedA
     return { url, path, bytes, mime };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -231,7 +278,10 @@ export interface BundleAssetsResult {
 export async function bundleAssets(
   contentHtml: string,
   pageUrl: string,
+  options: { maxBytes?: number; signal?: AbortSignal } = {},
 ): Promise<BundleAssetsResult> {
+  const maxBytes = Math.min(options.maxBytes ?? MAX_TOTAL_ASSET_BYTES, MAX_TOTAL_ASSET_BYTES);
+  options.signal?.throwIfAborted();
   const doc = new DOMParser().parseFromString(`<div id="root">${contentHtml}</div>`, 'text/html');
   const root = doc.getElementById('root');
   if (!root) return { html: contentHtml, images: [], missing: 0 };
@@ -313,33 +363,62 @@ export async function bundleAssets(
   // Bounded-concurrency fetch loop. `MAX_CONCURRENCY` workers pull from a
   // shared cursor so we never hammer a single origin with N requests. Each
   // fetch owns its own timeout — see `fetchAsset`.
+  //
+  // Results are parked by index rather than committed as they land, because
+  // the size budget below has to decide which images to drop and that
+  // decision must not depend on which fetch happened to win the race. A
+  // clip has to be reproducible: the same page with the same assets must
+  // produce the same EPUB bytes on every device, every time.
+  const settled = new Array<FetchedAsset | null>(uniqueUrls.length).fill(null);
+  const resolved = new Array<boolean>(uniqueUrls.length).fill(false);
+
+  // Bytes owned by the unbroken run of assets already resolved from the front
+  // of the document. Consulted only to stop dispatching once the budget is
+  // provably spent, so an image-heavy page does not download megabytes it is
+  // going to discard. The authoritative accounting is the in-order pass below,
+  // so this staying approximate cannot affect the output.
+  let prefixCursor = 0;
+  let prefixBytes = 0;
+  const settledPrefixBytes = (): number => {
+    while (prefixCursor < resolved.length && resolved[prefixCursor]) {
+      prefixBytes += settled[prefixCursor]?.bytes.byteLength ?? 0;
+      prefixCursor++;
+    }
+    return prefixBytes;
+  };
+
   let cursor = 0;
   const worker = async () => {
     while (cursor < uniqueUrls.length) {
+      options.signal?.throwIfAborted();
       const i = cursor++;
       const url = uniqueUrls[i]!;
-      if (totalBytes >= MAX_TOTAL_ASSET_BYTES) {
-        missing++;
-        continue;
-      }
-      try {
-        const asset = await fetchAsset(url, pageUrl);
-        if (asset && totalBytes + asset.bytes.byteLength <= MAX_TOTAL_ASSET_BYTES) {
-          fetched.set(url, asset);
-          totalBytes += asset.bytes.byteLength;
-        } else {
-          missing++;
+      if (isFetchableAssetUrl(url, pageUrl) && settledPrefixBytes() < maxBytes) {
+        try {
+          settled[i] = await fetchAsset(url, pageUrl, options.signal);
+        } catch (err) {
+          console.warn('[clip/bundle] image fetch failed', {
+            url,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
-      } catch (err) {
-        missing++;
-        console.warn('[clip/bundle] image fetch failed', {
-          url,
-          error: err instanceof Error ? err.message : String(err),
-        });
       }
+      resolved[i] = true;
     }
   };
   await Promise.all(Array.from({ length: MAX_CONCURRENCY }, worker));
+
+  options.signal?.throwIfAborted();
+  // Apply the budget strictly in document order.
+  for (let i = 0; i < uniqueUrls.length; i++) {
+    const asset = settled[i];
+    if (!asset || totalBytes + asset.bytes.byteLength > maxBytes) {
+      missing++;
+      continue;
+    }
+    fetched.set(uniqueUrls[i]!, asset);
+    totalBytes += asset.bytes.byteLength;
+  }
   console.log('[clip/bundle] done', {
     fetched: fetched.size,
     missing,

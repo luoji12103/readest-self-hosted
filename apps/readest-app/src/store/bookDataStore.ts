@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { SystemSettings } from '@/types/settings';
-import { Book, BookConfig, BookNote } from '@/types/book';
+import { Book, BookConfig, BookFormat, BookNote } from '@/types/book';
 import { EnvConfigType } from '@/services/environment';
 import { BookDoc } from '@/libs/document';
 import { useLibraryStore } from './libraryStore';
@@ -62,6 +62,8 @@ export interface BookData {
   file: File | null;
   config: BookConfig | null;
   bookDoc: BookDoc | null;
+  /* Format the document parsed as; differs from book.format for streamed stubs */
+  docFormat?: BookFormat;
   isFixedLayout: boolean;
 }
 
@@ -79,6 +81,22 @@ interface BookDataState {
   getBookData: (keyOrId: string) => BookData | null;
   clearBookData: (keyOrId: string) => void;
 }
+
+/**
+ * Drop booknotes that carry no CFI. Such a note has no anchor in the book: it
+ * can't be rendered, navigated to, or ordered against anything. Worse, it is
+ * actively dangerous — `CFI.compare` dereferences both of its arguments, so a
+ * null/undefined cfi reaching a sort comparator or `findNearestCfi` throws
+ * during render and drops the whole app to the error boundary.
+ *
+ * `BookNote.cfi` is typed `string`, but that isn't enforced at runtime for data
+ * we didn't create: file sync (`services/sync/file/wire.ts`), backup restore,
+ * and the Foliate importer all parse foreign JSON straight into booknotes.
+ * Every write to `config.booknotes` funnels through this store, so discard them
+ * here rather than defending each of the many CFI comparison sites.
+ */
+const discardUnanchoredBooknotes = (booknotes: BookNote[]): BookNote[] =>
+  booknotes.filter((booknote) => booknote.cfi);
 
 export const useBookDataStore = create<BookDataState>((set, get) => ({
   booksData: {},
@@ -109,12 +127,15 @@ export const useBookDataStore = create<BookDataState>((set, get) => ({
         console.warn('No config found for book', id);
         return state;
       }
+      const update = partialConfig.booknotes
+        ? { ...partialConfig, booknotes: discardUnanchoredBooknotes(partialConfig.booknotes) }
+        : partialConfig;
       return {
         booksData: {
           ...state.booksData,
           [id]: {
             ...state.booksData[id]!,
-            config: { ...config, ...partialConfig },
+            config: { ...config, ...update },
           },
         },
       };
@@ -168,7 +189,12 @@ export const useBookDataStore = create<BookDataState>((set, get) => ({
       const book = state.booksData[id];
       if (!book) return state;
       const dedupedBooknotes = Array.from(
-        new Map(booknotes.map((item) => [`${item.id}-${item.type}-${item.cfi}`, item])).values(),
+        new Map(
+          discardUnanchoredBooknotes(booknotes).map((item) => [
+            `${item.id}-${item.type}-${item.cfi}`,
+            item,
+          ]),
+        ).values(),
       );
       updatedConfig = {
         ...book.config,

@@ -214,8 +214,8 @@ const applyRow = async <T extends ReplicaLocalRecord>(
     // this path because the settings replica lands before the dict
     // replica, and a contentId may be referenced in providerEnabled
     // even though its dict row arrives tombstoned. Other kinds (font,
-    // texture, opds_catalog) self-no-op when no local exists, so the
-    // unconditional call is safe.
+    // texture, opds_catalog, abs_server) self-no-op when no local
+    // exists, so the unconditional call is safe.
     deps.softDeleteByContentId(row.replica_id);
     return;
   }
@@ -272,7 +272,7 @@ const applyRow = async <T extends ReplicaLocalRecord>(
     }
     return;
   }
-  if (!deps.adapter.binary) return;
+  if (!deps.adapter.binary || deps.adapter.binary.downloadOnDemand) return;
 
   // Skip the download queue if every manifest file is already on disk
   // under the resolved bundle dir. Refresh-the-page is a no-op rather

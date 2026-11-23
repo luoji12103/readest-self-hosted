@@ -1,5 +1,7 @@
+import { mergeBookshelfStates, migrateBookshelfSettings } from '@/services/bookshelves/state';
+import { readPendingBookshelves } from '@/services/bookshelves/journal';
 import { FileSystem } from '@/types/system';
-import { ReadSettings, SystemSettings } from '@/types/settings';
+import { LibrarySecondarySortByType, ReadSettings, SystemSettings } from '@/types/settings';
 import { DEFAULT_HIGHLIGHT_COLORS, UserHighlightColor, ViewSettings } from '@/types/book';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -31,6 +33,7 @@ import { safeLoadJSON, safeSaveJSON } from './persistence';
 export interface Context {
   fs: FileSystem;
   isMobile: boolean;
+  isDesktopApp?: boolean;
   isEink: boolean;
   isAppDataSandbox: boolean;
 }
@@ -47,6 +50,7 @@ export function getDefaultViewSettings(ctx: Context): ViewSettings {
     ...DEFAULT_ANNOTATOR_CONFIG,
     ...DEFAULT_WORD_LENS_CONFIG,
     ...DEFAULT_VIEW_SETTINGS_CONFIG,
+    spreadMode: ctx.isDesktopApp ? 'auto' : 'none',
     ...(ctx.isMobile ? DEFAULT_MOBILE_VIEW_SETTINGS : {}),
     ...(ctx.isEink ? DEFAULT_EINK_VIEW_SETTINGS : {}),
     ...(isCJKEnv() ? DEFAULT_CJK_VIEW_SETTINGS : {}),
@@ -101,6 +105,20 @@ export function migrateHighlightColorPrefs(read: ReadSettings): void {
   }
 
   read.userHighlightColors = userColors;
+}
+
+/**
+ * `librarySortBy2` was renamed to `libraryThenSortBy` (#5119). Carry a stored
+ * pre-rename pick over so users keep their "Then by" sort, then drop the legacy
+ * key so a later explicit `'none'` isn't resurrected on the next load.
+ */
+export function migrateLibraryThenSort(settings: SystemSettings): void {
+  const legacy = settings as unknown as { librarySortBy2?: LibrarySecondarySortByType };
+  if (!legacy.librarySortBy2) return;
+  if (settings.libraryThenSortBy === 'none') {
+    settings.libraryThenSortBy = legacy.librarySortBy2;
+  }
+  delete legacy.librarySortBy2;
 }
 
 export async function loadSettings(ctx: Context): Promise<SystemSettings> {
@@ -158,8 +176,26 @@ export async function loadSettings(ctx: Context): Promise<SystemSettings> {
     settings.globalViewSettings.annotationQuickAction = 'dictionary';
   }
 
+  migrateLibraryThenSort(settings);
+  // Recover this account's durable edits offline without refreshing its token.
+  // Other accounts' edits stay in the journal until their owner signs in.
+  const user = JSON.parse(localStorage.getItem('user') || '{}') as { id?: string };
+  for (const row of readPendingBookshelves()) {
+    if (row.user_id && row.user_id !== user.id) continue;
+    settings.bookshelves = mergeBookshelfStates(settings.bookshelves, {
+      rows: { [row.replica_id]: row },
+    });
+  }
+
+  if (settings.bookshelves) settings.bookshelves = mergeBookshelfStates(settings.bookshelves);
+
   if (!settings.kosync.deviceId) {
     settings.kosync.deviceId = uuidv4();
+    await saveSettings(ctx.fs, settings);
+  }
+
+  if (!settings.bookorbit.deviceId) {
+    settings.bookorbit.deviceId = uuidv4();
     await saveSettings(ctx.fs, settings);
   }
 
@@ -168,9 +204,37 @@ export async function loadSettings(ctx: Context): Promise<SystemSettings> {
     await saveSettings(ctx.fs, settings);
   }
 
+  if (migrateBookshelfSettings(settings)) {
+    await saveSettings(ctx.fs, settings);
+  }
+
   return settings;
 }
 
+let settingsWrites: Promise<void> = Promise.resolve();
+/**
+ * The newest queued settings, or null once it is safely on disk. Saves run on
+ * hot paths (every view-setting slider step) and each one reads settings.json
+ * back to merge `bookshelves`, so a burst would otherwise do one read+write per
+ * step. Only the newest object needs writing; the earlier callers still await a
+ * link that resolves after a write carrying their data or newer, and reject with
+ * it when it fails — the stamp is only dropped once the write succeeds, so the
+ * next link retries instead of reporting a silent success.
+ */
+let pendingSettings: SystemSettings | null = null;
 export async function saveSettings(fs: FileSystem, settings: SystemSettings): Promise<void> {
-  await safeSaveJSON(fs, SETTINGS_FILENAME, 'Settings', settings);
+  pendingSettings = settings;
+  const write = async () => {
+    const next = pendingSettings;
+    if (!next) return;
+    const disk = await safeLoadJSON<Partial<SystemSettings>>(fs, SETTINGS_FILENAME, 'Settings', {});
+    const merged =
+      next.bookshelves || disk.bookshelves
+        ? { ...next, bookshelves: mergeBookshelfStates(disk.bookshelves, next.bookshelves) }
+        : next;
+    await safeSaveJSON(fs, SETTINGS_FILENAME, 'Settings', merged);
+    if (pendingSettings === next) pendingSettings = null;
+  };
+  settingsWrites = settingsWrites.catch(() => {}).then(write);
+  await settingsWrites;
 }

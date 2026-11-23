@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { MdEdit, MdDelete, MdLock, MdLockOpen, MdOutlineSearch } from 'react-icons/md';
 
 import { Book } from '@/types/book';
@@ -10,10 +10,14 @@ import { flattenContributors, formatAuthors, formatPublisher, formatTitle } from
 import { useFileSelector } from '@/hooks/useFileSelector';
 import { FormField } from './FormField';
 import BookCover from '@/components/BookCover';
+import CoverSearchDialog from './CoverSearchDialog';
+import { browserFetch } from '@/services/webBrowser/browserFetch';
+import { useDefaultBookshelfCovers } from '@/hooks/useDefaultBookshelfCovers';
 
 interface BookDetailEditProps {
   book: Book;
   metadata: BookMetadata;
+  tags: string[];
   fieldSources: Record<string, string>;
   lockedFields: Record<string, boolean>;
   fieldErrors: Record<string, string>;
@@ -33,6 +37,7 @@ const emptyCoverImageUrl = '_blank';
 const BookDetailEdit: React.FC<BookDetailEditProps> = ({
   book,
   metadata,
+  tags,
   fieldSources,
   lockedFields,
   fieldErrors,
@@ -48,6 +53,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
 }) => {
   const _ = useTranslation();
   const { appService } = useEnv();
+  const { skeuomorphicCovers } = useDefaultBookshelfCovers();
   const { selectFiles } = useFileSelector(appService, _);
 
   const hasLockedFields = Object.values(lockedFields).some((locked) => locked);
@@ -55,6 +61,38 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
   const isCoverLocked = lockedFields['coverImageUrl'] || false;
   const coverImageUrl = metadata.coverImageUrl || null;
   const [newCoverImageUrl, setNewCoverImageUrl] = useState<string | null>(coverImageUrl);
+  const [coverSearchOpen, setCoverSearchOpen] = useState(false);
+  const searchBlobUrl = useRef<string | null>(null);
+
+  const handleSearchImage = async (url: string, pageUrl?: string) => {
+    if (isCoverLocked || !appService) return;
+    const response =
+      appService.appPlatform === 'tauri'
+        ? await browserFetch(url, pageUrl ? { headers: { Referer: pageUrl } } : undefined)
+        : await fetch(url);
+    if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) {
+      throw new Error('Could not load image');
+    }
+    const blob = await response.blob();
+    if (appService.appPlatform === 'tauri') {
+      const filename = `cover-search-${crypto.randomUUID()}`;
+      await appService.writeFile(filename, 'Cache', await blob.arrayBuffer());
+      const filePath = await appService.resolveFilePath(filename, 'Cache');
+      const imageUrl = await appService.getImageURL(filePath);
+      onFieldChange('coverImageBlobUrl', undefined);
+      onFieldChange('coverImageFile', filePath);
+      onFieldChange('coverImageUrl', imageUrl);
+      setNewCoverImageUrl(imageUrl);
+    } else {
+      if (searchBlobUrl.current) URL.revokeObjectURL(searchBlobUrl.current);
+      const blobUrl = URL.createObjectURL(blob);
+      searchBlobUrl.current = blobUrl;
+      onFieldChange('coverImageFile', undefined);
+      onFieldChange('coverImageUrl', blobUrl);
+      onFieldChange('coverImageBlobUrl', blobUrl);
+      setNewCoverImageUrl(blobUrl);
+    }
+  };
 
   const titleAuthorFields = [
     {
@@ -91,7 +129,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
       field: 'seriesIndex',
       label: _('Series Index'),
       isNumber: true,
-      value: String(metadata.seriesIndex || ''),
+      value: String(metadata.seriesIndex ?? ''),
       placeholder: _('Enter series index'),
     },
     {
@@ -142,6 +180,12 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
       placeholder: _('Fiction, Science, History'),
     },
     {
+      field: 'tags',
+      label: _('Tags'),
+      value: tags.join(', '),
+      placeholder: _('Favorites, To Read'),
+    },
+    {
       field: 'description',
       label: _('Description'),
       type: 'textarea',
@@ -158,11 +202,14 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
       if (selectedFile.path && appService) {
         const filePath = selectedFile.path;
         const imageUrl = await appService.getCachedImageUrl(filePath);
+        onFieldChange('coverImageBlobUrl', undefined);
         onFieldChange('coverImageFile', filePath);
         onFieldChange('coverImageUrl', imageUrl);
         setNewCoverImageUrl(imageUrl);
       } else if (selectedFile.file) {
         const coverImageBlobUrl = URL.createObjectURL(selectedFile.file);
+        onFieldChange('coverImageFile', undefined);
+        onFieldChange('coverImageUrl', coverImageBlobUrl);
         onFieldChange('coverImageBlobUrl', coverImageBlobUrl);
         setNewCoverImageUrl(coverImageBlobUrl);
       }
@@ -171,6 +218,14 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
 
   return (
     <div className='bg-base-100 relative w-full rounded-lg'>
+      {coverSearchOpen && (
+        <CoverSearchDialog
+          title={formatTitle(metadata.title)}
+          author={formatAuthors(metadata.author)}
+          onSelect={handleSearchImage}
+          onClose={() => setCoverSearchOpen(false)}
+        />
+      )}
       <div className='mb-6 flex items-stretch gap-4'>
         <div className='cover-field flex w-[30%] max-w-32 flex-col gap-2'>
           <button
@@ -179,6 +234,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
           >
             <BookCover
               mode='list'
+              showSpine={skeuomorphicCovers}
               book={{
                 ...book,
                 metadata: {
@@ -194,15 +250,15 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
               onClick={handleSelectLocalImage}
               disabled={isCoverLocked}
               className={clsx(
-                'flex w-1/2 min-w-0 items-center justify-center gap-1 rounded p-1 sm:w-3/5',
+                'flex w-1/2 min-w-0 items-center justify-center gap-1 rounded-sm p-1 sm:w-3/5',
                 'text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 sm:text-xs',
-                isCoverLocked ? '!text-base-content bg-base-200' : 'bg-gray-100 !text-gray-500',
+                isCoverLocked ? 'text-base-content! bg-base-200' : 'bg-gray-100 text-gray-500!',
               )}
               title={_('Change cover image')}
             >
               <MdEdit
                 className={clsx(
-                  'h-5 w-5 flex-shrink-0 sm:h-4 sm:w-4',
+                  'h-5 w-5 shrink-0 sm:h-4 sm:w-4',
                   isCoverLocked ? 'fill-base-content' : 'fill-gray-600',
                 )}
               />
@@ -218,10 +274,10 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
               }}
               disabled={isCoverLocked}
               className={clsx(
-                'flex w-1/4 items-center justify-center rounded p-1 sm:w-1/5',
+                'flex w-1/4 items-center justify-center rounded-sm p-1 sm:w-1/5',
                 'disabled:cursor-not-allowed disabled:opacity-50',
                 'text-red-500 hover:bg-red-50 hover:text-red-600',
-                isCoverLocked ? '!text-base-content bg-base-200' : 'bg-gray-100',
+                isCoverLocked ? 'text-base-content! bg-base-200' : 'bg-gray-100',
               )}
               title={_('Remove cover image')}
             >
@@ -231,7 +287,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
             <button
               onClick={() => onToggleFieldLock('coverImageUrl')}
               className={clsx(
-                'flex w-1/4 items-center justify-center rounded p-1 hover:bg-gray-50 sm:w-1/5',
+                'flex w-1/4 items-center justify-center rounded-sm p-1 hover:bg-gray-50 sm:w-1/5',
                 isCoverLocked
                   ? 'bg-green-100 text-green-500 hover:bg-green-200'
                   : 'bg-gray-100 text-gray-500',
@@ -245,8 +301,19 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
               )}
             </button>
           </div>
+          <button
+            type='button'
+            aria-label={_('Search Book Covers')}
+            title={_('Search Book Covers')}
+            disabled={isCoverLocked}
+            onClick={() => setCoverSearchOpen(true)}
+            className='btn btn-ghost eink-bordered min-h-11 w-full gap-1 px-1 text-sm'
+          >
+            <MdOutlineSearch aria-hidden className='h-5 w-5 shrink-0' />
+            <span className='truncate'>{_('Search')}</span>
+          </button>
         </div>
-        <div className='title-fields flex flex-1 flex-col justify-between'>
+        <div className='title-fields flex min-w-0 flex-1 flex-col justify-between'>
           {titleAuthorFields.map(({ field, label, required, value, placeholder }) => (
             <FormField
               key={field}
@@ -329,7 +396,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
               onClick={onUnlockAll}
               disabled={!hasLockedFields}
               className={clsx(
-                'hover:bg-base-200 flex items-center gap-1 rounded px-2 py-1 text-sm',
+                'hover:bg-base-200 flex items-center gap-1 rounded-sm px-2 py-1 text-sm',
                 'disabled:cursor-not-allowed disabled:opacity-80',
                 'text-yellow-600 hover:text-yellow-700',
               )}
@@ -342,7 +409,7 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
               onClick={onLockAll}
               disabled={allFieldsLocked}
               className={clsx(
-                'hover:bg-base-200 flex items-center gap-1 rounded px-2 py-1 text-sm',
+                'hover:bg-base-200 flex items-center gap-1 rounded-sm px-2 py-1 text-sm',
                 'disabled:cursor-not-allowed disabled:opacity-80',
                 'text-green-600 hover:text-green-700',
               )}

@@ -15,7 +15,9 @@ interface UnwrappedOpdsFields {
   customHeaders?: Record<string, string>;
   autoDownload?: boolean;
   disabled?: boolean;
+  allowSelfSignedCert?: boolean;
   addedAt?: number;
+  sortOrder?: number;
   username?: string;
   password?: string;
 }
@@ -28,7 +30,9 @@ const unwrapOpdsFields = (fields: FieldsObject): UnwrappedOpdsFields => {
   const customHeaders = unwrap(fields['customHeaders']);
   const autoDownload = unwrap(fields['autoDownload']);
   const disabled = unwrap(fields['disabled']);
+  const allowSelfSignedCert = unwrap(fields['allowSelfSignedCert']);
   const addedAt = unwrap(fields['addedAt']);
+  const sortOrder = unwrap(fields['sortOrder']);
   // Crypto middleware decrypted these in place before unpackRow ran
   // (see replicaCryptoMiddleware.decryptRowFields). A missing entry
   // means either the publishing device hadn't unlocked yet or the
@@ -47,7 +51,9 @@ const unwrapOpdsFields = (fields: FieldsObject): UnwrappedOpdsFields => {
         : undefined,
     autoDownload: autoDownload === true ? true : undefined,
     disabled: disabled === true ? true : undefined,
+    allowSelfSignedCert: typeof allowSelfSignedCert === 'boolean' ? allowSelfSignedCert : undefined,
     addedAt: typeof addedAt === 'number' ? addedAt : undefined,
+    sortOrder: typeof sortOrder === 'number' ? sortOrder : undefined,
     username: typeof username === 'string' ? username : undefined,
     password: typeof password === 'string' ? password : undefined,
   };
@@ -79,6 +85,9 @@ export const opdsCatalogAdapter: ReplicaAdapter<OPDSCatalog> = {
     if (catalog.customHeaders !== undefined) fields['customHeaders'] = catalog.customHeaders;
     if (catalog.autoDownload !== undefined) fields['autoDownload'] = catalog.autoDownload;
     if (catalog.disabled !== undefined) fields['disabled'] = catalog.disabled;
+    if (catalog.allowSelfSignedCert !== undefined)
+      fields['allowSelfSignedCert'] = catalog.allowSelfSignedCert;
+    if (catalog.sortOrder !== undefined) fields['sortOrder'] = catalog.sortOrder;
     // Pass credentials as plaintext here — the publish-side crypto
     // middleware (replicaCryptoMiddleware.encryptPackedFields) wraps
     // them in cipher envelopes before they hit fields_jsonb. If the
@@ -102,7 +111,12 @@ export const opdsCatalogAdapter: ReplicaAdapter<OPDSCatalog> = {
           : undefined,
       autoDownload: fields['autoDownload'] === true ? true : undefined,
       disabled: fields['disabled'] === true ? true : undefined,
+      allowSelfSignedCert:
+        typeof fields['allowSelfSignedCert'] === 'boolean'
+          ? fields['allowSelfSignedCert']
+          : undefined,
       addedAt: fields['addedAt'] !== undefined ? Number(fields['addedAt']) : undefined,
+      sortOrder: fields['sortOrder'] !== undefined ? Number(fields['sortOrder']) : undefined,
       username: fields['username'] !== undefined ? String(fields['username']) : undefined,
       password: fields['password'] !== undefined ? String(fields['password']) : undefined,
     };
@@ -127,7 +141,10 @@ export const opdsCatalogAdapter: ReplicaAdapter<OPDSCatalog> = {
     if (fields.customHeaders !== undefined) catalog.customHeaders = fields.customHeaders;
     if (fields.autoDownload !== undefined) catalog.autoDownload = fields.autoDownload;
     if (fields.disabled !== undefined) catalog.disabled = fields.disabled;
+    if (fields.allowSelfSignedCert !== undefined)
+      catalog.allowSelfSignedCert = fields.allowSelfSignedCert;
     if (fields.addedAt !== undefined) catalog.addedAt = fields.addedAt;
+    if (fields.sortOrder !== undefined) catalog.sortOrder = fields.sortOrder;
     if (fields.username !== undefined) catalog.username = fields.username;
     if (fields.password !== undefined) catalog.password = fields.password;
     if (row.reincarnation) catalog.reincarnation = row.reincarnation;

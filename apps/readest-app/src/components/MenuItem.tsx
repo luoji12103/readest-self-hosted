@@ -58,7 +58,7 @@ const MenuItem: React.FC<MenuItemProps> = ({
 
   const buttonContent = (
     <>
-      <div className='flex w-full items-center justify-between'>
+      <div className='flex w-full min-w-0 items-center justify-between'>
         <div className='flex min-w-0 items-center'>
           {!noIcon && (
             <span style={{ minWidth: `${iconSize}px` }}>
@@ -73,7 +73,10 @@ const MenuItem: React.FC<MenuItemProps> = ({
             </span>
           )}
           <span
-            className={clsx('mx-2 flex-1 truncate text-base sm:text-sm', labelClass)}
+            className={clsx(
+              'mx-2 flex-1 break-words text-pretty text-start text-base sm:text-sm',
+              labelClass,
+            )}
             style={{ minWidth: 0 }}
           >
             {label}
@@ -82,7 +85,7 @@ const MenuItem: React.FC<MenuItemProps> = ({
         {shortcut && (
           <kbd
             className={clsx(
-              'border-base-300/40 bg-base-300/75 hidden rounded-md border shadow-sm sm:flex',
+              'border-base-300/40 bg-base-300/75 hidden rounded-md border shadow-xs sm:flex',
               'shrink-0 px-1.5 py-0.5 text-xs font-medium',
               disabled ? 'text-gray-400' : 'text-neutral-content',
             )}
@@ -91,11 +94,11 @@ const MenuItem: React.FC<MenuItemProps> = ({
           </kbd>
         )}
       </div>
-      <div className='flex w-full'>
+      <div className='flex w-full min-w-0'>
         {description && (
           <span
             className='mt-1 truncate text-start text-xs text-gray-500'
-            style={{ minWidth: 0, paddingInlineStart: noIcon ? '0' : `${iconSize + 8}px` }}
+            style={{ minWidth: 0, paddingInlineStart: noIcon ? '0.5rem' : `${iconSize + 8}px` }}
           >
             {description}
           </span>
@@ -106,9 +109,13 @@ const MenuItem: React.FC<MenuItemProps> = ({
 
   if (children) {
     return (
-      <ul className='menu rounded-box m-0 p-0'>
-        <li aria-label={label}>
-          <details open={detailsOpen} onToggle={(e) => setIsDetailsOpen(e.currentTarget.open)}>
+      <ul className='menu rounded-box m-0 w-full min-w-0 p-0'>
+        <li className='w-full min-w-0 max-w-full' aria-label={label}>
+          <details
+            className='w-full min-w-0'
+            open={detailsOpen}
+            onToggle={(e) => setIsDetailsOpen(e.currentTarget.open)}
+          >
             <summary
               role='button'
               tabIndex={0}
@@ -130,7 +137,7 @@ const MenuItem: React.FC<MenuItemProps> = ({
   }
 
   return (
-    <div className='flex'>
+    <div className='flex min-w-0'>
       <button
         role={disabled ? 'none' : 'menuitem'}
         aria-label={
@@ -139,7 +146,7 @@ const MenuItem: React.FC<MenuItemProps> = ({
         aria-live={toggled === undefined ? 'polite' : 'off'}
         tabIndex={disabled ? -1 : 0}
         className={clsx(
-          'hover:bg-base-300 text-base-content flex w-full flex-col items-center justify-center rounded-md p-1 py-[10px]',
+          'hover:bg-base-300 text-base-content flex w-full min-w-0 flex-col items-center justify-center rounded-md p-1 py-[10px]',
           disabled && 'btn-disabled text-gray-400',
           buttonClass,
         )}

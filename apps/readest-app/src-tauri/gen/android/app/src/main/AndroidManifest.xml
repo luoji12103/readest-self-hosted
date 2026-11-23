@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- LocalSend device discovery: receiving multicast announcements needs a
+         MulticastLock, which requires these two permissions. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
@@ -23,12 +27,17 @@
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
 
-        <!-- Android Auto: advertise the media capability so Readest shows up in
-             the car launcher and projects the TTS media session. Withdrawn in
-             #5038 after a Play Auto rejection (broken forward/back feedback);
-             re-enabled once the skip controls give instant, coherent state. -->
+        <!-- Android Auto opt-in. Play's Auto review rejected version code
+             11020 ("Audio inconsistently plays on the Android Auto
+             environment"), which blocked the whole release; it was withdrawn
+             in #5038, restored in #5066, and withdrawn again in #5235. It now
+             ships to the FOSS/GitHub builds only: build.gradle.kts resolves
+             `carAppMetaName` to an inert name for storeFlavor=googleplay, so
+             the Play build advertises no car application and skips Auto
+             review. Flip that mapping once the car audio path is validated
+             on real hardware. -->
         <meta-data
-            android:name="com.google.android.gms.car.application"
+            android:name="${carAppMetaName}"
             android:resource="@xml/automotive_app_desc" />
 
         <!-- Sentry auto-init (ContentProvider). Empty DSN => disabled. Release
@@ -36,9 +45,10 @@
              their safe off/false defaults. -->
         <meta-data android:name="io.sentry.dsn" android:value="${sentryDsn}" />
         <meta-data android:name="io.sentry.environment" android:value="production" />
+        <meta-data android:name="io.sentry.ndk.enable" android:value="false" />
 
         <activity
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|navigation|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:hardwareAccelerated="true"
@@ -64,9 +74,8 @@
                 <data android:mimeType="application/vnd.amazon.mobi8-ebook" />
                 <data android:mimeType="application/vnd.comicbook+zip" />
                 <data android:mimeType="application/x-cbz" />
-                <data android:mimeType="application/zip" />
                 <data android:mimeType="text/plain" />
-                <data android:mimeType="application/octet-stream"/>
+                <data android:mimeType="text/markdown" />
                 <data android:mimeType="application/x-font-ttf"/>
                 <data android:mimeType="application/x-font-otf"/>
             </intent-filter>
@@ -78,17 +87,32 @@
 
                 <data android:scheme="content" />
                 <data android:scheme="file" />
+                <data android:host="*" />
                 <data android:mimeType="*/*" />
                 <data android:pathPattern=".*\\.epub" />
+                <data android:pathSuffix=".epub" />
                 <data android:pathPattern=".*\\.pdf" />
+                <data android:pathSuffix=".pdf" />
                 <data android:pathPattern=".*\\.fb2" />
+                <data android:pathSuffix=".fb2" />
                 <data android:pathPattern=".*\\.fb2.zip" />
+                <data android:pathSuffix=".fb2.zip" />
                 <data android:pathPattern=".*\\.mobi" />
+                <data android:pathSuffix=".mobi" />
                 <data android:pathPattern=".*\\.azw" />
+                <data android:pathSuffix=".azw" />
                 <data android:pathPattern=".*\\.azw3" />
+                <data android:pathSuffix=".azw3" />
                 <data android:pathPattern=".*\\.cbz" />
+                <data android:pathSuffix=".cbz" />
                 <data android:pathPattern=".*\\.zip" />
+                <data android:pathSuffix=".zip" />
                 <data android:pathPattern=".*\\.txt" />
+                <data android:pathSuffix=".txt" />
+                <data android:pathPattern=".*\\.md" />
+                <data android:pathSuffix=".md" />
+                <data android:pathPattern=".*\\.rbooks" />
+                <data android:pathSuffix=".rbooks" />
             </intent-filter>
 
             <intent-filter>
@@ -253,6 +277,33 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:mimeType="application/pdf" />
                 <data android:pathPattern=".*\\.pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="text/plain" />
+                <data android:pathPattern=".*\\.txt" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="text/markdown" />
+                <data android:pathPattern=".*\\.md" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/x-readest-books" />
+                <data android:pathPattern=".*\\.rbooks" />
             </intent-filter>
             
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->

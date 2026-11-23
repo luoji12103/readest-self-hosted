@@ -20,7 +20,8 @@ export type CloudSyncProviderKind = 'readest' | FileSyncBackendKind;
 /** Settings slice key for a third-party backend kind. */
 export const settingsKeyForBackend = (
   kind: FileSyncBackendKind,
-): 'webdav' | 'googleDrive' | 's3' | 'onedrive' => (kind === 'gdrive' ? 'googleDrive' : kind);
+): 'webdav' | 'googleDrive' | 's3' | 'onedrive' | 'icloud' =>
+  kind === 'gdrive' ? 'googleDrive' : kind;
 
 /** Human-readable provider name (product names — deliberately untranslated). */
 export const cloudProviderDisplayName = (kind: CloudSyncProviderKind): string =>
@@ -32,7 +33,9 @@ export const cloudProviderDisplayName = (kind: CloudSyncProviderKind): string =>
         ? 'S3'
         : kind === 'onedrive'
           ? 'OneDrive'
-          : 'Readest Cloud';
+          : kind === 'icloud'
+            ? 'iCloud'
+            : 'Readest Cloud';
 
 /**
  * The third-party backends the user has switched on, in a STABLE order that
@@ -46,6 +49,7 @@ export const getEnabledFileSyncBackends = (
   if (settings?.googleDrive?.enabled) enabled.push('gdrive');
   if (settings?.s3?.enabled) enabled.push('s3');
   if (settings?.onedrive?.enabled) enabled.push('onedrive');
+  if (settings?.icloud?.enabled) enabled.push('icloud');
   return enabled;
 };
 
@@ -95,10 +99,24 @@ export const setCachedUserPlan = (plan: UserPlan | undefined): void => {
 
 export const getCachedUserPlan = (): UserPlan => cachedUserPlan;
 
+/**
+ * Cached alongside the plan for the same reason: premium access is now the
+ * plan OR an outright Full Customization purchase, and a storage-only buyer
+ * reports the `purchase` plan without being entitled. Defaults to false, the
+ * restrictive side.
+ */
+let cachedCustomizationPurchased = false;
+
+export const setCachedCustomizationPurchased = (purchased: boolean | undefined): void => {
+  cachedCustomizationPurchased = purchased ?? false;
+};
+
+export const getCachedCustomizationPurchased = (): boolean => cachedCustomizationPurchased;
+
 export interface CloudSyncGate {
   /** Readest Cloud syncs the library channels (rows, progress, notes, files). */
   readest: boolean;
-  /** Third-party backends the user switched on, in the fixed webdav/gdrive/s3/onedrive order. */
+  /** Third-party backends the user switched on, in the fixed webdav/gdrive/s3/onedrive/icloud order. */
   backends: FileSyncBackendKind[];
   /**
    * True when third-party backends are switched on but the plan does not allow
@@ -112,12 +130,13 @@ export interface CloudSyncGate {
 export const resolveCloudSyncGate = (
   settings: SystemSettings | null | undefined,
   plan: UserPlan = cachedUserPlan,
+  customizationPurchased: boolean = cachedCustomizationPurchased,
 ): CloudSyncGate => {
   const backends = getEnabledFileSyncBackends(settings);
   return {
     readest: isReadestCloudEnabled(settings),
     backends,
-    paused: backends.length > 0 && !isCloudSyncAllowed(plan),
+    paused: backends.length > 0 && !isCloudSyncAllowed(plan, customizationPurchased),
   };
 };
 
@@ -170,6 +189,12 @@ export const applySyncBooksAutoEnable = (settings: SystemSettings): boolean => {
           changed = true;
         }
         break;
+      case 'icloud':
+        if (settings.icloud && !settings.icloud.syncBooks) {
+          settings.icloud = { ...settings.icloud, syncBooks: true };
+          changed = true;
+        }
+        break;
     }
   }
   return changed;
@@ -180,7 +205,7 @@ export const applySyncBooksAutoEnable = (settings: SystemSettings): boolean => {
  * native book/progress/note rows). Now simply "is Readest Cloud switched on" —
  * it no longer means "and nothing else is". A user can mirror to Drive AND keep
  * Readest Cloud; whether book *files* also go to Readest is still governed
- * separately by `autoUpload` and the transfer queue.
+ * separately by the Manage Sync "book" toggle and the transfer queue.
  */
 export const isReadestCloudStorageActive = (
   settings: SystemSettings | null | undefined,

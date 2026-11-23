@@ -1,12 +1,38 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { DocumentLoader } from '@/libs/document';
 import type { BookDoc } from '@/libs/document';
+import type { ViewSettings } from '@/types/book';
 import type { Renderer } from '@/types/view';
+import { getStyles } from '@/utils/style';
+import {
+  DEFAULT_ANNOTATOR_CONFIG,
+  DEFAULT_BOOK_FONT,
+  DEFAULT_BOOK_LANGUAGE,
+  DEFAULT_BOOK_LAYOUT,
+  DEFAULT_BOOK_STYLE,
+  DEFAULT_SCREEN_CONFIG,
+  DEFAULT_TRANSLATOR_CONFIG,
+  DEFAULT_TTS_CONFIG,
+  DEFAULT_VIEW_CONFIG,
+} from '@/services/constants';
 
 // Vite serves fixture files; fetch the EPUB at runtime in the browser.
 const EPUB_URL = new URL('../fixtures/data/sample-alice.epub', import.meta.url).href;
 
 let book: BookDoc;
+
+const makeViewSettings = (): ViewSettings =>
+  ({
+    ...DEFAULT_BOOK_FONT,
+    ...DEFAULT_BOOK_LAYOUT,
+    ...DEFAULT_BOOK_STYLE,
+    ...DEFAULT_BOOK_LANGUAGE,
+    ...DEFAULT_VIEW_CONFIG,
+    ...DEFAULT_TTS_CONFIG,
+    ...DEFAULT_TRANSLATOR_CONFIG,
+    ...DEFAULT_ANNOTATOR_CONFIG,
+    ...DEFAULT_SCREEN_CONFIG,
+  }) as ViewSettings;
 
 const loadEPUB = async () => {
   const resp = await fetch(EPUB_URL);
@@ -108,6 +134,34 @@ describe('Paginator scrolled mode (browser)', () => {
     await stabilized;
     // Scrolled mode always uses 1 column
     expect(paginator.columnCount).toBe(1);
+  });
+
+  it('should wrap long unbroken text in scrolled mode', async () => {
+    paginator = createPaginator();
+    paginator.open(book);
+    paginator.setAttribute('flow', 'scrolled');
+    paginator.setStyles?.(getStyles(makeViewSettings(), undefined, []));
+    const idx = book.sections!.findIndex((s) => s.linear !== 'no');
+    const stabilized = waitForStabilized(paginator);
+    await paginator.goTo({ index: idx });
+    await stabilized;
+
+    const doc = paginator.getContents().find((content) => content.index === idx)!.doc;
+    const longText = doc.createElement('div');
+    longText.style.width = '160px';
+    longText.textContent = `https://example.com/${'unbroken'.repeat(30)}`;
+    doc.body.append(longText);
+
+    expect(longText.scrollWidth).toBeLessThanOrEqual(longText.clientWidth + 1);
+
+    // The fallback must not shrink min-content sizes (#5681): a short label in
+    // a CSS table built from divs keeps its word on one line.
+    const table = doc.createElement('div');
+    table.innerHTML = `<div style="display:table;width:300px"><div style="display:table-row"><div id="label" style="display:table-cell">Angela:</div><div style="display:table-cell">${'Lorem ipsum dolor sit amet '.repeat(30)}</div></div></div>`;
+    doc.body.append(table);
+    const range = doc.createRange();
+    range.selectNodeContents(doc.getElementById('label')!);
+    expect(range.getClientRects().length, 'lines the label wraps onto').toBe(1);
   });
 
   // Regression for issue #3987: toggling scrolled mode off shortly after
@@ -490,5 +544,58 @@ describe('Paginator scrolled mode (browser)', () => {
     const last = relocates.at(-1);
     expect(last).toBeDefined();
     expect(last!.index).toBe(next);
+  });
+
+  // Regression for issue #5635: the scrolled-mode relocate is a trailing-only
+  // debounce, so a scroll that never pauses (the Auto Scroll reading mode)
+  // reset the timer on every frame and reading progress never updated until
+  // the scrolling stopped. A continuous scroll burst must emit periodic
+  // 'scroll' relocates while it is still in progress.
+  it('should emit periodic relocates while a continuous scroll never pauses', async () => {
+    paginator = createPaginator();
+    paginator.open(book);
+    paginator.setAttribute('flow', 'scrolled');
+
+    const sections = book.sections!;
+    // A tall section so the whole burst stays inside it.
+    const K = sections.findIndex((s) => s.linear !== 'no' && (s.size ?? 0) > 8000);
+    expect(K).toBeGreaterThanOrEqual(0);
+
+    const stabilized = waitForStabilized(paginator);
+    await paginator.goTo({ index: K, anchor: 0 });
+    await stabilized;
+    await waitForFillComplete(paginator);
+
+    // Freeze the loaded set so preloads don't interleave with the burst.
+    paginator.setAttribute('no-preload', '');
+
+    const container = paginator.shadowRoot!.getElementById('container')!;
+
+    // Consume #justAnchored from the navigation with isolated nudges whose
+    // trailing debounce settles before the burst starts.
+    for (const top of [10, 20]) {
+      container.scrollTop = top;
+      container.dispatchEvent(new Event('scroll'));
+      await new Promise((r) => setTimeout(r, 350));
+    }
+
+    let during = 0;
+    const onReloc = (e: Event) => {
+      if ((e as CustomEvent).detail.reason === 'scroll') during += 1;
+    };
+    paginator.addEventListener('relocate', onReloc as EventListener);
+
+    // Continuous burst for 2.5s with no pause ever longer than the 250ms
+    // debounce, mimicking Auto Scroll's per-frame steps.
+    const burstStart = Date.now();
+    while (Date.now() - burstStart < 2500) {
+      container.scrollTop += 4;
+      container.dispatchEvent(new Event('scroll'));
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    // Snapshot before the trailing debounce can fire: only relocates emitted
+    // while the scrolling was still in progress count.
+    paginator.removeEventListener('relocate', onReloc as EventListener);
+    expect(during).toBeGreaterThanOrEqual(2);
   });
 });

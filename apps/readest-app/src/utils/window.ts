@@ -1,8 +1,86 @@
 import { getAllWindows, getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import { emitTo, TauriEvent } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
-import { type as osType } from '@tauri-apps/plugin-os';
+import { type as osType, version as osVersion } from '@tauri-apps/plugin-os';
+import { AppService } from '@/types/system';
+import { useTrafficLightStore } from '@/store/trafficLightStore';
 import { eventDispatcher } from './event';
+
+const APP_NAME = 'Readest';
+
+/**
+ * The OS window title, e.g. `Readest - The Hobbit`. It is never drawn in the
+ * UI — desktop windows are either decorationless (Windows/Linux) or hide their
+ * title text (the macOS overlay title bar) — but window switchers and screen
+ * readers announce it, so it has to name the open book to tell windows apart.
+ */
+export const formatAppWindowTitle = (bookTitle?: string) => {
+  const title = bookTitle?.trim();
+  return title ? `${APP_NAME} - ${title}` : APP_NAME;
+};
+
+/**
+ * Whether this webview is the window the OS launched the app into.
+ *
+ * Cold-start deep links belong to that window alone. tauri-plugin-deep-link
+ * keeps the launch URL in process-global state for the whole session — macOS
+ * replaces it on every `RunEvent::Opened` and nothing ever clears it — so
+ * `getCurrent()` keeps returning it long after the link was acted on. The
+ * consume-once guards on the JS side are per-webview (a module flag, a
+ * sessionStorage key), so every window the app spawns itself (`reader-N` from
+ * showReaderWindow / showLibraryWindow) starts out believing the stale URL is
+ * its own cold start and hijacks whatever the user actually opened (#6104).
+ * Those windows carry their own intent in their URL, so they never need it.
+ */
+export const isMainAppWindow = () => {
+  try {
+    return getCurrentWindow().label === 'main';
+  } catch {
+    // No Tauri window API (web build): nothing spawns extra webviews there.
+    return true;
+  }
+};
+
+// Windows 10 renders the native shadow of an undecorated window as a 1px
+// border on the left, right and bottom edges but not the top, which reads as
+// a broken frame (tauri-apps/tauri#13134). Windows 11 draws a uniform border,
+// so only there is the shadow worth keeping. Keep in sync with
+// `undecorated_shadow_is_symmetric` in src-tauri/src/lib.rs.
+const WINDOWS_11_BUILD = 22000;
+
+const undecoratedShadowIsSymmetric = (appService: AppService) => {
+  if (!appService.isWindowsApp) return true;
+  const build = parseInt(osVersion().split('.')[2] ?? '', 10);
+  return Number.isNaN(build) ? true : build >= WINDOWS_11_BUILD;
+};
+
+/**
+ * Whether the window's own frame fails to give it a visible edge, so the
+ * client area has to draw one. On Windows 10 the native shadow is off (see
+ * above) and the OS draws nothing else, leaving the window floating without a
+ * border against a light desktop.
+ */
+export const windowNeedsClientOutline = (appService: AppService) =>
+  appService.isWindowsApp && !undecoratedShadowIsSymmetric(appService);
+
+export const tauriSetWindowTitle = async (bookTitle?: string) => {
+  const title = formatAppWindowTitle(bookTitle);
+  // On macOS a new title makes AppKit re-lay out the title bar and restore
+  // its standard 28pt container, dropping the traffic lights to their
+  // default spot — 8pt above where our header centers them — or bringing
+  // them back on screen where the reader had hidden them. Every page sets
+  // the title on mount, and a correction sent from here lands an IPC
+  // round-trip later, after that default has already been painted, so the
+  // buttons flicked between the two positions on each navigation (#6222).
+  // The native command sets the title and re-applies our layout in one
+  // main-thread pass, so the default is never drawn.
+  if (useTrafficLightStore.getState().appService?.hasTrafficLight) {
+    await invoke('set_window_title', { title });
+    return;
+  }
+  await getCurrentWindow().setTitle(title);
+};
 
 export const tauriGetWindowLogicalPosition = async () => {
   const currentWindow = getCurrentWindow();
@@ -68,16 +146,60 @@ export const tauriHandleOnCloseWindow = async (callback: () => void) => {
   });
 };
 
+// Whether the window was maximized when it last entered fullscreen, so the
+// maximized state survives a fullscreen round-trip on Windows.
+let wasMaximizedBeforeFullscreen = false;
+
 export const tauriHandleToggleFullScreen = async () => {
+  // Reader/library shortcuts also run on mobile, where Tauri does not
+  // register the desktop fullscreen commands (READEST-10K).
+  const platform = await osType();
+  if (platform === 'android' || platform === 'ios') return;
+
   const currentWindow = getCurrentWindow();
   const isFullscreen = await currentWindow.isFullscreen();
   // Toggle fullscreen regardless of the maximized state. Previously a maximized
   // window was only unmaximized here, so the fullscreen button did nothing when
   // the window was maximized, which is always the case on mobile shells like
   // Phosh and common on Windows (issue #4034).
-  await currentWindow.setFullscreen(!isFullscreen);
-  if ((await osType()) === 'linux') {
+  if (isFullscreen) {
+    await currentWindow.setFullscreen(false);
+    if (wasMaximizedBeforeFullscreen) {
+      wasMaximizedBeforeFullscreen = false;
+      await currentWindow.maximize();
+    }
+  } else {
+    // On Windows, tao keeps the WS_MAXIMIZE style when a maximized window
+    // enters borderless fullscreen, so Windows clamps the window to the work
+    // area and the taskbar stays visible but unclickable (issue #5295).
+    // Unmaximize first and restore the maximized state on exit. Other
+    // platforms must keep entering fullscreen straight from the maximized
+    // state (Phosh windows are always maximized).
+    wasMaximizedBeforeFullscreen = platform === 'windows' && (await currentWindow.isMaximized());
+    if (wasMaximizedBeforeFullscreen) {
+      await currentWindow.unmaximize();
+    }
+    await currentWindow.setFullscreen(true);
+  }
+  if (platform === 'linux') {
     linuxWindowRestoreTransparentBg();
+  }
+};
+
+// The web build has no native window, so its fullscreen is the browser's
+// Fullscreen API: on a phone there is no F11 to reach it otherwise (#6892).
+// Native mobile webviews don't implement it.
+export const canToggleFullScreen = (appService: AppService | null) =>
+  !!appService?.hasWindow || (appService?.appPlatform === 'web' && !!document.fullscreenEnabled);
+
+export const toggleFullScreen = async (appService: AppService | null) => {
+  if (appService?.hasWindow) return tauriHandleToggleFullScreen();
+  try {
+    // Requested before any await, while the tap still counts as user activation.
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch (error) {
+    console.warn('Failed to toggle fullscreen:', error);
   }
 };
 

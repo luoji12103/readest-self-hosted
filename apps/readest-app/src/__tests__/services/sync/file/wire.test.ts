@@ -3,6 +3,7 @@ import {
   buildRemotePayload,
   parseRemotePayload,
   parseRemoteLibraryIndex,
+  stripDeviceLocalFields,
 } from '@/services/sync/file/wire';
 import type { Book, BookConfig } from '@/types/book';
 
@@ -41,6 +42,57 @@ describe('wire envelope (frozen)', () => {
     expect('viewSettings' in p.config).toBe(false);
   });
 
+  test('preserves a reserved Notebook record through the frozen wire envelope', () => {
+    const notebookConfig: BookConfig = {
+      ...config,
+      booknotes: [
+        {
+          id: 'notebook',
+          type: 'notebook',
+          cfi: 'epubcfi(/6/2)',
+          note: '# Notes',
+          createdAt: 10,
+          updatedAt: 20,
+        },
+      ],
+    };
+
+    const parsed = parseRemotePayload(
+      JSON.stringify(buildRemotePayload(book, notebookConfig, 'dev-1')),
+    );
+
+    expect(parsed?.booknotes).toEqual(notebookConfig.booknotes);
+  });
+
+  // Issue #5716. The count stands in for the book's own page list, so it is
+  // book data rather than a screen preference. It rides its own envelope key
+  // instead of `config.viewSettings` so the generic scalar spread in
+  // mergeBookConfig can never replace a peer's whole viewSettings object.
+  test('buildRemotePayload carries the reference page count outside config', () => {
+    const withCount = {
+      ...config,
+      viewSettings: { fontSize: 14, referencePageCount: 350 },
+    } as unknown as BookConfig;
+    const p = buildRemotePayload(book, withCount, 'dev-1');
+    expect(p.referencePageCount).toBe(350);
+    // Still never leaks the rest of viewSettings.
+    expect('viewSettings' in p.config).toBe(false);
+  });
+
+  test('buildRemotePayload omits the count when the user never set one', () => {
+    const p = buildRemotePayload(book, config, 'dev-1');
+    expect(p.referencePageCount).toBeUndefined();
+  });
+
+  test('buildRemotePayload carries the synced read-aloud packs outside config', () => {
+    const withPacks = { ...config, ttsPacks: { webdav: ['3-a.mp3'] } } as BookConfig;
+    const p = buildRemotePayload(book, withPacks, 'dev-1');
+    expect(p.ttsPacks).toEqual({ webdav: ['3-a.mp3'] });
+    // Outside config: the scalar spread in mergeBookConfig must never replace it.
+    expect('ttsPacks' in p.config).toBe(false);
+    expect(parseRemotePayload(JSON.stringify(p))?.ttsPacks).toEqual({ webdav: ['3-a.mp3'] });
+  });
+
   test('parseRemotePayload rejects null / non-JSON / wrong schema', () => {
     expect(parseRemotePayload(null)).toBeNull();
     expect(parseRemotePayload('not json')).toBeNull();
@@ -70,5 +122,11 @@ describe('wire envelope (frozen)', () => {
       JSON.stringify({ schemaVersion: 1, books: [book], updatedAt: 5 }),
     );
     expect(legacy?.uploadedHashes).toBeUndefined();
+  });
+
+  // An offline Audiobookshelf download lives on this device only (#6256).
+  test('stripDeviceLocalFields drops the offline-download stamp', () => {
+    const stripped = stripDeviceLocalFields({ ...book, format: 'ABS', absDownloadedAt: 7 });
+    expect(stripped).not.toHaveProperty('absDownloadedAt');
   });
 });

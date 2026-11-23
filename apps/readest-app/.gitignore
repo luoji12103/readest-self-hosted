@@ -41,6 +41,8 @@ Entitlements*.plist
 
 # local confs
 tauri.*.conf.json
+# tracked exception: the direct-distribution iCloud overlay ships in the repo
+!tauri.macos-nonestore.conf.json
 
 # vercel
 .vercel
@@ -62,7 +64,8 @@ src-tauri/gen
 # local dev overrides (personal signing, etc.)
 src-tauri/tauri.*.local.json
 
-# vendor
+# vendor: only what the reader fetches by URL at runtime. Modules the bundler
+# imports resolve straight from packages/ (see vendor-aliases-outside-public.test.ts).
 /public/vendor
 
 # docs
@@ -80,6 +83,8 @@ docs/superpowers
 .claude/settings.local.json
 .claude/skills
 .claude/plans
+# Agent memories holding operational data (costs, logs, infra details) stay local
+.claude/memory/private-*.md
 
 # Playwright web e2e
 /test-results/

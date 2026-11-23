@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { NodeDatabaseService } from '@/services/database/nodeDatabaseService';
 import { migrate } from '@/services/database/migrate';
 import { getMigrations } from '@/services/database/migrations';
 import type { DatabaseService } from '@/types/database';
+import type { AppService } from '@/types/system';
 import { StatisticsDb } from '@/services/statistics/statisticsDb';
 
 async function freshStatsDb(): Promise<DatabaseService> {
@@ -195,5 +196,81 @@ describe('StatisticsDb', () => {
     }
     // Sorted: [10, 20, 30, 40, 50, 60] -> (30 + 40) / 2 = 35.
     expect(await stats.getMedianPageDurationSecs(id)).toBe(35);
+  });
+});
+
+describe('StatisticsDb.open', () => {
+  it('retries after a transient singleton open failure', async () => {
+    const db = await freshStatsDb();
+    const error = new Error('transient open failure');
+    const openDatabase = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(db);
+    const appService = { openDatabase } as unknown as AppService;
+
+    await expect(StatisticsDb.open(appService)).rejects.toBe(error);
+
+    const stats = await StatisticsDb.open(appService);
+    expect(openDatabase).toHaveBeenCalledTimes(2);
+    await stats.close();
+  });
+});
+
+describe('library reading paces', () => {
+  it('uses the same deterministic sample when timestamps tie across the latest 50 events', async () => {
+    const stats = StatisticsDb.from(await freshStatsDb());
+    const id = await stats.upsertBook({ bookMd5: 'tied', title: 'Tied', authors: '' });
+    for (let page = 0; page < 60; page++) {
+      await stats.insertPageEvent(id, {
+        page,
+        startTime: 1000,
+        duration: page + 10,
+        totalPages: 100,
+      });
+    }
+
+    // Break timestamp ties by descending page: pages 10–59 have median duration 44.5.
+    expect.soft(await stats.getMedianPageDurationSecs(id)).toBe(44.5);
+    expect.soft((await stats.getMedianPageDurationsSecs())['tied']).toBe(44.5);
+  });
+
+  it('loads the same recent median per book as individual labels, including the data threshold', async () => {
+    const stats = StatisticsDb.from(await freshStatsDb());
+    const ids: Record<string, number> = {};
+    for (const [hash, count] of [
+      ['slow', 60],
+      ['fast', 6],
+      ['new', 4],
+    ] as const) {
+      const id = await stats.upsertBook({ bookMd5: hash, title: hash, authors: '' });
+      ids[hash] = id;
+      for (let i = 0; i < count; i++)
+        await stats.insertPageEvent(id, {
+          page: i,
+          startTime: 1000 + i,
+          duration: i + 10,
+          totalPages: 100,
+        });
+    }
+    const paces = await stats.getMedianPageDurationsSecs();
+    for (const [hash, id] of Object.entries(ids))
+      expect(paces[hash] ?? null).toBe(await stats.getMedianPageDurationSecs(id));
+    expect(paces['slow']).toBe(44.5);
+  });
+
+  it('leaves events longer than a page visit out of the pace', async () => {
+    // A CrossPoint session recorded in whole percents before any Readest app
+    // paginated the book: each step spans many pages.
+    const stats = StatisticsDb.from(await freshStatsDb());
+    const id = await stats.upsertBook({ bookMd5: 'percents', title: 'P', authors: '' });
+    const durations = [30, 40, 50, 60, 70, 400, 500, 600];
+    for (let i = 0; i < durations.length; i++) {
+      await stats.insertPageEvent(id, {
+        page: i + 1,
+        startTime: 1000 + i,
+        duration: durations[i]!,
+        totalPages: 100,
+      });
+    }
+    expect(await stats.getMedianPageDurationSecs(id)).toBe(50);
+    expect((await stats.getMedianPageDurationsSecs())['percents']).toBe(50);
   });
 });

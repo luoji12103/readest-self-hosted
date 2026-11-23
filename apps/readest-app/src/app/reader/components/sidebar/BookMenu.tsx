@@ -12,6 +12,7 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useParallelViewStore } from '@/store/parallelViewStore';
 import { isWebAppPlatform } from '@/services/environment';
 import { eventDispatcher } from '@/utils/event';
+import { canPairAudiobook } from '@/utils/audiobook';
 import { FIXED_LAYOUT_FORMATS } from '@/types/book';
 import { DOWNLOAD_READEST_URL } from '@/services/constants';
 import { saveViewSettings } from '@/helpers/settings';
@@ -34,9 +35,12 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
   const { getVisibleLibrary } = useLibraryStore();
   const { openParallelView } = useBooksManager();
   const { sideBarBookKey } = useSidebarStore();
-  const { getConfig } = useBookDataStore();
+  const { getConfig, getBookData } = useBookDataStore();
   const { parallelViews, setParallel, unsetParallel } = useParallelViewStore();
   const viewSettings = getViewSettings(sideBarBookKey!);
+  const bookData = sideBarBookKey ? getBookData(sideBarBookKey) : null;
+  const showPairAudiobook = canPairAudiobook(bookData);
+  const showTOCThumbnails = viewSettings?.showTOCThumbnails ?? true;
 
   const [isSortedTOC, setIsSortedTOC] = React.useState(viewSettings?.sortedTOC || false);
 
@@ -86,6 +90,19 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
       );
     }
   };
+  const handleToggleTOCThumbnails = () => {
+    setIsDropdownOpen?.(false);
+    if (sideBarBookKey) {
+      saveViewSettings(
+        envConfig,
+        sideBarBookKey,
+        'showTOCThumbnails',
+        !showTOCThumbnails,
+        true,
+        false,
+      );
+    }
+  };
   const handleSetParallel = () => {
     setParallel(bookKeys);
     setIsDropdownOpen?.(false);
@@ -98,16 +115,27 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
     setProofreadRulesVisibility(true);
     setIsDropdownOpen?.(false);
   };
-  const handlePullKOSync = () => {
-    eventDispatcher.dispatch('pull-kosync', { bookKey: sideBarBookKey });
+  // `provider` addresses one sync backend: KOSync, BookOrbit and Grimmory sync
+  // progress through the same hook and would otherwise all answer.
+  type ProgressProvider = 'kosync' | 'bookorbit' | 'grimmory';
+  const handlePullKOSync = (provider: ProgressProvider) => () => {
+    eventDispatcher.dispatch('pull-kosync', { bookKey: sideBarBookKey, provider });
     setIsDropdownOpen?.(false);
   };
-  const handlePushKOSync = () => {
-    eventDispatcher.dispatch('push-kosync', { bookKey: sideBarBookKey });
+  const handlePushKOSync = (provider: ProgressProvider) => () => {
+    eventDispatcher.dispatch('push-kosync', { bookKey: sideBarBookKey, provider });
     setIsDropdownOpen?.(false);
   };
   const handlePushReadwise = () => {
     eventDispatcher.dispatch('readwise-push-all', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handlePushNotion = () => {
+    eventDispatcher.dispatch('notion-push-all', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handlePushObsidian = () => {
+    eventDispatcher.dispatch('obsidian-push-all', { bookKey: sideBarBookKey });
     setIsDropdownOpen?.(false);
   };
   const handlePushHardcoverNotes = () => {
@@ -118,10 +146,34 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
     eventDispatcher.dispatch('hardcover-push-progress', { bookKey: sideBarBookKey });
     setIsDropdownOpen?.(false);
   };
+  // Hosted by ReaderContent (like the audiobook dialog) so the picker
+  // outlives this dropdown.
+  const handleLinkHardcoverBook = () => {
+    eventDispatcher.dispatch('hardcover-link-book', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const hardcoverLink = sideBarBookKey ? getConfig(sideBarBookKey)?.hardcover : undefined;
+  const handlePushPageboundProgress = () => {
+    eventDispatcher.dispatch('pagebound-push-progress', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handleLinkPageboundBook = () => {
+    eventDispatcher.dispatch('pagebound-link-book', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const pageboundLink = sideBarBookKey ? getConfig(sideBarBookKey)?.pagebound : undefined;
+  const pageboundEnabled = !!(settings.pagebound?.enabled && settings.pagebound.refreshToken);
+  const obsidianEnabled = !!(settings.obsidian?.enabled && settings.obsidian.folder);
+  const bookOrbitProgressSync = settings.bookorbit.enabled && settings.bookorbit.syncProgress;
+  const grimmoryProgressSync = settings.grimmory.enabled && settings.grimmory.syncProgress;
   // Routed through Annotator (per-book, long-lived) so that the
   // confirmation dialog isn't unmounted with the dropdown menu.
   const handleClearAnnotations = () => {
     eventDispatcher.dispatch('clear-annotations', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handleManageAudiobook = () => {
+    eventDispatcher.dispatch('manage-audiobook', { bookKey: sideBarBookKey });
     setIsDropdownOpen?.(false);
   };
 
@@ -150,7 +202,7 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
                     alt={book.title}
                     width={56}
                     height={80}
-                    className='aspect-auto max-h-8 max-w-4 rounded-sm shadow-md'
+                    className='aspect-auto max-h-8 max-w-4 rounded-xs shadow-md'
                     onError={(e) => {
                       (e.target as HTMLImageElement).style.display = 'none';
                     }}
@@ -165,18 +217,41 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
       </MenuItem>
       {bookKeys.length > 1 &&
         (parallelViews.length > 0 ? (
-          <MenuItem label={_('Exit Parallel Read')} onClick={handleUnsetParallel} />
+          <MenuItem label={_('Exit Parallel Sync')} onClick={handleUnsetParallel} />
         ) : (
-          <MenuItem label={_('Enter Parallel Read')} onClick={handleSetParallel} />
+          <MenuItem label={_('Enter Parallel Sync')} onClick={handleSetParallel} />
         ))}
-      {(settings.kosync.enabled || settings.readwise.enabled || settings.hardcover.enabled) && (
+      {(settings.kosync.enabled ||
+        bookOrbitProgressSync ||
+        grimmoryProgressSync ||
+        settings.readwise.enabled ||
+        settings.hardcover.enabled ||
+        pageboundEnabled ||
+        obsidianEnabled ||
+        (settings.notion.enabled && settings.notion.accessToken && settings.notion.databaseId)) && (
         <hr aria-hidden='true' className='border-base-200 my-1' />
       )}
       {settings.kosync.enabled && (
         <MenuItem label={_('KOReader Sync')} detailsOpen={false} buttonClass='py-2'>
           <ul className='flex flex-col ps-1'>
-            <MenuItem label={_('Push Progress')} noIcon onClick={handlePushKOSync} />
-            <MenuItem label={_('Pull Progress')} noIcon onClick={handlePullKOSync} />
+            <MenuItem label={_('Push Progress')} noIcon onClick={handlePushKOSync('kosync')} />
+            <MenuItem label={_('Pull Progress')} noIcon onClick={handlePullKOSync('kosync')} />
+          </ul>
+        </MenuItem>
+      )}
+      {bookOrbitProgressSync && (
+        <MenuItem label={_('BookOrbit Sync')} detailsOpen={false} buttonClass='py-2'>
+          <ul className='flex flex-col ps-1'>
+            <MenuItem label={_('Push Progress')} noIcon onClick={handlePushKOSync('bookorbit')} />
+            <MenuItem label={_('Pull Progress')} noIcon onClick={handlePullKOSync('bookorbit')} />
+          </ul>
+        </MenuItem>
+      )}
+      {grimmoryProgressSync && (
+        <MenuItem label={_('Grimmory Sync')} detailsOpen={false} buttonClass='py-2'>
+          <ul className='flex flex-col ps-1'>
+            <MenuItem label={_('Push Progress')} noIcon onClick={handlePushKOSync('grimmory')} />
+            <MenuItem label={_('Pull Progress')} noIcon onClick={handlePullKOSync('grimmory')} />
           </ul>
         </MenuItem>
       )}
@@ -187,16 +262,57 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
           </ul>
         </MenuItem>
       )}
+      {settings.notion.enabled && settings.notion.accessToken && settings.notion.databaseId && (
+        <MenuItem label={_('Notion Sync')} detailsOpen={false} buttonClass='py-2'>
+          <ul className='flex flex-col ps-1'>
+            <MenuItem label={_('Push Notes')} noIcon onClick={handlePushNotion} />
+          </ul>
+        </MenuItem>
+      )}
+      {obsidianEnabled && (
+        <MenuItem label={_('Obsidian Sync')} detailsOpen={false} buttonClass='py-2'>
+          <ul className='flex flex-col ps-1'>
+            <MenuItem label={_('Push Notes')} noIcon onClick={handlePushObsidian} />
+          </ul>
+        </MenuItem>
+      )}
       {settings.hardcover.enabled && (
         <MenuItem label={_('Hardcover Sync')} detailsOpen={false} buttonClass='py-2'>
           <ul className='flex flex-col ps-1'>
             <MenuItem label={_('Push Progress')} noIcon onClick={handlePushHardcoverProgress} />
             <MenuItem label={_('Push Notes')} noIcon onClick={handlePushHardcoverNotes} />
+            <MenuItem
+              label={_('Link Book')}
+              description={hardcoverLink?.title}
+              noIcon
+              onClick={handleLinkHardcoverBook}
+            />
+          </ul>
+        </MenuItem>
+      )}
+      {pageboundEnabled && (
+        <MenuItem label={_('Pagebound Sync')} detailsOpen={false} buttonClass='py-2'>
+          <ul className='flex flex-col ps-1'>
+            <MenuItem label={_('Push Progress')} noIcon onClick={handlePushPageboundProgress} />
+            <MenuItem
+              label={_('Link Book')}
+              description={pageboundLink?.title}
+              noIcon
+              onClick={handleLinkPageboundBook}
+            />
           </ul>
         </MenuItem>
       )}
       <hr aria-hidden='true' className='border-base-200 my-1' />
       <MenuItem label={_('Proofread')} onClick={showProofreadRulesWindow} />
+      {showPairAudiobook && (
+        <MenuItem
+          label={
+            getConfig(sideBarBookKey!)?.audiobook ? _('Manage Audiobook') : _('Pair Audiobook')
+          }
+          onClick={handleManageAudiobook}
+        />
+      )}
       <hr aria-hidden='true' className='border-base-200 my-1' />
       <MenuItem label={_('Export Annotations')} onClick={handleExportAnnotations} />
       <MenuItem label={_('Import Annotations')} onClick={handleImportAnnotations} />
@@ -210,6 +326,13 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
         Icon={isSortedTOC ? MdCheck : undefined}
         onClick={handleToggleSortTOC}
       />
+      {bookData?.bookDoc?.getPageThumbnail && (
+        <MenuItem
+          label={_('Show Page Thumbnails')}
+          Icon={showTOCThumbnails ? MdCheck : undefined}
+          onClick={handleToggleTOCThumbnails}
+        />
+      )}
       <MenuItem label={_('Reload Page')} shortcut='Shift+R' onClick={handleReloadPage} />
       <hr aria-hidden='true' className='border-base-200 my-1' />
       {isWebAppPlatform() && <MenuItem label={_('Download Readest')} onClick={downloadReadest} />}

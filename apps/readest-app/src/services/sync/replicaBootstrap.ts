@@ -1,10 +1,14 @@
-import { useCustomDictionaryStore } from '@/store/customDictionaryStore';
+import { bookshelfAdapter } from './adapters/bookshelf';
+import { findDictionaryByContentId, useCustomDictionaryStore } from '@/store/customDictionaryStore';
 import { useCustomFontStore } from '@/store/customFontStore';
 import { useCustomTextureStore } from '@/store/customTextureStore';
 import { dictionaryAdapter, DICTIONARY_KIND } from './adapters/dictionary';
 import { fontAdapter, FONT_KIND } from './adapters/font';
 import { textureAdapter, TEXTURE_KIND } from './adapters/texture';
 import { opdsCatalogAdapter } from './adapters/opdsCatalog';
+import { absServerAdapter } from './adapters/absServer';
+import { customTranslatorAdapter, translationPromptAdapter } from './adapters/customTranslator';
+import { customTTSAdapter } from './adapters/customTTS';
 import { settingsAdapter } from './adapters/settings';
 import { getReplicaPersistEnv } from './replicaPersist';
 import { getReplicaAdapter, registerReplicaAdapter } from './replicaRegistry';
@@ -12,11 +16,19 @@ import { registerReplicaDownloadHandler } from './replicaTransferIntegration';
 import type { ReplicaAdapter } from './replicaRegistry';
 
 const KNOWN_ADAPTERS: ReplicaAdapter<unknown>[] = [
+  bookshelfAdapter as unknown as ReplicaAdapter<unknown>,
   dictionaryAdapter as unknown as ReplicaAdapter<unknown>,
   fontAdapter as unknown as ReplicaAdapter<unknown>,
   textureAdapter as unknown as ReplicaAdapter<unknown>,
   // Metadata-only — no binary download handler needed.
   opdsCatalogAdapter as unknown as ReplicaAdapter<unknown>,
+  // Metadata-only — no binary download handler needed.
+  absServerAdapter as unknown as ReplicaAdapter<unknown>,
+  // Metadata-only — no binary download handler needed.
+  customTranslatorAdapter as unknown as ReplicaAdapter<unknown>,
+  translationPromptAdapter as unknown as ReplicaAdapter<unknown>,
+  // Metadata-only — no binary download handler needed.
+  customTTSAdapter as unknown as ReplicaAdapter<unknown>,
   // Bundled scalar settings — singleton row, no binary.
   settingsAdapter as unknown as ReplicaAdapter<unknown>,
 ];
@@ -33,7 +45,19 @@ export const bootstrapReplicaAdapters = (): void => {
   // replicaTransferIntegration once binaries are on disk. Each store
   // exposes a markAvailable* method that clears the placeholder
   // `unavailable` flag set by the pull orchestrator.
-  registerReplicaDownloadHandler(DICTIONARY_KIND, (replicaId) => {
+  registerReplicaDownloadHandler(DICTIONARY_KIND, async (replicaId) => {
+    const dict = findDictionaryByContentId(replicaId);
+    if (!dict || dict.kind !== 'plugin') {
+      useCustomDictionaryStore.getState().markAvailableByContentId(replicaId);
+      return;
+    }
+    const env = getReplicaPersistEnv();
+    if (!env) return;
+    const appService = await env.getAppService();
+    const { materializePluginDictionary } = await import(
+      '@/services/dictionaries/plugins/materialize'
+    );
+    await materializePluginDictionary(appService, dict);
     useCustomDictionaryStore.getState().markAvailableByContentId(replicaId);
   });
   // Fonts need more than the unavailable flag cleared: the binary must

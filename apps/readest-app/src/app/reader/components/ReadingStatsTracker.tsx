@@ -1,16 +1,24 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { useBookProgress } from '@/store/readerProgressStore';
+import { getBookProgress, useBookProgress } from '@/store/readerProgressStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { StatisticsDb } from '@/services/statistics/statisticsDb';
 import { TrackerCore, type FlushedEvent } from '@/services/statistics/trackerCore';
+import { getBookHashFromKey, ttsSessionManager } from '@/services/tts/TTSSessionManager';
 import { DEFAULT_STATS_TRACKING_CONFIG } from '@/types/statistics';
 import { SyncClient } from '@/libs/sync';
+import { BookOrbitClient } from '@/services/bookorbit/BookOrbitClient';
+import { pushStatsToBookOrbit } from '@/services/bookorbit/statsPush';
+import { GrimmoryClient, grimmoryAccountKey } from '@/services/grimmory/GrimmoryClient';
+import { GrimmorySyncStore } from '@/services/grimmory/GrimmorySyncStore';
+import { pushStatsToGrimmory } from '@/services/grimmory/statsPush';
 import { pushStats, pullStats } from '@/services/statistics/statsSync';
 import { isSyncCategoryEnabled } from '@/services/sync/syncCategories';
+import { useSettingsStore } from '@/store/settingsStore';
+import { eventDispatcher } from '@/utils/event';
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -32,6 +40,15 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
   const dbRef = useRef<StatisticsDb | null>(null);
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // While this book is being read aloud, TtsStatsRecorder owns the clock and
+  // this tracker stands down — otherwise TTS auto-follow's relocations would
+  // bill the same wall-clock a second time. Seeded from the manager rather than
+  // the event bus alone, so opening the reader from the mini player mid-session
+  // doesn't miss the transition that already happened.
+  const ttsPlayingRef = useRef(
+    ttsSessionManager.getPlaybackState() === 'playing' &&
+      ttsSessionManager.getActiveSession()?.bookHash === getBookHashFromKey(bookKey),
+  );
 
   const bookData = getBookData(bookKey);
   const book = bookData?.book;
@@ -43,23 +60,72 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
 
   const syncEnabled = () => !!user && isSyncCategoryEnabled('stats');
 
+  // BookOrbit stats push needs no Readest account — only the integration.
+  const bookOrbitStatsPush = (db: StatisticsDb): Promise<unknown> | undefined => {
+    const { settings } = useSettingsStore.getState();
+    const bookorbit = settings.bookorbit;
+    if (
+      !bookorbit.enabled ||
+      !bookorbit.syncStats ||
+      !bookorbit.serverUrl ||
+      !bookorbit.username ||
+      !bookorbit.userkey
+    ) {
+      return undefined;
+    }
+    return pushStatsToBookOrbit(db, new BookOrbitClient(bookorbit));
+  };
+
+  // Sessions go to Grimmory only for books matched there by the reader's pass.
+  const grimmoryStatsPush = (db: StatisticsDb, closing: boolean) => {
+    const { settings } = useSettingsStore.getState();
+    const grimmory = settings.grimmory;
+    if (
+      !appService ||
+      !grimmory.enabled ||
+      !grimmory.syncStats ||
+      !grimmory.serverUrl ||
+      !grimmory.username ||
+      !grimmory.password
+    ) {
+      return undefined;
+    }
+    return pushStatsToGrimmory({
+      db,
+      client: new GrimmoryClient(grimmory),
+      store: new GrimmorySyncStore(appService),
+      account: grimmoryAccountKey(grimmory),
+      now: nowSec(),
+      readingHash: closing ? undefined : bookMd5,
+    });
+  };
+
+  const pushToAllTargets = (db: StatisticsDb, closing = false) => {
+    if (syncEnabled()) runBestEffort(pushStats(db, new SyncClient()));
+    const bookOrbitPush = bookOrbitStatsPush(db);
+    if (bookOrbitPush) runBestEffort(bookOrbitPush);
+    const grimmoryPush = grimmoryStatsPush(db, closing);
+    if (grimmoryPush) runBestEffort(grimmoryPush);
+  };
+
   const schedulePush = () => {
-    if (!syncEnabled()) return;
     if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
     pushTimerRef.current = setTimeout(() => {
       const db = dbRef.current;
-      if (db) runBestEffort(pushStats(db, new SyncClient()));
+      if (db) pushToAllTargets(db);
     }, 10_000);
   };
 
   useEffect(() => {
     if (!appService) return;
     let cancelled = false;
-    StatisticsDb.open(appService).then((db) => {
-      if (cancelled) return;
-      dbRef.current = db;
-      if (syncEnabled()) runBestEffort(pullStats(db, new SyncClient()));
-    });
+    runBestEffort(
+      StatisticsDb.open(appService).then((db) => {
+        if (cancelled) return;
+        dbRef.current = db;
+        if (syncEnabled()) runBestEffort(pullStats(db, new SyncClient()));
+      }),
+    );
     return () => {
       cancelled = true;
     };
@@ -91,16 +157,42 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
     );
   };
 
+  const openPageAt = (info: { current?: number; total: number } | undefined) => {
+    if (!info) return;
+    void persist(coreRef.current.onPage((info.current ?? 0) + 1, info.total || 1, nowSec()));
+    armIdle();
+  };
+
   // Page changes drive the tracker.
   useEffect(() => {
-    const info = progress?.pageinfo;
-    if (!info) return;
-    const page = (info.current ?? 0) + 1;
-    const total = info.total || 1;
-    void persist(coreRef.current.onPage(page, total, nowSec()));
-    armIdle();
+    if (ttsPlayingRef.current) return;
+    openPageAt(progress?.pageinfo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [progress?.pageinfo]);
+
+  // Hand the clock to TtsStatsRecorder while this book is read aloud, and take
+  // it back afterwards. TTS turns pages to follow the narration, so without
+  // this the same minutes would be recorded by both.
+  useEffect(() => {
+    const bookHash = getBookHashFromKey(bookKey);
+    const onPlaybackState = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { bookKey?: string; state?: string };
+      // Another book can be playing while this one is read manually.
+      if (!detail?.bookKey || getBookHashFromKey(detail.bookKey) !== bookHash) return;
+      const playing = detail.state === 'playing';
+      if (playing === ttsPlayingRef.current) return;
+      ttsPlayingRef.current = playing;
+      if (playing) {
+        if (idleRef.current) clearTimeout(idleRef.current);
+        void persist(coreRef.current.onIdle(nowSec()));
+      } else {
+        openPageAt(getBookProgress(bookKey)?.pageinfo);
+      }
+    };
+    eventDispatcher.on('tts-playback-state', onPlaybackState);
+    return () => eventDispatcher.off('tts-playback-state', onPlaybackState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
 
   // Tab/window visibility.
   useEffect(() => {
@@ -122,7 +214,7 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       runBestEffort(
         persist(coreRef.current.onClose(nowSec())).then(() => {
-          if (syncEnabled() && dbRef.current) return pushStats(dbRef.current, new SyncClient());
+          if (dbRef.current) pushToAllTargets(dbRef.current, true);
           return undefined;
         }),
       );

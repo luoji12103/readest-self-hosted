@@ -4,6 +4,33 @@ import { getRuntimeConfig } from '@/services/runtimeConfig';
 
 const decodeRequiredBase64 = (value: string | undefined) => (value ? atob(value) : '');
 
+// supabase-js persists the session under a key derived from the URL's first
+// host label. Readest Cloud keeps the key from its original host so moving the
+// client to another of its hosts doesn't sign everyone out.
+const READEST_CLOUD_HOSTS = [
+  'readest.supabase.co',
+  'vbsyxfusjjqdxkjqlysc.supabase.co',
+  'auth.readest.com',
+];
+
+// Some ISPs block *.supabase.co (#6416), so Readest Cloud sends password sign-in
+// and the calls that keep such a session alive through a Worker on readest.com
+// (workers/auth-proxy). OAuth and email links stay on the Supabase host: their
+// callbacks land there, and a proxy can't change that.
+const AUTH_PROXY_URL = 'https://auth-cf.readest.com';
+
+const isProxiedAuthRequest = ({ pathname, searchParams }: URL) =>
+  pathname === '/auth/v1/logout' ||
+  (pathname === '/auth/v1/token' &&
+    ['password', 'refresh_token'].includes(searchParams.get('grant_type') ?? ''));
+
+const proxyAuthFetch: typeof fetch = (input, init) => {
+  const url = new URL(input instanceof Request ? input.url : input);
+  return isProxiedAuthRequest(url)
+    ? fetch(`${AUTH_PROXY_URL}${url.pathname}${url.search}`, init)
+    : fetch(input, init);
+};
+
 const getSupabasePublicConfig = () => {
   const runtimeConfig = getRuntimeConfig();
   return {
@@ -27,7 +54,13 @@ export const getSupabaseClient = () => {
   const { supabaseUrl, supabaseAnonKey } = getSupabasePublicConfig();
   const cacheKey = `${supabaseUrl}\n${supabaseAnonKey}`;
   if (!cachedPublicClient || cachedPublicClientKey !== cacheKey) {
-    cachedPublicClient = createClient(supabaseUrl, supabaseAnonKey);
+    cachedPublicClient = createClient(
+      supabaseUrl,
+      supabaseAnonKey,
+      READEST_CLOUD_HOSTS.includes(new URL(supabaseUrl).hostname)
+        ? { auth: { storageKey: 'sb-readest-auth-token' }, global: { fetch: proxyAuthFetch } }
+        : undefined,
+    );
     cachedPublicClientKey = cacheKey;
   }
   return cachedPublicClient;

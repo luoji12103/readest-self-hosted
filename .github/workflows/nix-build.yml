@@ -1,0 +1,25 @@
+name: Build with Nix
+
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'readest/readest'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866
+      with:
+        name: readest
+        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: build with nix
+      run: nix build -L # --extra-substituters is provided by the cachix action; does not need to be specified  

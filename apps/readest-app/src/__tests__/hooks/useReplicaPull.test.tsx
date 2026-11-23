@@ -3,6 +3,9 @@ import { act, cleanup, renderHook } from '@testing-library/react';
 
 const pullSpy = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
 const getReplicaSyncSpy = vi.fn();
+const getAccessTokenSpy = vi.fn(async (): Promise<string | null> => 'token');
+const replayBookshelvesSpy = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+const applyBookshelvesSpy = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
 const readyListeners = new Set<() => void>();
 const subscribeReplicaSyncReadySpy = vi.fn((listener: () => void) => {
   if (getReplicaSyncSpy()) {
@@ -97,7 +100,12 @@ vi.mock('@/store/customOPDSStore', () => ({
 }));
 
 vi.mock('@/utils/access', () => ({
-  getAccessToken: async () => 'token',
+  getAccessToken: () => getAccessTokenSpy(),
+}));
+
+vi.mock('@/services/bookshelves/persistence', () => ({
+  replayBookshelfOperations: (...args: unknown[]) => replayBookshelvesSpy(...args),
+  applyRemoteBookshelfRows: (...args: unknown[]) => applyBookshelvesSpy(...args),
 }));
 
 vi.mock('@/utils/misc', () => ({
@@ -140,6 +148,9 @@ beforeEach(() => {
   pullSpy.mockClear();
   pullSpy.mockResolvedValue(undefined);
   getReplicaSyncSpy.mockReset();
+  getAccessTokenSpy.mockReset().mockResolvedValue('token');
+  replayBookshelvesSpy.mockClear();
+  applyBookshelvesSpy.mockClear();
   subscribeReplicaSyncReadySpy.mockClear();
   readyListeners.clear();
   __resetReplicaPullForTests();
@@ -153,6 +164,25 @@ afterEach(() => {
 });
 
 describe('useReplicaPull', () => {
+  test('applies fetched bookshelf rows even if the token disappears after the batch pull', async () => {
+    const rows = [{ kind: 'bookshelf', replica_id: 'recent' }];
+    const manager = makeManagerMock();
+    manager.pullMany.mockImplementation(async () => {
+      getAccessTokenSpy.mockResolvedValue(null);
+      return new Map([['bookshelf', rows]]);
+    });
+    getReplicaSyncSpy.mockReturnValue({ manager });
+    renderHook(() => useReplicaPull({ kinds: ['bookshelf'], delayMs: 100 }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+
+    expect(manager.pullMany).toHaveBeenCalledOnce();
+    expect(applyBookshelvesSpy).toHaveBeenCalledWith(envValue.envConfig, rows);
+    expect(manager.pull).not.toHaveBeenCalled();
+  });
+
   test('does not pull before delayMs elapses', () => {
     getReplicaSyncSpy.mockReturnValue({ manager: makeManagerMock() });
     renderHook(() => useReplicaPull({ kinds: ['dictionary'], delayMs: 5_000 }));
@@ -305,6 +335,46 @@ describe('useReplicaPull', () => {
       await Promise.resolve();
     });
     expect(dictionaryPullCount()).toBe(2);
+  });
+
+  // `pullMany` omits a kind the backend rejected with UNKNOWN_KIND. That is
+  // "no information", not "the server has no rows" — applying it would run
+  // the kind's apply path (and its tombstone mirroring) against an empty
+  // result set. The slot is released so a later mount retries.
+  test('a kind missing from the batch result is not applied', async () => {
+    const managerMock = makeManagerMock();
+    managerMock.pullMany.mockImplementation(async () => {
+      const out = new Map<string, unknown[]>();
+      out.set('font', []);
+      return out;
+    });
+    getReplicaSyncSpy.mockReturnValue({ manager: managerMock });
+
+    const view = renderHook(() => useReplicaPull({ kinds: ['dictionary', 'font'], delayMs: 100 }));
+    await act(async () => {
+      vi.advanceTimersByTime(200);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(dictionaryPullCount()).toBe(0);
+    view.unmount();
+
+    // Slot released: a later mount tries the missing kind again.
+    managerMock.pullMany.mockImplementation(async (kinds) => {
+      const out = new Map<string, unknown[]>();
+      for (const k of kinds) out.set(k, []);
+      return out;
+    });
+    renderHook(() => useReplicaPull({ kinds: ['dictionary', 'font'], delayMs: 100 }));
+    await act(async () => {
+      vi.advanceTimersByTime(200);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(dictionaryPullCount()).toBe(1);
   });
 
   test('cleanup cancels a pending pull when the component unmounts before delayMs', () => {

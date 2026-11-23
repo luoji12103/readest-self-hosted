@@ -1,7 +1,9 @@
 import { IconType } from 'react-icons';
 import { FiSearch } from 'react-icons/fi';
 import { FiCopy } from 'react-icons/fi';
+import { FiLink } from 'react-icons/fi';
 import { FiShare } from 'react-icons/fi';
+import { FiImage } from 'react-icons/fi';
 import { PiHighlighterFill } from 'react-icons/pi';
 import { LuBookA } from 'react-icons/lu';
 import { BsPencilSquare } from 'react-icons/bs';
@@ -42,6 +44,12 @@ export const annotationToolButtons = createAnnotationToolButtons([
     tooltip: _('Copy text after selection'),
     Icon: FiCopy,
     quickAction: true,
+  },
+  {
+    type: 'copylink',
+    label: _('Copy Link'),
+    tooltip: _('Copy link to text after selection'),
+    Icon: FiLink,
   },
   {
     type: 'highlight',
@@ -96,6 +104,12 @@ export const annotationToolButtons = createAnnotationToolButtons([
     tooltip: _('Share text after selection'),
     Icon: FiShare,
     quickAction: true,
+  },
+  {
+    type: 'quotecard',
+    label: _('Quote Card'),
+    tooltip: _('Create a quote card image from the selection'),
+    Icon: FiImage,
   },
 ]);
 

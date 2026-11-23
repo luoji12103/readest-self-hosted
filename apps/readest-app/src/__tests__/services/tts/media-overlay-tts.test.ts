@@ -1,0 +1,342 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+
+import type { BookDoc } from '@/libs/document';
+import {
+  loadMediaOverlaySection,
+  MediaOverlaySection,
+  type NarrationPar,
+} from '@/services/tts/mediaOverlay/MediaOverlaySection';
+import { MediaOverlayTTS } from '@/services/tts/mediaOverlay/MediaOverlayTTS';
+import { parseSSMLMarks } from '@/utils/ssml';
+import * as CFI from 'foliate-js/epubcfi.js';
+
+const par = (id: string, begin: number, end: number) =>
+  `<par><text src="ch1.xhtml#${id}"/><audio src="ch1.mp3" clipBegin="${begin}s" clipEnd="${end}s"/></par>`;
+
+// Two blocks: the first paragraph is narrated word-by-word (three pars sharing
+// a block), the second as a whole (one par).
+const HTML =
+  '<p id="p1"><span id="w1">Alpha</span> <span id="w2">beta</span> <span id="w3">gamma</span></p>' +
+  '<p id="p2">Second paragraph entirely.</p>';
+const SMIL =
+  '<smil xmlns="http://www.w3.org/ns/SMIL"><body>' +
+  par('w1', 0, 1) +
+  par('w2', 1, 2) +
+  par('w3', 2, 3) +
+  par('p2', 3, 6) +
+  '</body></smil>';
+
+const marksOf = (ssml: string | undefined) =>
+  ssml === undefined ? undefined : parseSSMLMarks(ssml).marks.map((m) => m.name);
+
+let section: MediaOverlaySection;
+let doc: Document;
+let highlight: ReturnType<typeof vi.fn<(range: Range) => void>>;
+
+const makeTTS = () => new MediaOverlayTTS(doc, section, highlight);
+
+beforeEach(async () => {
+  doc = new DOMParser().parseFromString(
+    `<!DOCTYPE html><html lang="en"><body>${HTML}</body></html>`,
+    'text/html',
+  );
+  const book = {
+    sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+    loadText: async () => SMIL,
+  } as unknown as BookDoc;
+  section = (await loadMediaOverlaySection(book, 0, doc, 'en'))!;
+  highlight = vi.fn<(range: Range) => void>();
+});
+
+describe('MediaOverlayTTS', () => {
+  test('exposes the section document, as the controller expects of a TTS', () => {
+    expect(makeTTS().doc).toBe(doc);
+  });
+
+  test('start() yields the first block from its first mark', () => {
+    expect(marksOf(makeTTS().start())).toEqual(['0', '1', '2']);
+  });
+
+  test('resume() on a fresh instance yields the first block', () => {
+    expect(marksOf(makeTTS().resume())).toEqual(['0', '1', '2']);
+  });
+
+  test('resume() re-yields the current block truncated at the last spoken mark', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('1');
+    expect(marksOf(tts.resume())).toEqual(['1', '2']);
+  });
+
+  test('next() advances a whole block and resets the mark', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('1');
+    expect(marksOf(tts.next())).toEqual(['3']);
+    expect(marksOf(tts.resume())).toEqual(['3']);
+  });
+
+  test('next() past the last block yields nothing, so the controller changes section', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.next();
+    expect(tts.next()).toBeUndefined();
+  });
+
+  test('prev() moves back a block and yields it whole', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.next();
+    expect(marksOf(tts.prev())).toEqual(['0', '1', '2']);
+  });
+
+  test('prev() before the first block yields nothing', () => {
+    const tts = makeTTS();
+    tts.start();
+    expect(tts.prev()).toBeUndefined();
+  });
+
+  test('nextMark() steps one par inside the block', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('0');
+    expect(marksOf(tts.nextMark())).toEqual(['1', '2']);
+  });
+
+  test('nextMark() spills into the following block at the block end', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('2');
+    expect(marksOf(tts.nextMark())).toEqual(['3']);
+  });
+
+  test('prevMark() steps back one par inside the block', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('2');
+    expect(marksOf(tts.prevMark())).toEqual(['1', '2']);
+  });
+
+  test('prevMark() spills back into the previous block at its last par', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.next();
+    tts.setMark('3');
+    expect(marksOf(tts.prevMark())).toEqual(['2']);
+  });
+
+  test('setMark() highlights the par range and returns it', () => {
+    const tts = makeTTS();
+    tts.start();
+    const range = tts.setMark('1');
+    expect(range?.toString()).toBe('beta');
+    expect(highlight).toHaveBeenCalledTimes(1);
+    expect(highlight.mock.calls[0]![0].toString()).toBe('beta');
+  });
+
+  test('setMark() with an unknown name changes nothing', () => {
+    const tts = makeTTS();
+    tts.start();
+    expect(tts.setMark('99')).toBeUndefined();
+    expect(highlight).not.toHaveBeenCalled();
+  });
+
+  test('getLastRange() tracks the last spoken mark', () => {
+    const tts = makeTTS();
+    tts.start();
+    expect(tts.getLastRange()).toBeUndefined();
+    tts.setMark('2');
+    expect(tts.getLastRange()?.toString()).toBe('gamma');
+  });
+
+  test('navigating while paused highlights without waiting for playback', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('0');
+    highlight.mockClear();
+
+    tts.nextMark(true);
+    expect(highlight.mock.calls.at(-1)![0].toString()).toBe('beta');
+
+    tts.next(true);
+    expect(highlight.mock.calls.at(-1)![0].toString()).toBe('Second paragraph entirely.');
+  });
+
+  test('navigating while playing leaves highlighting to the audio boundaries', () => {
+    const tts = makeTTS();
+    tts.start();
+    tts.setMark('0');
+    highlight.mockClear();
+
+    tts.nextMark();
+    tts.next();
+    expect(highlight).not.toHaveBeenCalled();
+  });
+
+  test('from(range) resumes at the par containing the range', () => {
+    const tts = makeTTS();
+    const target = doc.createRange();
+    const gamma = doc.getElementById('w3')!;
+    target.selectNodeContents(gamma);
+
+    expect(marksOf(tts.from(target))).toEqual(['2']);
+    expect(tts.getLastRange()?.toString()).toBe('gamma');
+  });
+
+  test('from(range) picks the par a mid-sentence range falls inside', () => {
+    const tts = makeTTS();
+    const target = doc.createRange();
+    const text = doc.getElementById('p2')!.firstChild!;
+    target.setStart(text, 7);
+    target.setEnd(text, 16);
+
+    expect(marksOf(tts.from(target))).toEqual(['3']);
+  });
+
+  // #7342: a title page drawn as a picture is narrated, then playback carries on.
+  test('plays an image-only par in order and resumes onto it', async () => {
+    const imageDoc = new DOMParser().parseFromString(
+      '<html><body><div><span id="title"><img src="title.jpg" alt="Title. Author."/></span></div>' +
+        '<p id="s1">First sentence.</p></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () =>
+        `<smil><body>${par('title', 13.192, 22.036)}${par('s1', 22.036, 25)}</body></smil>`,
+    } as unknown as BookDoc;
+    const imageSection = (await loadMediaOverlaySection(book, 0, imageDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(imageDoc, imageSection, highlight);
+
+    expect(marksOf(tts.start())).toEqual(['0']);
+    expect(marksOf(tts.next())).toEqual(['1']);
+    // A location saved while the image played is its range's CFI, read back.
+    const cfi = CFI.fromRange(imageSection.pars[0]!.range);
+    expect(marksOf(tts.from(CFI.toRange(imageDoc, CFI.parse(cfi)) as Range))).toEqual(['0']);
+    // So is the start of the title page.
+    const page = imageDoc.createRange();
+    page.setStart(imageDoc.body, 0);
+    expect(marksOf(tts.from(page))).toEqual(['0']);
+  });
+
+  test('from(range) finds body text after an interleaved end-of-chapter footnote', async () => {
+    const footnoteDoc = new DOMParser().parseFromString(
+      '<html><body><p id="before">Before the note.</p>' +
+        '<p id="after">After the note.</p><p id="gap">Unnarrated text.</p>' +
+        '<p id="later">Later body text.</p>' +
+        '<aside role="doc-footnote" id="note">The footnote.</aside></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () =>
+        '<smil><body>' +
+        par('before', 0, 1) +
+        par('note', 1, 2) +
+        par('after', 2, 3) +
+        par('later', 3, 4) +
+        '</body></smil>',
+    } as unknown as BookDoc;
+    const footnoteSection = (await loadMediaOverlaySection(book, 0, footnoteDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(footnoteDoc, footnoteSection, highlight);
+    for (const [id, mark] of [
+      ['before', '0'],
+      ['after', '2'],
+      ['gap', '3'],
+      ['later', '3'],
+      ['note', '1'],
+    ] as const) {
+      const range = footnoteDoc.createRange();
+      range.selectNodeContents(footnoteDoc.getElementById(id)!);
+      expect(marksOf(tts.from(range)), `starting in ${id}`).toEqual([mark]);
+      expect(marksOf(tts.resume())).toEqual([mark]);
+    }
+    // Playback still follows the publisher's order: body, note, then body.
+    tts.start();
+    expect(marksOf(tts.next())).toEqual(['1']);
+    expect(marksOf(tts.next())).toEqual(['2']);
+  });
+
+  test('from(range) prefers a containing parent over a later nested phrase', async () => {
+    const nestedDoc = new DOMParser().parseFromString(
+      '<html><body><p id="parent">Before <span id="child">nested phrase</span> after.</p></body></html>',
+      'text/html',
+    );
+    const book = {
+      sections: [{ mediaOverlay: { href: 'OEBPS/ch1.smil', id: 'smil1' } }],
+      loadText: async () => `<smil><body>${par('parent', 0, 1)}${par('child', 1, 2)}</body></smil>`,
+    } as unknown as BookDoc;
+    const nestedSection = (await loadMediaOverlaySection(book, 0, nestedDoc, 'en'))!;
+    const tts = new MediaOverlayTTS(nestedDoc, nestedSection, highlight);
+    const parentRange = nestedSection.pars[0]!.range;
+    const childRange = nestedSection.pars[1]!.range;
+
+    expect(marksOf(tts.from(parentRange)), 'exact parent range').toEqual(['0', '1']);
+    expect(marksOf(tts.resume())).toEqual(['0', '1']);
+    expect(marksOf(tts.from(childRange)), 'exact child range').toEqual(['1']);
+
+    const afterChild = nestedDoc.createRange();
+    afterChild.setStart(nestedDoc.getElementById('parent')!.lastChild!, 1);
+    afterChild.collapse(true);
+    expect(marksOf(tts.from(afterChild)), 'parent text after child').toEqual(['0', '1']);
+  });
+
+  // Found by end-to-end playback: narration skips unnarrated sections, so the
+  // location playback was requested from usually belongs to a DIFFERENT
+  // section's document. compareBoundaryPoints throws WrongDocumentError across
+  // documents, which aborted the whole session before any audio played.
+  test('from(range) tolerates a range from another section document', () => {
+    const other = new DOMParser().parseFromString(
+      '<!DOCTYPE html><html><body><p id="elsewhere">Front matter.</p></body></html>',
+      'text/html',
+    );
+    const foreign = other.createRange();
+    foreign.selectNodeContents(other.getElementById('elsewhere')!);
+
+    const tts = makeTTS();
+    expect(() => tts.from(foreign)).not.toThrow();
+    expect(marksOf(tts.from(foreign))).toEqual(['0', '1', '2']);
+  });
+
+  test('from(range) before any par falls back to the first block', () => {
+    const tts = makeTTS();
+    const target = doc.createRange();
+    target.setStart(doc.body, 0);
+    target.setEnd(doc.body, 0);
+
+    expect(marksOf(tts.from(target))).toEqual(['0', '1', '2']);
+  });
+
+  test('maps a page position proportionally into an approximately timed chapter', () => {
+    const approximateDoc = new DOMParser().parseFromString(
+      '<!DOCTYPE html><html><body><p>abcdefghij</p></body></html>',
+      'text/html',
+    );
+    const text = approximateDoc.querySelector('p')!.firstChild as Text;
+    const chapter = approximateDoc.createRange();
+    chapter.selectNodeContents(text);
+    const approximateSection = new MediaOverlaySection(
+      [
+        {
+          markName: '0',
+          blockIndex: 0,
+          range: chapter,
+          text: 'Chapter',
+          audioHref: 'chapter.m4b',
+          clipBegin: 20,
+          clipEnd: 120,
+        } satisfies NarrationPar,
+      ],
+      'en',
+      'approximate',
+    );
+    const tts = new MediaOverlayTTS(approximateDoc, approximateSection, highlight);
+    const page = approximateDoc.createRange();
+    page.setStart(text, 5);
+    page.setEnd(text, 8);
+
+    expect(marksOf(tts.from(page))).toEqual(['0']);
+    expect(tts.takeStartPosition()).toBeCloseTo(50, 5);
+    expect(tts.getPlaybackRange(0.75)?.toString()).toBe('h');
+  });
+});

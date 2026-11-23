@@ -11,6 +11,8 @@
 // manifest updates and once more at session close.
 
 import { isTauriAppPlatform } from '@/services/environment';
+import type { BookDataListings } from '@/services/sync/bookData/engine';
+import type { BookDataDestination } from '@/services/sync/bookData/types';
 import type { DatabaseService } from '@/types/database';
 import type { AppService } from '@/types/system';
 import type { TTSCacheEntry, TTSCacheStore } from './cache';
@@ -21,12 +23,24 @@ import { SqliteTTSCacheStore, TTSPackFs } from './sqliteCacheStore';
 const CONFIG_KEY = 'readest-tts-cache';
 const DEFAULT_BUDGET_MB = 200;
 const COMPACT_DEBOUNCE_MS = 30_000;
+const DOWNLOADS_MARKER = 'downloads.json';
+
+// The sync round in flight per book, shared by every store of that book.
+const syncRounds = new Map<string, Promise<void>>();
+// A saved pack record stays pending until its cloud publication succeeds.
+const pendingPackPublications = new Set<string>();
+// What a book's rounds share between opens: the destinations, so a folder is
+// prepared once, and their listings, so a push round lists nothing new. An
+// open starts a new session; a download's push rounds (one per finished
+// section) reuse it.
+const syncSessions = new Map<
+  string,
+  { destinations: Map<string, BookDataDestination>; listings: BookDataListings }
+>();
 
 export interface TTSCacheConfig {
   enabled: boolean;
   budgetMB: number;
-  // Share section packs through the user's third-party file-sync provider.
-  syncEnabled: boolean;
 }
 
 // localStorage-backed like the other TTS preferences (TTSUtils); a settings
@@ -38,10 +52,9 @@ export const getTTSCacheConfig = (): TTSCacheConfig => {
     return {
       enabled: parsed.enabled !== false,
       budgetMB: typeof parsed.budgetMB === 'number' ? parsed.budgetMB : DEFAULT_BUDGET_MB,
-      syncEnabled: parsed.syncEnabled === true,
     };
   } catch {
-    return { enabled: true, budgetMB: DEFAULT_BUDGET_MB, syncEnabled: false };
+    return { enabled: true, budgetMB: DEFAULT_BUDGET_MB };
   }
 };
 
@@ -87,6 +100,16 @@ const createNativePackFs = (dir: string): TTSPackFs => ({
       await file.close();
     }
   },
+  async readSidecar(name) {
+    try {
+      const { readTextFile, BaseDirectory } = await import('@tauri-apps/plugin-fs');
+      const text = await readTextFile(`${dir}/${name}`, { baseDir: BaseDirectory.AppCache });
+      const parsed = JSON.parse(text);
+      return parsed && Array.isArray(parsed.entries) ? parsed : null;
+    } catch {
+      return null;
+    }
+  },
   async remove(name) {
     const { remove, BaseDirectory } = await import('@tauri-apps/plugin-fs');
     await remove(`${dir}/${name}`, { baseDir: BaseDirectory.AppCache });
@@ -98,6 +121,19 @@ const createNativePackFs = (dir: string): TTSPackFs => ({
   },
 });
 
+// The per-book store every synthetic engine of one reader shares: each opens
+// the same `cache.db`, and OPFS sync access handles are exclusive, so two
+// stores on one book would fight. Entries are namespaced by provider id.
+// Null when there is no app context or the user turned the cache off.
+export const createBookTTSCacheStore = (
+  appService: AppService | null | undefined,
+  getBookHash: () => string | null,
+): BookTTSCacheStore | null => {
+  const cacheConfig = getTTSCacheConfig();
+  if (!appService || !cacheConfig.enabled) return null;
+  return new BookTTSCacheStore(appService, getBookHash, cacheConfig.budgetMB * 1024 * 1024);
+};
+
 export class BookTTSCacheStore implements TTSCacheStore {
   #appService: AppService;
   // The book key lands on the controller after construction (init()), so the
@@ -105,7 +141,9 @@ export class BookTTSCacheStore implements TTSCacheStore {
   #getBookHash: () => string | null;
   #budgetBytes: number;
   #opening: Promise<{ db: DatabaseService; store: SqliteTTSCacheStore } | null> | null = null;
+  #closing: Promise<void> | null = null;
   #compactTimer: ReturnType<typeof setTimeout> | null = null;
+  readonly #importListeners = new Set<(keys: string[]) => void>();
 
   constructor(appService: AppService, getBookHash: () => string | null, budgetBytes: number) {
     this.#appService = appService;
@@ -114,6 +152,7 @@ export class BookTTSCacheStore implements TTSCacheStore {
   }
 
   #open() {
+    if (this.#closing) return this.#closing.then(() => null);
     if (this.#opening) return this.#opening;
     const bookHash = this.#getBookHash();
     if (!bookHash) {
@@ -138,6 +177,14 @@ export class BookTTSCacheStore implements TTSCacheStore {
         // 'tts-cache' has no registered migrations; the store owns its DDL.
         const db = await this.#appService.openDatabase('tts-cache', `${dir}/cache.db`, 'Cache');
         const store = new SqliteTTSCacheStore(db, { budgetBytes: this.#budgetBytes, packFs });
+        // Before the pull below, so its imports reach the listeners.
+        store.onImported((keys) => {
+          for (const listener of this.#importListeners) listener(keys);
+        });
+        // Reconcile the durable marker before a cross-book sweep. A crash can
+        // occur between pinning SQLite rows and writing the marker; the next
+        // open repairs that gap before eviction is allowed to inspect it.
+        await this.#syncDownloadMarker(bookHash, store);
         // Sweep tmp files from crashed compactions and packs whose rows were
         // evicted before the file delete landed. Concurrent-safe: only files
         // unknown to the database are touched.
@@ -148,8 +195,10 @@ export class BookTTSCacheStore implements TTSCacheStore {
           sweepTTSCaches(this.#appService, bookHash, this.#budgetBytes),
         );
         // Adopt packs other devices produced (existence-checked, validated
-        // on import); fire-and-forget like all cache housekeeping.
-        this.#syncPacks(bookHash, store, 'pull');
+        // on import), then upload local packs the remote lacks, such as ones
+        // compacted before sync was turned on. Fire-and-forget like all cache
+        // housekeeping.
+        this.#syncPacks(bookHash, store, 'both');
         return { db, store };
       } catch (err) {
         console.warn('TTS cache unavailable for this session', err);
@@ -159,9 +208,22 @@ export class BookTTSCacheStore implements TTSCacheStore {
     return this.#opening;
   }
 
+  onImported(listener: (keys: string[]) => void): void {
+    this.#importListeners.add(listener);
+  }
+
+  async open(): Promise<void> {
+    await this.#open();
+  }
+
   async get(key: string): Promise<TTSCacheEntry | null> {
     const opened = await this.#open();
     return opened ? opened.store.get(key) : null;
+  }
+
+  async cachedKeys(keys: string[]): Promise<Set<string>> {
+    const opened = await this.#open();
+    return opened ? opened.store.cachedKeys(keys) : new Set();
   }
 
   async put(
@@ -185,6 +247,60 @@ export class BookTTSCacheStore implements TTSCacheStore {
     await opened?.store.recordMarkKey(section, ordinal, key);
   }
 
+  async recordMarkKeys(section: number, marks: { ordinal: number; key: string }[]): Promise<void> {
+    const opened = await this.#open();
+    await opened?.store.recordMarkKeys(section, marks);
+  }
+
+  async beginDownloadSections(sections: number[]): Promise<void> {
+    const opened = await this.#open();
+    if (!opened) return;
+    const bookHash = this.#getBookHash();
+    if (!bookHash) return;
+    // Write the eviction guard first. A crash may leave a harmless stale
+    // marker, but must never leave pinned SQLite rows exposed to another
+    // book's concurrent cross-cache sweep.
+    await this.#appService.writeFile(
+      `tts-cache/${bookHash}/${DOWNLOADS_MARKER}`,
+      'Cache',
+      JSON.stringify({ pinned: true }),
+    );
+    try {
+      await opened.store.beginDownloadSections(sections);
+    } catch (err) {
+      await this.#syncDownloadMarker(bookHash, opened.store);
+      throw err;
+    }
+  }
+
+  async completeDownloadSections(sections: number[]): Promise<void> {
+    const opened = await this.#open();
+    if (!opened) return;
+    await opened.store.completeDownloadSections(sections);
+    const bookHash = this.#getBookHash();
+    if (!bookHash) return;
+    await this.#syncDownloadMarker(bookHash, opened.store);
+    // A section packed earlier by listening becomes eligible only now, with
+    // no new pack for compaction to push.
+    this.#syncPacks(bookHash, opened.store, 'push');
+  }
+
+  async cancelDownloadSections(sections: number[]): Promise<void> {
+    const opened = await this.#open();
+    if (!opened) return;
+    await opened.store.cancelDownloadSections(sections);
+    const bookHash = this.#getBookHash();
+    if (bookHash) await this.#syncDownloadMarker(bookHash, opened.store);
+  }
+
+  async clearDownloads(): Promise<void> {
+    const opened = await this.#open();
+    if (!opened) return;
+    await opened.store.clearDownloads();
+    const bookHash = this.#getBookHash();
+    if (bookHash) await this.#syncDownloadMarker(bookHash, opened.store);
+  }
+
   // Immediate compaction for downloads (bypasses the debounced timer), then a
   // push if any packs were created and sync is on.
   async compact(): Promise<void> {
@@ -196,7 +312,10 @@ export class BookTTSCacheStore implements TTSCacheStore {
   }
 
   async getSectionStatuses(): Promise<
-    Map<number, { total: number; recorded: number; packed: boolean }>
+    Map<
+      number,
+      { total: number; recorded: number; packed: boolean; pinned: boolean; active: boolean }
+    >
   > {
     const opened = await this.#open();
     return opened ? opened.store.getSectionStatuses() : new Map();
@@ -210,6 +329,20 @@ export class BookTTSCacheStore implements TTSCacheStore {
   async totalCacheBytes(): Promise<number> {
     const opened = await this.#open();
     return opened ? opened.store.totalCacheBytes() : 0;
+  }
+
+  async #syncDownloadMarker(bookHash: string, store: SqliteTTSCacheStore): Promise<void> {
+    const path = `tts-cache/${bookHash}/${DOWNLOADS_MARKER}`;
+    try {
+      if (await store.hasDownloads()) {
+        await this.#appService.writeFile(path, 'Cache', JSON.stringify({ pinned: true }));
+      } else {
+        await this.#appService.deleteFile(path, 'Cache');
+      }
+    } catch {
+      // Marker repair is best-effort. SQLite remains authoritative and the
+      // next store open will retry before launching the sweep.
+    }
   }
 
   // Compaction is idle work: debounce it behind manifest updates so it never
@@ -234,29 +367,146 @@ export class BookTTSCacheStore implements TTSCacheStore {
     }
   }
 
-  // Push/pull section packs through the selected file-sync provider. The
-  // sync module is imported lazily: it must stay out of the TTS module
-  // graph (settingsStore -> constants -> EdgeTTSClient would cycle) and out
-  // of sessions that never enable sync.
-  #syncPacks(bookHash: string, store: SqliteTTSCacheStore, direction: 'push' | 'pull'): void {
-    if (!getTTSCacheConfig().syncEnabled) return;
-    void (async () => {
-      const { getActiveTTSPackSyncProvider, pullTTSPacks, pushTTSPacks } = await import(
-        '@/services/sync/file/ttsPackSync'
-      );
-      const provider = await getActiveTTSPackSyncProvider();
-      if (!provider) return;
-      if (direction === 'pull') {
-        await pullTTSPacks(provider, bookHash, store);
-      } else {
-        await pushTTSPacks(provider, bookHash, store);
+  // Push/pull downloaded section packs through every book-data destination
+  // (Book Data sync). The sync modules are imported lazily: they must stay
+  // out of the TTS module graph (settingsStore -> constants -> EdgeTTSClient
+  // would cycle).
+  // Rounds for one book run one after another: overlapping rounds would both
+  // see a pack missing and upload it twice, through the same Cache file.
+  #syncPacks(bookHash: string, store: SqliteTTSCacheStore, direction: 'push' | 'both'): void {
+    const round = async () => {
+      const [
+        { getBookDataDestinations },
+        { pullBookData, pushBookData },
+        { createTTSBookDataKind },
+        { useBookDataStore },
+        { useLibraryStore },
+        { useSettingsStore },
+      ] = await Promise.all([
+        import('@/services/sync/bookData/destinationsFor'),
+        import('@/services/sync/bookData/engine'),
+        import('@/services/sync/bookData/ttsKind'),
+        import('@/store/bookDataStore'),
+        import('@/store/libraryStore'),
+        import('@/store/settingsStore'),
+      ]);
+      const current = await getBookDataDestinations(this.#appService, bookHash);
+      let session = syncSessions.get(bookHash);
+      if (direction === 'both' || !session) {
+        session = { destinations: new Map(), listings: new Map() };
+        syncSessions.set(bookHash, session);
       }
-    })().catch((err) => {
-      console.warn('TTS pack sync failed', err);
+      const { destinations: kept, listings } = session;
+      const destinations = current.map((dest) => {
+        if (!kept.has(dest.id)) kept.set(dest.id, dest);
+        return kept.get(dest.id)!;
+      });
+      if (!destinations.length) return;
+      const kind = createTTSBookDataKind(store);
+      // What each destination holds, synced in the book's config: an open
+      // pulls only when it names a pack this device lacks, or a destination it
+      // has never recorded. A book without audio then makes no request. The
+      // push never trusts it: it only grows by merging, so it still names
+      // packs purged with the book from a destination; a device with audio
+      // lists before pushing, which also corrects the record.
+      const books = useBookDataStore.getState();
+      const recorded = books.getConfig(bookHash)?.ttsPacks;
+      const needsPull = async () => {
+        if (destinations.some((dest) => !recorded?.[dest.id])) return true;
+        for (const dest of destinations) {
+          for (const unit of recorded![dest.id]!) {
+            if (!(await kind.hasLocal(unit))) return true;
+          }
+        }
+        return false;
+      };
+      if (direction === 'both' && (await needsPull())) {
+        await pullBookData(kind, bookHash, destinations, listings);
+      }
+      await pushBookData(kind, bookHash, destinations, listings);
+
+      // Record what each listed destination holds; one that declined the
+      // book holds nothing. Start from the config as it is now: the reader's
+      // pull may have merged a peer's record while this round awaited.
+      const latest = books.getConfig(bookHash);
+      if (!latest) return;
+      const next = { ...latest.ttsPacks };
+      for (const dest of destinations) {
+        if (!listings.has(dest.id)) continue;
+        const files = listings.get(dest.id) ?? new Set<string>();
+        const units = new Set<string>();
+        for (const file of files) {
+          const unit = kind.unitOf(file);
+          if (unit && kind.filesOf(unit).every((f) => files.has(f))) units.add(unit);
+        }
+        // Keep what a peer added after the listing began; the listing only
+        // supersedes what this round started with.
+        for (const unit of latest.ttsPacks?.[dest.id] ?? []) {
+          if (!recorded?.[dest.id]?.includes(unit)) units.add(unit);
+        }
+        next[dest.id] = [...units];
+      }
+      if (JSON.stringify(next) !== JSON.stringify(latest.ttsPacks ?? {})) {
+        // No updatedAt bump: recording audio must not move reading progress.
+        // Saved at once, so a quit before the next page turn keeps it.
+        books.setConfig(bookHash, { ttsPacks: next });
+        const book = useLibraryStore.getState().getBookByHash(bookHash);
+        const config = books.getConfig(bookHash);
+        if (book && config) {
+          const settings = useSettingsStore.getState().settings;
+          await this.#appService.saveBookConfig(book, config, settings);
+          pendingPackPublications.add(bookHash);
+        }
+      }
+    };
+    const previous = syncRounds.get(bookHash) ?? Promise.resolve();
+    const next = previous
+      .then(round)
+      .then(async () => {
+        if (!pendingPackPublications.has(bookHash)) return;
+        const [
+          { useBookDataStore },
+          { useLibraryStore },
+          { SyncClient },
+          { isSyncCategoryEnabled },
+          { getUserID },
+        ] = await Promise.all([
+          import('@/store/bookDataStore'),
+          import('@/store/libraryStore'),
+          import('@/libs/sync'),
+          import('@/services/sync/syncCategories'),
+          import('@/utils/access'),
+        ]);
+        const book = useLibraryStore.getState().getBookByHash(bookHash);
+        const config = useBookDataStore.getState().getConfig(bookHash);
+        // Retry saved records even when Book Data has no destinations now.
+        // Publish only the pack record, at the oldest timestamp: the server
+        // unions it into its row without replacing reading progress. The
+        // reader publishes its position separately, with a fresh XPointer.
+        if (book && config && isSyncCategoryEnabled('progress') && (await getUserID())) {
+          await new SyncClient().pushChanges({
+            configs: [
+              { bookHash, metaHash: book.metaHash, ttsPacks: config.ttsPacks, updatedAt: 0 },
+            ],
+          });
+          pendingPackPublications.delete(bookHash);
+        }
+      })
+      .catch((err) => {
+        console.warn('TTS pack sync failed', err);
+      });
+    syncRounds.set(bookHash, next);
+    void next.then(() => {
+      if (syncRounds.get(bookHash) === next) syncRounds.delete(bookHash);
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (!this.#closing) this.#closing = this.#close();
+    return this.#closing;
+  }
+
+  async #close(): Promise<void> {
     if (this.#compactTimer) {
       clearTimeout(this.#compactTimer);
       this.#compactTimer = null;
@@ -281,3 +531,36 @@ export class BookTTSCacheStore implements TTSCacheStore {
     }
   }
 }
+
+// Delete pinned offline audio when a book leaves the local library, including
+// deletion paths that run without a live reader/controller (sync and purge).
+// Open the existing database directly so cleanup does not trigger normal
+// cache-open side effects such as pack sync or a cross-book sweep.
+export const clearBookTTSDownloads = async (
+  appService: AppService,
+  bookHash: string,
+): Promise<void> => {
+  const dir = `tts-cache/${bookHash}`;
+  const dbPath = `${dir}/cache.db`;
+  if (!(await appService.databaseExists(dbPath, 'Cache'))) {
+    await appService.deleteFile(`${dir}/${DOWNLOADS_MARKER}`, 'Cache').catch(() => {});
+    return;
+  }
+
+  let packFs: TTSPackFs | undefined;
+  if (isTauriAppPlatform()) {
+    packFs = createNativePackFs(`${dir}/packs`);
+  } else {
+    packFs = await createOpfsPackFs(`${dir}/packs`);
+  }
+  const db = await appService.openDatabase('tts-cache', dbPath, 'Cache');
+  const budgetBytes = Math.max(1, getTTSCacheConfig().budgetMB * 1024 * 1024);
+  const store = new SqliteTTSCacheStore(db, { budgetBytes, packFs });
+  try {
+    await store.clearDownloads();
+    await store.flush();
+  } finally {
+    await db.close();
+  }
+  await appService.deleteFile(`${dir}/${DOWNLOADS_MARKER}`, 'Cache').catch(() => {});
+};

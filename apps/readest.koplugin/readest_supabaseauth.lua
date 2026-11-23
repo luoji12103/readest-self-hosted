@@ -1,16 +1,40 @@
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local socketutil = require("socketutil")
+local sporeResponse = require("readest_sporeresponse")
 
 -- Auth operation timeouts
 local AUTH_TIMEOUTS = { 5, 10 }
 -- Token refresh timeouts
 local REFRESH_TIMEOUTS = { 3, 7 }
+-- Hard limit for a token refresh. UI waiters are released much earlier; this
+-- only ends a request that will never finish (e.g. a stalled DNS lookup), so
+-- a later refresh can start. A rotation lost past it requires a new login.
+local REFRESH_DEADLINE = 150
 
 local SupabaseAuthClient = {
     service_spec = nil,
     api_key = nil,
+    REFRESH_DEADLINE = REFRESH_DEADLINE,
 }
+
+-- Normalize the outcome of a Spore call so every endpoint hands callers a
+-- table with a message, including Spore's wrapped HTTP exceptions.
+local function unwrap(name, expected_status, ok, res)
+    local response, reason = sporeResponse(res)
+    local status = response and response.status
+    local body = response and response.body
+    if ok and status == expected_status then return true, body or {}, status end
+    logger.dbg("SupabaseAuthClient:" .. name .. " failure:", reason or status or tostring(res))
+    if type(body) ~= "table" then
+        body = { msg = type(body) == "string" and body ~= "" and body
+            or reason or (status and ("HTTP " .. status)) or tostring(res) }
+    elseif not body.msg then
+        body.msg = body.message or body.error_description or body.error
+            or reason or (status and ("HTTP " .. status)) or "request failed"
+    end
+    return false, body, status
+end
 
 function SupabaseAuthClient:new(o)
     if o == nil then o = {} end
@@ -40,32 +64,8 @@ function SupabaseAuthClient:init()
         end
     end
 
-    package.loaded["Spore.Middleware.AsyncHTTP"] = {}
-    require("Spore.Middleware.AsyncHTTP").call = function(args, req)
-        -- disable async http if Turbo looper is missing
-        if not UIManager.looper then return end
-        req:finalize()
-        local result
-        require("httpclient"):new():request({
-            url = req.url,
-            method = req.method,
-            body = req.env.spore.payload,
-            on_headers = function(headers)
-                for header, value in pairs(req.headers) do
-                    if type(header) == "string" then
-                        headers:add(header, value)
-                    end
-                end
-            end,
-        }, function(res)
-            result = res
-            -- Turbo HTTP client uses code instead of status
-            -- change to status so that Spore can understand
-            result.status = res.code
-            coroutine.resume(args.thread)
-        end)
-        return coroutine.create(function() coroutine.yield(result) end)
-    end
+    package.loaded["Spore.Middleware.AsyncHTTP"] = require("readest_asynchttp")
+
 end
 
 function SupabaseAuthClient:sign_in_password(email, password)
@@ -82,12 +82,7 @@ function SupabaseAuthClient:sign_in_password(email, password)
         })
     end)
     socketutil:reset_timeout()
-    if ok then
-        return res.status == 200, res.body
-    else
-        logger.dbg("SupabaseAuthClient:sign_in_password failure:", res)
-        return false, res.body
-    end
+    return unwrap("sign_in_password", 200, ok, res)
 end
 
 function SupabaseAuthClient:sign_in_otp(email, callback)
@@ -103,14 +98,9 @@ function SupabaseAuthClient:sign_in_otp(email, callback)
                 email = email,
             })
         end)
-        if ok then
-            callback(res.status == 200, res.body)
-        else
-            logger.dbg("SupabaseAuthClient:sign_in_otp failure:", res)
-            callback(false, res.body)
-        end
+        callback(unwrap("sign_in_otp", 200, ok, res))
     end)
-    self.client:enable("AsyncHTTP", {thread = co})
+    self.client:enable("AsyncHTTP", {thread = co, timeout = 15})
     coroutine.resume(co)
     if UIManager.looper then UIManager:setInputTimeout() end
     socketutil:reset_timeout()
@@ -131,15 +121,27 @@ function SupabaseAuthClient:verify_otp(email, token, type)
         })
     end)
     socketutil:reset_timeout()
-    if ok then
-        return res.status == 200, res.body
-    else
-        logger.dbg("SupabaseAuthClient:verify_otp failure:", res)
-        return false, res.body
-    end
+    return unwrap("verify_otp", 200, ok, res)
 end
 
 function SupabaseAuthClient:refresh_token(refresh_token, callback)
+    -- DNS stalls must not block reader input. Keep the worker alive past the
+    -- caller's wait so a successful rotation can still be persisted.
+    if not UIManager.looper and require("ffi/util").runInSubProcess then
+        local worker = {
+            client = self.client,
+            _prepare = function()
+                self.client:reset_middlewares()
+                self.client:enable("Format.JSON")
+                self.client:enable("SupabaseHeaders", { api_key = self.api_key })
+            end,
+        }
+        require("readest_syncclient")._dispatchInSubprocess(worker, "refresh_token",
+            { refresh_token = refresh_token }, REFRESH_TIMEOUTS,
+            function(ok, res) callback(unwrap("refresh_token", 200, ok, res)) end,
+            { deadline = REFRESH_DEADLINE })
+        return
+    end
     self.client:reset_middlewares()
     self.client:enable("Format.JSON")
     self.client:enable("SupabaseHeaders", {
@@ -152,14 +154,11 @@ function SupabaseAuthClient:refresh_token(refresh_token, callback)
                 refresh_token = refresh_token,
             })
         end)
-        if ok then
-            callback(res.status == 200, res.body)
-        else
-            logger.dbg("SupabaseAuthClient:refresh_token failure:", res)
-            callback(false, res.body)
-        end
+        callback(unwrap("refresh_token", 200, ok, res))
     end)
-    self.client:enable("AsyncHTTP", {thread = co})
+    -- The coordinator's UI wait ends sooner; a late HTTP response must still
+    -- resume this coroutine unless the request outlives the hard limit.
+    self.client:enable("AsyncHTTP", {thread = co, timeout = REFRESH_DEADLINE})
     coroutine.resume(co)
     if UIManager.looper then UIManager:setInputTimeout() end
     socketutil:reset_timeout()
@@ -177,16 +176,13 @@ function SupabaseAuthClient:sign_out(access_token, callback)
     socketutil:set_timeout(AUTH_TIMEOUTS[1], AUTH_TIMEOUTS[2])
     local co = coroutine.create(function()
         local ok, res = pcall(function()
-            return self.client:sign_out()
+            -- Only this device, like the app: Supabase's default scope
+            -- (global) signs the account out everywhere.
+            return self.client:sign_out({ scope = "local" })
         end)
-        if ok then
-            callback(res.status == 204, res.body)
-        else
-            logger.dbg("SupabaseAuthClient:sign_out failure:", res)
-            callback(false, res.body)
-        end
+        callback(unwrap("sign_out", 204, ok, res))
     end)
-    self.client:enable("AsyncHTTP", {thread = co})
+    self.client:enable("AsyncHTTP", {thread = co, timeout = 15})
     coroutine.resume(co)
     if UIManager.looper then UIManager:setInputTimeout() end
     socketutil:reset_timeout()
@@ -206,14 +202,9 @@ function SupabaseAuthClient:get_user(access_token, callback)
         local ok, res = pcall(function()
             return self.client:get_user()
         end)
-        if ok then
-            callback(res.status == 200, res.body)
-        else
-            logger.dbg("SupabaseAuthClient:get_user failure:", res)
-            callback(false, res.body)
-        end
+        callback(unwrap("get_user", 200, ok, res))
     end)
-    self.client:enable("AsyncHTTP", {thread = co})
+    self.client:enable("AsyncHTTP", {thread = co, timeout = 15})
     coroutine.resume(co)
     if UIManager.looper then UIManager:setInputTimeout() end
     socketutil:reset_timeout()
