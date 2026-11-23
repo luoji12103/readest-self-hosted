@@ -114,9 +114,6 @@ for marker in \
   'macos-latest' \
   'universal-apple-darwin' \
   "APPLE_SIGNING_IDENTITY: '-'" \
-  'TAURI_APPIMAGE_CLI_REV: 503bdbc1eade37d50a64ea7f81dbe853338b7fda' \
-  'if !quick_sharun.exists()' \
-  'cargo install --path "$tauri_source/crates/tauri-cli" --locked --force' \
   'pnpm tauri android build --apk' \
   'pnpm tauri android build --split-per-abi --apk' \
   'Duplicate Android APKs for ABI' \
@@ -163,41 +160,85 @@ for index, job in enumerate(jobs):
 PY
 
 python3 - <<'PY'
+import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 text = Path('.github/workflows/build-selfhost.yml').read_text()
 start = text.index('  build-linux:')
 end = text.index('  build-macos:', start)
 block = text[start:end]
-build_start = block.index('      - name: Build and collect Linux packages')
-build_env = block.index('        env:', build_start)
-if '        timeout-minutes: 45' not in block[build_start:build_env]:
-    raise SystemExit('Linux package build is missing its step-level hang timeout')
-if 'cargo install tauri-cli --git' in block:
-    raise SystemExit('Linux AppImage CLI is installed before applying the pinned helper-cache patch')
 
-install_start = block.index('      - name: Install truly portable AppImage bundler')
-install_end = block.index('      - name:', install_start + 8)
-install_block = block[install_start:install_end]
-run_start = install_block.index('        run: |\n') + len('        run: |\n')
-run_script = '\n'.join(
-    line[10:] if line.startswith('          ') else line
-    for line in install_block[run_start:].splitlines()
-)
-expected_patch_start = """download_start = '''  let data = download(
-'''
-download_start_replacement = '''  if !quick_sharun.exists() {
-    let data = download(
-'''"""
-expected_patch_end = """download_end = '''  write_and_make_executable(&quick_sharun, data)?;
-'''
-download_end_replacement = '''    write_and_make_executable(&quick_sharun, data)?;
-  }
-'''"""
-if expected_patch_start not in run_script or expected_patch_end not in run_script:
-    raise SystemExit('Linux AppImage CLI patch does not preserve the exact Rust source indentation')
-if 'raw.githubusercontent.com' in install_block:
-    raise SystemExit('Linux AppImage CLI patch embeds a moving third-party download URL')
+def step(name):
+    return block.split(f'      - name: {name}\n', 1)[1].split('      - name:', 1)[0]
+
+deps = step('Install Linux dependencies')
+for package in ('libasound2-dev', 'libclang-dev', 'g++', 'libnss3', 'libpulse0', 'libspeechd2', 'libxkbcommon-x11-0'):
+    if package not in deps.split():
+        raise SystemExit(f'Linux dependencies are missing {package}')
+if 'pkg-config --modversion alsa' not in deps:
+    raise SystemExit('Linux setup must check that pkg-config can find ALSA')
+
+install = step('Install the pinned Tauri CEF CLI')
+if 'TAURI_CEF_CLI_REV: 6beeb209b5514f597a26f48b7a5b9fe4c59b5f12' not in install or \
+   'cargo install tauri-cli --git https://github.com/readest/tauri --rev "$TAURI_CEF_CLI_REV" --locked --force' not in install:
+    raise SystemExit('Linux must install the pinned, locked Tauri CEF CLI from Readest')
+if 'TAURI_BUNDLER_NEW_APPIMAGE_FORMAT' in block or 'quick-sharun.sh' in block:
+    raise SystemExit('The CEF CLI must manage its own pinned quick-sharun helper')
+
+build = step('Build and collect Linux packages')
+if '        timeout-minutes: 45' not in build.split('        env:', 1)[0]:
+    raise SystemExit('Linux package build is missing its step-level hang timeout')
+if "TAURI_CEF_CARGO: '1'" not in build or "STRACE_MODE: '0'" not in build:
+    raise SystemExit('Linux must use the Cargo CEF CLI without runtime tracing')
+ordered = [build.index(marker) for marker in (
+    'pnpm patch-tauri-selfhost', 'pnpm tauri build', '--appimage-extract',
+    'verify-selfhost-linux-appimage.sh', 'copy_signed "${appimages[0]}"',
+)]
+if ordered != sorted(ordered):
+    raise SystemExit('Linux must patch its identity, build, extract, verify, and then collect the AppImage')
+for asset in (
+    'Readest-Selfhost_${version}_amd64.AppImage', 'Readest-Selfhost_${version}_aarch64.AppImage',
+    'Readest-Selfhost_${version}_amd64.deb', 'Readest-Selfhost_${version}_arm64.deb',
+    'Readest-Selfhost-${version}-1.x86_64.rpm', 'Readest-Selfhost-${version}-1.aarch64.rpm',
+):
+    if asset not in build:
+        raise SystemExit(f'Linux changed the release asset basename {asset}')
+
+with TemporaryDirectory() as directory:
+    appdir = Path(directory) / 'My Readest.AppDir'
+    executables = ('AppRun', 'bin/readest', 'shared/bin/readest')
+    required_files = (
+        'bin/libcef.so', 'bin/00-no-userns-prompt.hook', 'lib/libsoftokn3.so',
+        'lib/libfreeblpriv3.so', 'lib/libnssckbi.so', 'lib/libsqlite3.so.0',
+        'lib/libpulse.so.0', 'lib/libspeechd.so.2', 'lib/libxkbcommon-x11.so.0',
+        'lib/pulseaudio/libpulsecommon-15.99.so',
+    )
+    for name in executables + required_files:
+        path = appdir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('payload')
+        if name in executables:
+            path.chmod(0o755)
+    (appdir / 'lib/lib.path').write_text('+\n+/pulseaudio\n')
+    (appdir / 'My Readest.desktop').write_text('[Desktop Entry]\nName=My Readest\n')
+    command = ['bash', 'scripts/verify-selfhost-linux-appimage.sh', str(appdir), 'My Readest']
+    subprocess.run(command, check=True)
+
+    def rejects(message):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 1 or message not in result.stderr:
+            raise SystemExit(f'Linux AppImage verification did not reject {message}: {result.stderr}')
+
+    (appdir / 'lib/lib.path').write_text('+\n+/pulseaudio-extra\n')
+    rejects('Missing +/pulseaudio in lib/lib.path')
+    (appdir / 'lib/lib.path').write_text('+\n+/pulseaudio\n')
+    (appdir / 'lib/libpulse.so.0').unlink()
+    (appdir / 'lib/libpulse.so.0').symlink_to('libpulse.so.0.24.1')
+    rejects('Missing library libpulse.so.0')
+    (appdir / 'lib/libpulse.so.0.24.1').write_text('payload')
+    (appdir / 'bin/00-no-userns-prompt.hook').unlink()
+    rejects('Missing the no-userns-prompt hook')
 PY
 
 python3 - <<'PY'
