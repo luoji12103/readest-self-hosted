@@ -1,0 +1,382 @@
+/**
+ * Heuristic chapter-list extraction for web-novel table-of-contents pages.
+ *
+ * Parses the RAW page HTML with `DOMParser` — a detached document has no
+ * browsing context, so nothing executes or loads; we only read strings out of
+ * it. (`sanitizeForParsing` is deliberately NOT used here: DOMPurify's
+ * defaults strip every `<meta>` tag, and `og:novel:*` metadata is the best
+ * title/author signal on most novel sites.) Everything extracted is either
+ * XML-escaped by `buildEpub` or run through `sanitizeHtml` before it reaches
+ * a rendered page.
+ */
+
+export interface NovelChapterLink {
+  title: string;
+  url: string;
+}
+
+export interface NovelToc {
+  title: string;
+  author: string;
+  coverUrl: string | null;
+  chapters: NovelChapterLink[];
+  /**
+   * Fields that came from a page-level guess (the `<title>` tag, a site-wide
+   * `meta[name=author]`) rather than real per-work metadata. A chapter-index
+   * page is often just a list of links, so a chapter page may know better.
+   */
+  weak: { title: boolean; author: boolean };
+}
+
+export interface WorkMetadata {
+  title: string | null;
+  author: string | null;
+}
+
+/** Fewer links than this is not a chapter list. */
+const MIN_CHAPTER_LINKS = 5;
+
+/**
+ * The chosen container must hold at least this fraction of all chapter-like
+ * links on the page. "Latest chapters" sidebars (a handful of links) fail the
+ * bar; the full list passes; when the full list is split across siblings the
+ * common parent wins instead.
+ */
+const CONTAINER_COVERAGE = 0.8;
+
+const CHAPTER_TEXT_PATTERNS = [
+  // Traditional forms too (節, 話, 萬, 兩); some sites number chapters as 页/頁.
+  /第\s*[0-9０-９零〇一二三四五六七八九十百千万萬两兩]+\s*[章节節回卷集部篇话話页頁]/,
+  /\bchapter\s*[0-9]+/i,
+  /\bch\.?\s*[0-9]+\b/i,
+  /\bepisode\s*[0-9]+/i,
+  /^[0-9]+\s*[、.．:：\-]/,
+];
+
+const isChapterText = (text: string): boolean => CHAPTER_TEXT_PATTERNS.some((p) => p.test(text));
+
+/** Collapse digit runs so `/book/1/482.html` and `/book/1/7.html` compare equal. */
+const hrefTemplate = (url: URL): string => url.origin + url.pathname.replace(/[0-9]+/g, '#');
+
+interface LinkEntry {
+  el: Element;
+  text: string;
+  url: URL;
+  template: string;
+}
+
+const collectLinks = (doc: Document, pageUrl: string): LinkEntry[] => {
+  const entries: LinkEntry[] = [];
+  for (const el of doc.querySelectorAll('a[href]')) {
+    const href = el.getAttribute('href') || '';
+    if (!href || href.startsWith('#')) continue;
+    let url: URL;
+    try {
+      url = new URL(href, pageUrl);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    entries.push({ el, text, url, template: hrefTemplate(url) });
+  }
+  return entries;
+};
+
+const majorityTemplate = (entries: LinkEntry[]): { template: string; count: number } | null => {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    counts.set(entry.template, (counts.get(entry.template) || 0) + 1);
+  }
+  let best: { template: string; count: number } | null = null;
+  for (const [template, count] of counts) {
+    if (!best || count > best.count) best = { template, count };
+  }
+  return best;
+};
+
+const elementDepth = (el: Element): number => {
+  let depth = 0;
+  for (let node = el.parentElement; node; node = node.parentElement) depth++;
+  return depth;
+};
+
+/**
+ * The deepest element containing at least `CONTAINER_COVERAGE` of the
+ * chapter-like links — tight enough to exclude sidebars, wide enough to span
+ * a list split across columns.
+ */
+const findChapterContainer = (candidates: LinkEntry[]): Element | null => {
+  const counts = new Map<Element, number>();
+  for (const { el } of candidates) {
+    for (let node = el.parentElement; node; node = node.parentElement) {
+      counts.set(node, (counts.get(node) || 0) + 1);
+    }
+  }
+  const threshold = Math.max(MIN_CHAPTER_LINKS, Math.ceil(CONTAINER_COVERAGE * candidates.length));
+  let container: Element | null = null;
+  let containerDepth = -1;
+  for (const [el, count] of counts) {
+    if (count < threshold) continue;
+    const depth = elementDepth(el);
+    if (depth > containerDepth) {
+      container = el;
+      containerDepth = depth;
+    }
+  }
+  return container;
+};
+
+const CN_DIGITS: Record<string, number> = {
+  零: 0,
+  〇: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  兩: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000 };
+
+/** 第一百零一 → 101, 第一萬零二 → 10002. */
+const parseChineseNumber = (numeral: string): number => {
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  for (const ch of numeral) {
+    if (ch in CN_DIGITS) digit = CN_DIGITS[ch]!;
+    else if (ch in CN_UNITS) {
+      section += (digit || 1) * CN_UNITS[ch]!;
+      digit = 0;
+    } else if (ch === '万' || ch === '萬') {
+      total += (section + digit) * 10000;
+      section = 0;
+      digit = 0;
+    }
+  }
+  return total + section + digit;
+};
+
+/** Chapter number in the title (the last 第N, arabic or Chinese, so 第一卷
+ *  第六章 reads 6), else the last digit run in the URL path — used only to
+ *  detect newest-first ordering. */
+const chapterNumber = (entry: LinkEntry): number | null => {
+  // Full-width digits (第１２頁) read as ASCII.
+  const text = entry.text.replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
+  const numeral = [
+    ...text.matchAll(/第\s*([0-9]+|[零〇一二三四五六七八九十百千万萬两兩]+)/g),
+  ].pop()?.[1];
+  if (numeral) return /^[0-9]/.test(numeral) ? parseInt(numeral, 10) : parseChineseNumber(numeral);
+  const numbered =
+    text.match(/(?:\bchapter|\bch\.?|\bepisode)\s*([0-9]+)/i) ||
+    text.match(/^([0-9]+)\s*[、.．:：\-]/);
+  if (numbered?.[1]) return parseInt(numbered[1], 10);
+  const pathDigits = entry.url.pathname.match(/([0-9]+)(?=[^0-9]*$)/);
+  return pathDigits?.[1] ? parseInt(pathDigits[1], 10) : null;
+};
+
+/** Newest-first lists read backwards — reverse when numbers mostly descend. */
+const orderChapters = (entries: LinkEntry[]): LinkEntry[] => {
+  let descending = 0;
+  let ascending = 0;
+  let prev: number | null = null;
+  for (const entry of entries) {
+    const num = chapterNumber(entry);
+    if (num !== null && prev !== null) {
+      if (num < prev) descending++;
+      else if (num > prev) ascending++;
+    }
+    if (num !== null) prev = num;
+  }
+  return descending > ascending ? entries.slice().reverse() : entries;
+};
+
+const metaContent = (doc: Document, selectors: string[]): string | null => {
+  for (const selector of selectors) {
+    const content = doc.querySelector(selector)?.getAttribute('content')?.trim();
+    if (content) return content;
+  }
+  return null;
+};
+
+/** "斗破苍穹最新章节_笔趣阁" → "斗破苍穹"; "Title - Read Online" → "Title". */
+const cleanTitleTag = (raw: string): string => {
+  const first = raw.split(/\s*[|_｜]\s*|\s+[-–—]\s+/)[0]?.trim() || raw.trim();
+  return first.replace(/(最新章节列表|最新章节|章节列表|章节目录|全文阅读|无弹窗)+$/, '').trim();
+};
+
+/** Meta tags that name the work itself, as opposed to the page or the site. */
+const WORK_TITLE_META = [
+  'meta[property="og:novel:book_name"]',
+  'meta[property="og:title"]',
+  'meta[name="twitter:title"]',
+];
+const WORK_AUTHOR_META = ['meta[property="og:novel:author"]', 'meta[property="books:author"]'];
+
+/** Labels a novel site uses to introduce the writer's name. */
+const AUTHOR_LABEL = /(?:作者|著者)\s*[:：]\s*/;
+/**
+ * Field labels that sit right after the byline on the same line. The flattened
+ * text runs them into the name with no separator at all — "作者：五月不行"
+ * immediately followed by "日期：2026-08-24" — and no generic rule can tell
+ * where such a name ends, so the labels worth cutting at are named here.
+ */
+const NEXT_FIELD_LABEL = /(?:日期|时间|更新|状态|字数|分类|类别|类型|标签|来源|最新)\s*[:：]/;
+/** Trim a byline candidate down to the name. A byline name runs up to the
+ *  first separator — whitespace included, since the rest of the line is other
+ *  fields, not more name. */
+const cleanAuthorName = (raw: string): string => {
+  const field = raw.trim().split(/[\s，,。；;、|/]/)[0] ?? '';
+  return (field.split(NEXT_FIELD_LABEL)[0] ?? '').slice(0, 32);
+};
+
+/**
+ * The writer's name from an on-page byline. Walks text nodes instead of
+ * matching the flattened `body.textContent`, so the name can be read out of the
+ * link that usually wraps it (`作者：<a>NAME</a></span>日期：…`) without the
+ * neighbouring field bleeding into it.
+ */
+const bylineAuthor = (doc: Document): string | null => {
+  const body = doc.body;
+  if (!body) return null;
+  const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node.textContent || '';
+    const label = text.match(AUTHOR_LABEL);
+    if (label?.index === undefined) continue;
+    let name = cleanAuthorName(text.slice(label.index + label[0].length));
+    if (!name) {
+      // The label can end its own node, with the name in a following one, and
+      // markup indentation often puts whitespace nodes in between. Only the
+      // first non-blank node can be the name: anything past it is the next
+      // field, so an empty byline must not reach for the date or a chapter.
+      for (let ahead = walker.nextNode(); ahead; ahead = walker.nextNode()) {
+        const candidate = (ahead.textContent || '').trim();
+        if (!candidate) continue;
+        name = cleanAuthorName(candidate);
+        break;
+      }
+    }
+    if (name) return name;
+  }
+  return null;
+};
+
+const extractMetadata = (
+  doc: Document,
+  pageUrl: string,
+): { title: string; author: string; coverUrl: string | null; weak: NovelToc['weak'] } => {
+  const workTitle = metaContent(doc, WORK_TITLE_META);
+  const title =
+    workTitle ||
+    cleanTitleTag(doc.querySelector('title')?.textContent || '') ||
+    new URL(pageUrl).hostname;
+
+  // `meta[name=author]` is routinely set site-wide (to the operator, not the
+  // writer), so it counts as a guess rather than work metadata.
+  const workAuthor = metaContent(doc, WORK_AUTHOR_META);
+  const author = workAuthor || metaContent(doc, ['meta[name="author"]']) || bylineAuthor(doc) || '';
+
+  const rawCover = metaContent(doc, ['meta[property="og:image"]']);
+  let coverUrl: string | null = null;
+  if (rawCover) {
+    try {
+      const resolved = new URL(rawCover, pageUrl);
+      if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+        coverUrl = resolved.href;
+      }
+    } catch {
+      /* unparseable cover URL — cover is optional */
+    }
+  }
+  return { title, author, coverUrl, weak: { title: !workTitle, author: !workAuthor } };
+};
+
+/** Headings a chapter page uses for the work title and the writer's byline. */
+const WORK_TITLE_HEADINGS = ['h1[class*="title"]', 'h2[class*="title"]'];
+const WORK_AUTHOR_HEADINGS = ['[class*="byline"]', '[rel="author"]', '[class*="author"]'];
+
+const headingText = (doc: Document, selectors: string[]): string | null => {
+  for (const selector of selectors) {
+    const text = doc.querySelector(selector)?.textContent?.replace(/\s+/g, ' ').trim();
+    // A heading naming the chapter ("Chapter 7") describes this page, not the
+    // work — the same test that recognizes chapter links recognizes it here.
+    if (text && !isChapterText(text)) return text;
+  }
+  return null;
+};
+
+/**
+ * Work title and author as advertised by a single chapter page. Chapter pages
+ * usually carry the real per-work metadata even when the chapter-index page is
+ * nothing but a list of links, so this backfills what the index couldn't say.
+ * Returns `null` per field when the page offers no better answer than the
+ * index already had — notably the site-wide `meta[name=author]`, which is
+ * deliberately not consulted here.
+ */
+export function parseWorkMetadata(html: string, _pageUrl?: string): WorkMetadata {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const titleTag = cleanTitleTag(doc.querySelector('title')?.textContent || '');
+  return {
+    title:
+      metaContent(doc, WORK_TITLE_META) ||
+      headingText(doc, WORK_TITLE_HEADINGS) ||
+      (titleTag && !isChapterText(titleTag) ? titleTag : null) ||
+      null,
+    author:
+      metaContent(doc, WORK_AUTHOR_META) ||
+      headingText(doc, WORK_AUTHOR_HEADINGS)?.replace(/^by\s+/i, '') ||
+      null,
+  };
+}
+
+/**
+ * Parse a web-novel TOC page into title/author/cover metadata plus an ordered
+ * chapter list. Returns `null` when the page doesn't look like a chapter list
+ * (fewer than `MIN_CHAPTER_LINKS` chapter-like links).
+ */
+export function parseChapterList(html: string, pageUrl: string): NovelToc | null {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const links = collectLinks(doc, pageUrl);
+
+  // Chapter-like links: recognizable chapter titles, or — when titles carry
+  // no numbers ("Prologue", "The End") — the page's dominant href template.
+  let candidates = links.filter((entry) => isChapterText(entry.text));
+  if (candidates.length < MIN_CHAPTER_LINKS) {
+    const majority = majorityTemplate(links);
+    if (!majority || majority.count < MIN_CHAPTER_LINKS) return null;
+    candidates = links.filter((entry) => entry.template === majority.template);
+  }
+
+  const container = findChapterContainer(candidates);
+  if (!container) return null;
+
+  // Keep the container's chapter-like links in document order; also admit
+  // same-template links whose titles didn't match (a "Prologue" row inside a
+  // numbered list). Dedup by URL — many lists repeat entries.
+  const candidateSet = new Set(candidates);
+  const template = majorityTemplate(candidates)?.template;
+  const seen = new Set<string>();
+  const contained: LinkEntry[] = [];
+  for (const entry of links) {
+    if (!container.contains(entry.el)) continue;
+    if (!candidateSet.has(entry) && entry.template !== template) continue;
+    if (seen.has(entry.url.href)) continue;
+    seen.add(entry.url.href);
+    contained.push(entry);
+  }
+  if (contained.length < MIN_CHAPTER_LINKS) return null;
+
+  const ordered = orderChapters(contained);
+  return {
+    ...extractMetadata(doc, pageUrl),
+    chapters: ordered.map((entry) => ({ title: entry.text, url: entry.url.href })),
+  };
+}

@@ -7,6 +7,7 @@ import {
   getEntryId,
   getNextPageUrl,
   findNewestFeedURL,
+  checkCatalogFeed,
 } from '@/services/opds/feedChecker';
 
 vi.mock('@/services/environment', () => ({
@@ -55,6 +56,23 @@ const makeAcquisitionFeed = (
   ${entryXml}
 </feed>`;
 };
+
+describe('checkCatalogFeed', () => {
+  const answering = async (body: string) => {
+    const { fetch } = await import('@tauri-apps/plugin-http');
+    vi.mocked(fetch).mockResolvedValue(new Response(body, { status: 200 }));
+    return checkCatalogFeed({ id: 'c', name: 'C', url: 'https://example.com/opds' });
+  };
+
+  it('passes on an OPDS feed', async () => {
+    expect(await answering(makeAcquisitionFeed([{ title: 'A', href: '/a.epub' }]))).toBe(true);
+    expect(await answering(JSON.stringify({ metadata: {}, publications: [] }))).toBe(true);
+  });
+
+  it('fails on JSON that is not a feed', async () => {
+    expect(await answering('{}')).toBe(false);
+  });
+});
 
 describe('OPDS feed checker', () => {
   describe('getAcquisitionLink', () => {
@@ -441,6 +459,51 @@ describe('OPDS feed checker', () => {
       expect(getAcquisitionLink(pub)!.href).toBe('/dl/book.cbz');
     });
 
+    // readest issue #5583: a Calibre entry that also carries KFX must not have
+    // that picked over the EPUB sitting next to it.
+    it('prefers EPUB over a format Readest cannot import', () => {
+      const pub: OPDSPublication = {
+        metadata: { id: 'urn:test:kfx-epub', title: 'KFX vs EPUB' },
+        links: [
+          {
+            href: '/get/kfx/56/Calibre_Library',
+            rel: 'http://opds-spec.org/acquisition',
+            properties: {},
+          },
+          {
+            href: '/get/epub/56/Calibre_Library',
+            type: 'application/epub+zip',
+            rel: 'http://opds-spec.org/acquisition',
+            properties: {},
+          },
+        ],
+        images: [],
+      };
+      expect(getAcquisitionLink(pub)!.href).toBe('/get/epub/56/Calibre_Library');
+    });
+
+    // Downloading it would only fail at import, leaving a failed-download entry
+    // behind, so the entry is skipped outright.
+    it('skips an entry whose only formats are ones Readest cannot import', () => {
+      const pub: OPDSPublication = {
+        metadata: { id: 'urn:test:kfx-only', title: 'KFX only' },
+        links: [
+          {
+            href: '/get/kfx/56/Calibre_Library',
+            rel: 'http://opds-spec.org/acquisition',
+            properties: {},
+          },
+          {
+            href: '/get/lit/56/Calibre_Library',
+            rel: 'http://opds-spec.org/acquisition',
+            properties: {},
+          },
+        ],
+        images: [],
+      };
+      expect(getAcquisitionLink(pub)).toBeUndefined();
+    });
+
     it('treats PDF and CBZ as the same tier (uses feed order to break ties)', () => {
       const pub: OPDSPublication = {
         metadata: { id: 'urn:test:pdf-cbz', title: 'PDF vs CBZ' },
@@ -633,6 +696,69 @@ describe('OPDS feed checker', () => {
       const items = collectNewEntries(feed, new Set(), 'https://example.com/opds/');
       expect(items).toHaveLength(1);
       expect(items[0]!.entryId).toBe('https://example.com/dl/book.epub');
+    });
+
+    it('carries the entry cover href so the import can use it (issue #5270)', () => {
+      const feed: OPDSFeed = {
+        metadata: { title: 'Test' },
+        links: [],
+        publications: [
+          {
+            metadata: { id: 'urn:cover', title: 'Custom Cover' },
+            links: [
+              {
+                href: '/dl/cover.epub',
+                type: 'application/epub+zip',
+                rel: 'http://opds-spec.org/acquisition',
+                properties: {},
+              },
+            ],
+            images: [
+              { href: '/cwa/opds/cover/572/thumb', rel: 'http://opds-spec.org/image/thumbnail' },
+              { href: '/cwa/opds/cover/572', rel: 'http://opds-spec.org/image' },
+            ],
+          },
+        ],
+      };
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.coverHref).toBe('/cwa/opds/cover/572');
+    });
+
+    it('carries the entry metadata so the import can apply it (issue #5270)', () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <id>urn:test:feed</id>
+  <title>Test Feed</title>
+  <entry>
+    <id>urn:meta</id>
+    <title>Feed Title</title>
+    <author><name>Jane Doe</name></author>
+    <dc:language>fr</dc:language>
+    <category term="FIC009000" label="Fantasy"/>
+    <summary type="text">A summary.</summary>
+    <link href="/dl/a.epub" type="application/epub+zip"
+          rel="http://opds-spec.org/acquisition"/>
+  </entry>
+</feed>`;
+      const doc = parseXML(xml);
+      const feed = getFeed(doc) as OPDSFeed;
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.metadata).toMatchObject({
+        title: 'Feed Title',
+        author: 'Jane Doe',
+        language: 'fr',
+        subject: ['Fantasy'],
+        description: 'A summary.',
+      });
+    });
+
+    it('leaves coverHref unset when the entry advertises no artwork', () => {
+      const xml = makeAcquisitionFeed([{ id: 'urn:a', title: 'Issue 1', href: '/dl/a' }]);
+      const doc = parseXML(xml);
+      const feed = getFeed(doc) as OPDSFeed;
+      const items = collectNewEntries(feed, new Set(), 'https://example.com');
+      expect(items[0]!.coverHref).toBeUndefined();
     });
 
     it('returns empty when all entries are already known', () => {

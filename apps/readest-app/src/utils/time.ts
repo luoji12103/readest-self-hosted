@@ -3,6 +3,11 @@ import duration from 'dayjs/plugin/duration';
 import relativeTime from 'dayjs/plugin/relativeTime';
 
 dayjs.extend(duration);
+// At module scope, not only inside `initDayjs`: `formatSyncTimeFromNow` below
+// is called from a hook that unit tests mount directly, where the app's startup
+// `initDayjs` never ran. `extend` is idempotent, so `initDayjs` keeps its call
+// for the locale.
+dayjs.extend(relativeTime);
 
 import 'dayjs/locale/en';
 import 'dayjs/locale/zh';
@@ -35,6 +40,16 @@ export const initDayjs = (locale: string) => {
   dayjs.extend(relativeTime);
 };
 
+// "Last synced" labels show the newest pulled record's timestamp, which is the
+// AUTHORING device's clock — a clock-skewed peer can stamp the future and the
+// label would read "Synced in an hour" (#5661). Clamp to local now at display
+// time only; the record-derived pull cursor must never be clamped.
+export const clampSyncTimeForDisplay = (time: number): number => Math.min(time, Date.now());
+
+/** The clamped "x minutes ago" used by every "Synced {{time}}" row. */
+export const formatSyncTimeFromNow = (time: number): string =>
+  dayjs(clampSyncTimeForDisplay(time)).fromNow();
+
 // Clock-style playback time for the TTS scrubber: m:ss below one hour,
 // h:mm:ss above. Pass forceHours so both labels of a row share the format
 // chosen by the total's magnitude and the row never re-layouts when the
@@ -48,6 +63,39 @@ export const formatPlaybackTime = (seconds: number, forceHours = false): string 
     return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   }
   return `${minutes}:${String(secs).padStart(2, '0')}`;
+};
+
+// Compact playback time for the minimal TTS mini player (#5310), which shows
+// the remaining time alone: m:ss below one hour, h:mm above. The seconds go
+// past the hour mark rather than letting a three-part clock get chopped off in
+// the narrow row -- at that range the seconds are noise anyway. Both forms fit
+// five columns of tabular-nums, so the row never re-layouts as time runs down.
+export const formatCompactTime = (seconds: number): string => {
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(total % 60).padStart(2, '0')}`;
+};
+
+/**
+ * A duration split into parts, for callers that label it with real units.
+ *
+ * `formatCompactTime` renders 7h55m and 7m55s identically as "7:55", which is
+ * the right trade in the mini player's fixed-width countdown but misleading on
+ * the shelf, where books of very different lengths sit next to each other.
+ */
+export const splitDuration = (
+  seconds: number,
+): { hours: number; minutes: number; seconds: number } => {
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  return {
+    hours: Math.floor(total / 3600),
+    minutes: Math.floor((total % 3600) / 60),
+    seconds: total % 60,
+  };
 };
 
 // Countdown label for TTS sleep-timer chips: total minutes : seconds

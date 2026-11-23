@@ -4,6 +4,8 @@
   <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Readest uses the local network to discover nearby devices and transfer books with Nearby BookDrop.</string>
     <key>CFBundleLocalizations</key>
     <array>
       <string>en</string>
@@ -43,6 +45,13 @@
     </array>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <!-- Add-only Photos access. Readest never reads the library, but the
+         WebView's "Add to Photos" image callout and the share sheet's
+         "Save Image" activity both write through PHPhotoLibrary in-process;
+         without this key TCC terminates the app on the first attempt (#5397)
+         and iOS hides "Save Image" from the share sheet entirely. -->
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Readest needs access to save images from your books to your photo library.</string>
     <key>CFBundleURLTypes</key>
     <array>
       <dict>
@@ -80,10 +89,26 @@
     </array>
     <key>UIApplicationSceneManifest</key>
     <dict>
+      <!-- Readest creates one main window. Extra scenes requested by Files on
+           iPad have no WebView and appear black. Keep document handoffs in
+           the existing scene; retain the separate CarPlay role below. -->
       <key>UIApplicationSupportsMultipleScenes</key>
-      <true/>
+      <false/>
       <key>UISceneConfigurations</key>
       <dict>
+        <!-- UIKit can create the phone scene after a CarPlay-only launch
+             without asking the app delegate for a new configuration. -->
+        <key>UIWindowSceneSessionRoleApplication</key>
+        <array>
+          <dict>
+            <key>UISceneClassName</key>
+            <string>UIWindowScene</string>
+            <key>UISceneConfigurationName</key>
+            <string>Default</string>
+            <key>UISceneDelegateClassName</key>
+            <string>TaoSceneDelegate</string>
+          </dict>
+        </array>
         <key>CPTemplateApplicationSceneSessionRoleApplication</key>
         <array>
           <dict>
@@ -95,6 +120,18 @@
             <string>$(PRODUCT_MODULE_NAME).CarPlaySceneDelegate</string>
           </dict>
         </array>
+      </dict>
+    </dict>
+    <key>NSUbiquitousContainers</key>
+    <dict>
+      <key>iCloud.com.bilingify.readest</key>
+      <dict>
+        <key>NSUbiquitousContainerIsDocumentScopePublic</key>
+        <true/>
+        <key>NSUbiquitousContainerName</key>
+        <string>Readest</string>
+        <key>NSUbiquitousContainerSupportedFolderLevels</key>
+        <string>Any</string>
       </dict>
     </dict>
   </dict>

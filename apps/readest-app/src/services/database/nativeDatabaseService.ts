@@ -44,6 +44,14 @@ export class NativeDatabaseService implements DatabaseService {
   }
 
   async close(): Promise<void> {
-    await this.db.close();
+    // Turso is WAL-only with no auto-checkpoint and does not fold the WAL on
+    // close by itself; without this the main file never grows past its header
+    // and every written byte sits in the -wal sidecar, which file-level copy
+    // or sync of the containing directory can miss.
+    await this.execute('PRAGMA wal_checkpoint(TRUNCATE)').catch(() => {});
+    // The plugin's arg-less close() drains EVERY open connection app-wide;
+    // pass our path so closing this database cannot tear down the others
+    // (statistics.db etc. dying with "database ... not loaded", READEST-6).
+    await this.db.close(this.db.path);
   }
 }

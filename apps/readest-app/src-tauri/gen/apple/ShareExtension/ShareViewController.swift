@@ -3,6 +3,17 @@
 // that lets the user pick a target library group, then queues the save
 // into the App Group container and best-effort launches Readest.
 //
+// Safari shares additionally run `GetPageContent.js` inside the page
+// (NSExtensionJavaScriptPreprocessingFile) and deliver the rendered DOM
+// here — captured with the user's session, so login-walled articles come
+// through whole (#5262). The HTML is stashed in the App Group
+// `SharedClips/` directory and referenced from the pending save via
+// `htmlFile`; the host converts it directly instead of re-fetching.
+//
+// Plain text that isn't a single URL (a selection, an AI reply, #6747) is
+// stashed in `SharedClips/` as `.txt` and queued via `textFile`; the host
+// imports it as a TXT book.
+//
 // Two delivery paths to the host app, in order of preference:
 //
 //   1. App Group queue + responder-chain launch.
@@ -35,8 +46,21 @@ import UniformTypeIdentifiers
 
 final class ShareViewController: UIViewController {
 
+  // Anything larger risks blowing the extension's tight memory budget and
+  // is almost certainly not an article. Falls back to the URL-only save.
+  private static let maxSharedHtmlBytes = 10 * 1024 * 1024
+
   // Single-shot: avoid double-firing if iOS re-presents the extension.
   private var didCompleteOnce = false
+
+  // Page DOM delivered by GetPageContent.js when sharing from Safari.
+  private var capturedHtml: String?
+
+  // What the share sheet handed us: an article URL, or plain text.
+  enum SharedContent {
+    case url(URL, title: String?)
+    case text(String)
+  }
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -55,34 +79,53 @@ final class ShareViewController: UIViewController {
     let items = context.inputItems.compactMap { $0 as? NSExtensionItem }
     NSLog("[ReadestShare] inputItems count=\(items.count)")
 
-    let url = await firstShareableURL(from: items)
+    // Safari web-page shares deliver the JS-preprocessed DOM; every other
+    // source falls through to the plain URL/text extraction.
+    let pageContent = await firstPageContent(from: items)
+    // `??` takes a non-async autoclosure, so the fallback can't be inlined.
+    let url: URL?
+    if let pageURL = pageContent?.url {
+      url = pageURL
+    } else {
+      url = await firstShareableURL(from: items)
+    }
     let pageTitle =
-      items
+      pageContent?.title
+      ?? items
       .compactMap { $0.attributedTitle?.string ?? $0.attributedContentText?.string }
       .first { !$0.isEmpty }
+    let text = url == nil ? await firstSharedText(from: items) : nil
 
     await MainActor.run {
-      guard let url = url else {
-        NSLog("[ReadestShare] no URL found, cancelling")
+      if let url = url {
+        self.capturedHtml = pageContent?.html
+        NSLog(
+          "[ReadestShare] presenting picker for URL: %@ (captured HTML: %d chars)",
+          url.absoluteString, pageContent?.html?.count ?? 0)
+        self.presentPicker(content: .url(url, title: pageTitle))
+      } else if let text = text {
+        NSLog("[ReadestShare] presenting picker for text (%d chars)", text.count)
+        self.presentPicker(content: .text(text))
+      } else {
+        NSLog("[ReadestShare] no URL or text found, cancelling")
         self.cancelRequest()
-        return
       }
-      NSLog("[ReadestShare] presenting picker for URL: %@", url.absoluteString)
-      self.presentPicker(url: url, pageTitle: pageTitle)
     }
   }
 
-  private func presentPicker(url: URL, pageTitle: String?) {
+  private func presentPicker(content: SharedContent) {
     let groups = AppGroupBridge.readGroups()
     let options = SaveOptionsViewController(
-      url: url,
-      pageTitle: pageTitle,
+      content: content,
       groups: groups,
       onCancel: { [weak self] in
         self?.cancelRequest()
       },
       onSave: { [weak self] selectedGroup in
-        self?.handleSave(url: url, group: selectedGroup)
+        switch content {
+        case .url(let url, _): self?.handleSave(url: url, group: selectedGroup)
+        case .text(let text): self?.handleSave(text: text, group: selectedGroup)
+        }
       }
     )
     let nav = UINavigationController(rootViewController: options)
@@ -101,18 +144,52 @@ final class ShareViewController: UIViewController {
   // MARK: - Save / Cancel
 
   private func handleSave(url: URL, group: AppGroupBridge.LibraryGroup?) {
+    var htmlFile: String?
+    if let html = capturedHtml, !html.isEmpty {
+      htmlFile = AppGroupBridge.writeSharedClip(html, pathExtension: "html")
+    }
     let save = AppGroupBridge.PendingSave(
       url: url.absoluteString,
       groupId: group?.id,
       groupName: group?.name,
-      addedAt: AppGroupBridge.nowIso8601()
+      addedAt: AppGroupBridge.nowIso8601(),
+      htmlFile: htmlFile,
+      textFile: nil,
+      title: nil
     )
     AppGroupBridge.appendPendingSave(save)
-    NSLog("[ReadestShare] queued save for %@ group=%@", url.absoluteString, group?.name ?? "<none>")
+    NSLog(
+      "[ReadestShare] queued save for %@ group=%@ htmlFile=%@",
+      url.absoluteString, group?.name ?? "<none>", htmlFile ?? "<none>")
 
     if let target = buildTargetURL(scheme: "readest", host: "clip", inner: url) {
       let opened = openViaResponderChain(target)
       NSLog("[ReadestShare] responder-chain launch=%@", opened ? "yes" : "no")
+    }
+    completeOnce()
+  }
+
+  private func handleSave(text: String, group: AppGroupBridge.LibraryGroup?) {
+    guard let textFile = AppGroupBridge.writeSharedClip(text, pathExtension: "txt") else {
+      NSLog("[ReadestShare] could not write shared text, cancelling")
+      cancelRequest()
+      return
+    }
+    AppGroupBridge.appendPendingSave(
+      AppGroupBridge.PendingSave(
+        url: "",
+        groupId: group?.id,
+        groupName: group?.name,
+        addedAt: AppGroupBridge.nowIso8601(),
+        htmlFile: nil,
+        textFile: textFile,
+        title: Self.textTitle(text)
+      ))
+    NSLog("[ReadestShare] queued text save %@ group=%@", textFile, group?.name ?? "<none>")
+    // `readest://clip/` carries no URL: it only wakes the app, which then
+    // drains the queue.
+    if let target = URL(string: "readest://clip/") {
+      openViaResponderChain(target)
     }
     completeOnce()
   }
@@ -130,6 +207,40 @@ final class ShareViewController: UIViewController {
     extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
   }
 
+  // MARK: - Safari page-content extraction (GetPageContent.js results)
+
+  /// Pull the JS-preprocessed page out of a Safari share: a property-list
+  /// attachment whose `NSExtensionJavaScriptPreprocessingResultsKey` dict
+  /// carries `{url, title, html}` as returned by GetPageContent.js. `html`
+  /// is nil when it's missing, empty, or over the size cap — the caller
+  /// still uses the URL and falls back to the in-app clip path.
+  private func firstPageContent(
+    from items: [NSExtensionItem]
+  ) async -> (url: URL, title: String?, html: String?)? {
+    for item in items {
+      guard let attachments = item.attachments else { continue }
+      for attachment in attachments
+      where attachment.hasItemConformingToTypeIdentifier(UTType.propertyList.identifier) {
+        guard
+          let raw = try? await attachment.loadItem(
+            forTypeIdentifier: UTType.propertyList.identifier, options: nil),
+          let plist = raw as? [String: Any],
+          let results = plist[NSExtensionJavaScriptPreprocessingResultsKey] as? [String: Any],
+          let urlString = results["url"] as? String,
+          let url = URL(string: urlString), Self.isHttp(url)
+        else { continue }
+        var html = results["html"] as? String
+        if let candidate = html, candidate.isEmpty || candidate.utf8.count > Self.maxSharedHtmlBytes {
+          NSLog("[ReadestShare] dropping captured HTML (%d bytes)", candidate.utf8.count)
+          html = nil
+        }
+        let title = (results["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return (url, title, html)
+      }
+    }
+    return nil
+  }
+
   // MARK: - URL extraction
 
   private func firstShareableURL(from items: [NSExtensionItem]) async -> URL? {
@@ -141,9 +252,12 @@ final class ShareViewController: UIViewController {
             return url
           }
         }
+        // Text counts as a URL only when it is nothing but one; longer
+        // text is imported as text (see `firstSharedText`).
         if attachment.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
           if let text = try? await loadText(from: attachment),
-            let url = Self.extractHTTPURL(from: text)
+            let url = Self.extractHTTPURL(from: text),
+            text.trimmingCharacters(in: .whitespacesAndNewlines) == url.absoluteString
           {
             return url
           }
@@ -151,6 +265,31 @@ final class ShareViewController: UIViewController {
       }
     }
     return nil
+  }
+
+  /// First non-blank plain-text attachment. A `.txt` shared from Files is a
+  /// file URL here (`loadText` returns nil), but the activation rule keeps
+  /// the extension out of file shares in the first place.
+  private func firstSharedText(from items: [NSExtensionItem]) async -> String? {
+    for item in items {
+      for attachment in item.attachments ?? []
+      where attachment.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+        if let text = try? await loadText(from: attachment),
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+          return text
+        }
+      }
+    }
+    return nil
+  }
+
+  /// First non-empty line, capped: the book title and the preview label.
+  static func textTitle(_ text: String) -> String {
+    let line = text.split(whereSeparator: \.isNewline)
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .first { !$0.isEmpty }
+    return String((line ?? "").prefix(80))
   }
 
   private func loadURL(from provider: NSItemProvider) async throws -> URL? {
@@ -243,8 +382,7 @@ final class ShareViewController: UIViewController {
 /// in the nav bar. Mirrors the Zotero / Pocket save UX.
 private final class SaveOptionsViewController: UITableViewController {
 
-  private let url: URL
-  private let pageTitle: String?
+  private let content: ShareViewController.SharedContent
   private let groups: [AppGroupBridge.LibraryGroup]
   // nil means "Default" (no group). Initial selection: nil.
   private var selectedGroupId: String?
@@ -252,14 +390,12 @@ private final class SaveOptionsViewController: UITableViewController {
   private let onSave: (AppGroupBridge.LibraryGroup?) -> Void
 
   init(
-    url: URL,
-    pageTitle: String?,
+    content: ShareViewController.SharedContent,
     groups: [AppGroupBridge.LibraryGroup],
     onCancel: @escaping () -> Void,
     onSave: @escaping (AppGroupBridge.LibraryGroup?) -> Void
   ) {
-    self.url = url
-    self.pageTitle = pageTitle
+    self.content = content
     self.groups = groups
     self.onCancel = onCancel
     self.onSave = onSave
@@ -312,7 +448,10 @@ private final class SaveOptionsViewController: UITableViewController {
       let cell =
         tableView.dequeueReusableCell(withIdentifier: URLPreviewCell.reuseId, for: indexPath)
         as! URLPreviewCell
-      cell.configure(url: url, pageTitle: pageTitle)
+      switch content {
+      case .url(let url, let title): cell.configure(url: url, pageTitle: title)
+      case .text(let text): cell.configure(text: text)
+      }
       cell.selectionStyle = .none
       return cell
     }
@@ -408,6 +547,15 @@ private final class URLPreviewCell: UITableViewCell {
     titleLabel.text = pageTitle?.isEmpty == false ? pageTitle : url.absoluteString
     hostLabel.text = host
     loadFavicon(for: url)
+  }
+
+  /// Shared text: its first line as the title, the start of the rest below.
+  func configure(text: String) {
+    let title = ShareViewController.textTitle(text)
+    titleLabel.text = title
+    let rest = text.trimmingCharacters(in: .whitespacesAndNewlines).dropFirst(title.count)
+    hostLabel.text = rest.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    iconView.image = UIImage(systemName: "doc.plaintext")
   }
 
   /// Best-effort favicon at `https://<host>/favicon.ico` with a 2s

@@ -1,5 +1,6 @@
 export type AnnotationToolType =
   | 'copy'
+  | 'copylink'
   | 'highlight'
   | 'annotate'
   | 'search'
@@ -7,4 +8,5 @@ export type AnnotationToolType =
   | 'translate'
   | 'tts'
   | 'proofread'
-  | 'share';
+  | 'share'
+  | 'quotecard';

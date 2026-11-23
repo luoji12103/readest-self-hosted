@@ -6,9 +6,13 @@ import { useDeviceControlStore } from '@/store/deviceStore';
 import { saveSysSettings, saveViewSettings } from '@/helpers/settings';
 import { useResetViewSettings } from '@/hooks/useResetSettings';
 import { eventDispatcher } from '@/utils/event';
+import { useEinkRefreshSupported } from '@/hooks/useEinkRefreshSupported';
 import {
   normalizeNativeKey,
   normalizeDomKeyEvent,
+  formatKeyBindingLabel,
+  isModifierKeyEvent,
+  matchesBinding,
   PAGE_TURN_ACTIONS,
   PageTurnAction,
 } from '@/utils/keybinding';
@@ -28,8 +32,7 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
   const { getViewSettings } = useReaderStore();
-  const { setKeyLearnMode, acquireVolumeKeyInterception, releaseVolumeKeyInterception } =
-    useDeviceControlStore();
+  const { setKeyLearnMode } = useDeviceControlStore();
   const { settings } = useSettingsStore();
   const viewSettings = getViewSettings(bookKey) || settings.globalViewSettings;
   const resetToDefaults = useResetViewSettings();
@@ -40,6 +43,9 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
   configRef.current = config;
   const [listening, setListening] = useState<Slot | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The 'Refresh Page' slot only fires a visible flash where a vendor
+  // full-refresh hook actually exists, so hide it (not just no-op) elsewhere.
+  const einkRefreshSupported = useEinkRefreshSupported();
 
   const persist = (next: HardwarePageTurnerSettings) => {
     setConfig(next);
@@ -64,11 +70,7 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
     const bindings = { ...current.bindings, [slot]: binding };
     // A key can drive only one action — clear it from every other slot.
     for (const other of PAGE_TURN_ACTIONS) {
-      if (
-        other !== slot &&
-        bindings[other]?.source === binding.source &&
-        bindings[other]?.id === binding.id
-      ) {
+      if (other !== slot && matchesBinding(bindings[other], binding)) {
         bindings[other] = null;
       }
     }
@@ -92,17 +94,26 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
       if (event.repeat) return;
       event.preventDefault();
       event.stopImmediatePropagation();
+      if (isModifierKeyEvent(event)) return;
+      captureBinding(listening, normalizeDomKeyEvent(event));
+    };
+    const onDomKeyUp = (event: KeyboardEvent) => {
+      if (!isModifierKeyEvent(event)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
       captureBinding(listening, normalizeDomKeyEvent(event));
     };
 
     setNativeLearnMode(true);
     eventDispatcher.on('native-key-down', onNativeKey);
     window.addEventListener('keydown', onDomKey, true);
+    window.addEventListener('keyup', onDomKeyUp, true);
     timeoutRef.current = setTimeout(stopListening, LEARN_TIMEOUT_MS);
 
     return () => {
       eventDispatcher.off('native-key-down', onNativeKey);
       window.removeEventListener('keydown', onDomKey, true);
+      window.removeEventListener('keyup', onDomKeyUp, true);
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
       setNativeLearnMode(false);
@@ -111,14 +122,9 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
   }, [listening]);
 
   useEffect(() => {
+    // The reader and library pagination hooks own the volume-key interception
+    // and follow this setting; taking it here too left it held (#7119).
     saveViewSettings(envConfig, bookKey, 'volumeKeysToFlip', volumeKeysToFlip, false, false);
-    if (appService?.isMobileApp) {
-      if (volumeKeysToFlip) {
-        acquireVolumeKeyInterception();
-      } else {
-        releaseVolumeKeyInterception();
-      }
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [volumeKeysToFlip]);
 
@@ -145,7 +151,7 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
           {binding && !isListening && (
             <button
               type='button'
-              className='text-base-content/70 hover:text-base-content text-end text-[0.85em] focus:outline-none'
+              className='text-base-content/70 hover:text-base-content text-end text-[0.85em] focus:outline-hidden'
               disabled={!config.enabled}
               aria-label={`${_('Clear')}: ${label}`}
               onClick={() => persist({ ...config, bindings: { ...config.bindings, [slot]: null } })}
@@ -155,13 +161,17 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
           )}
           <button
             type='button'
-            className='text-base-content/70 hover:text-base-content py-1 text-end text-[0.85em] focus:outline-none'
+            className='text-base-content/70 hover:text-base-content py-1 text-end text-[0.85em] focus:outline-hidden'
             disabled={!config.enabled}
             aria-pressed={isListening}
             aria-label={`${label}: ${isListening ? _('Listening…') : _('Set key')}`}
             onClick={() => (isListening ? stopListening() : setListening(slot))}
           >
-            {isListening ? _('Listening…') : binding ? _(binding.label) : _('Set key')}
+            {isListening
+              ? _('Listening…')
+              : binding
+                ? formatKeyBindingLabel(binding, _)
+                : _('Set key')}
           </button>
         </div>
       </SettingsRow>
@@ -169,13 +179,17 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
   };
 
   return (
-    <div className='space-y-2'>
+    <div className='space-y-2' data-shortcut-recording={listening ? 'true' : undefined}>
       <BoxedList
         title={_('Page Turner')}
         data-setting-id='settings.control.pageTurner'
-        description={_(
-          'Press a button on your remote controller or keyboard after tapping "Set key".',
-        )}
+        description={
+          appService?.isIOSApp
+            ? _(
+                'Press a button on your remote controller or keyboard, or use an Apple Pencil gesture, after tapping "Set key".',
+              )
+            : _('Press a button on your remote controller or keyboard after tapping "Set key".')
+        }
       >
         {appService?.isMobileApp && (
           <SettingsSwitchRow
@@ -197,6 +211,7 @@ const PageTurnerSettings: React.FC<PageTurnerSettingsProps> = ({ bookKey, onRegi
             on Android, where the native bridge can drive the panel. */}
         {appService?.isAndroidApp &&
           viewSettings.isEink &&
+          einkRefreshSupported &&
           renderSlot('refresh', _('Refresh Page'))}
       </BoxedList>
     </div>

@@ -15,13 +15,20 @@ vi.mock('@/utils/simplecc', () => ({
   runSimpleCC: vi.fn((text: string, _variant: string) => text),
 }));
 
-vi.mock('@/utils/lang', () => ({
-  detectLanguage: vi.fn(() => 'en'),
-  getLanguageInfo: vi.fn(() => ({ direction: 'ltr' })),
-  isSameLang: vi.fn(() => true),
-  isValidLang: vi.fn(() => true),
-  normalizedLangCode: (lang?: string | null) => (lang ? lang.split('-')[0]!.toLowerCase() : ''),
-}));
+vi.mock('@/utils/lang', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@/utils/lang')>();
+  return {
+    detectLanguage: vi.fn(() => 'en'),
+    getLanguageInfo: vi.fn(() => ({ direction: 'ltr' })),
+    isValidLang: vi.fn(() => true),
+    normalizedLangCode: (lang?: string | null) => (lang ? lang.split('-')[0]!.toLowerCase() : ''),
+    // These decide which language a section ends up tagged with, so stubbing them
+    // would test the stub rather than the transformer.
+    isCJKLang: original.isCJKLang,
+    isCJKStr: original.isCJKStr,
+    isSameLang: original.isSameLang,
+  };
+});
 
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: {
@@ -236,6 +243,54 @@ describe('whitespaceTransformer', () => {
         makeCtx({ content: '', viewSettings: settings }),
       );
       expect(result).toBe('');
+    });
+
+    test('preserves indentation inside <pre>', async () => {
+      const html = '<pre><code>&lt;div&gt;\n    &lt;a/&gt;\n        &lt;b/&gt;\n</code></pre>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe(html);
+    });
+
+    test('preserves spaces inside inline <code>', async () => {
+      const html = '<p>run <code>a    b</code> now</p>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe(html);
+    });
+
+    test('still collapses spaces outside <pre>', async () => {
+      const html = '<p>hello   world</p><pre>  keep  me  </pre><p>a   b</p>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe('<p>hello world</p><pre>  keep  me  </pre><p>a b</p>');
+    });
+
+    test('preserves nbsp entities inside <pre>', async () => {
+      const html = '<pre>a&nbsp;&nbsp;b</pre>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe(html);
+    });
+
+    test('handles <pre> with attributes and uppercase tags', async () => {
+      const html = '<PRE class="x">a    b</PRE>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe(html);
+    });
+
+    test('collapses spaces in text between two <pre> blocks', async () => {
+      const html = '<pre>a    b</pre>x   y<pre>c    d</pre>';
+      const result = await whitespaceTransformer.transform(
+        makeCtx({ content: html, viewSettings: settings }),
+      );
+      expect(result).toBe('<pre>a    b</pre>x y<pre>c    d</pre>');
     });
   });
 
@@ -598,6 +653,34 @@ describe('styleTransformer', () => {
     expect(transformStylesheet).not.toHaveBeenCalled();
   });
 
+  // A `<style media="print">` block should stay print-only: its rules must
+  // never apply to the on-screen paginated rendering. Rewriting the tag
+  // without its original attributes drops the `media` scoping and turns a
+  // print-only rule (e.g. a `.noprint { display: none }` companion to a
+  // `<body class="noprint">`) into a rule that also hides the page on screen
+  // (readest/readest#6233).
+  test('preserves the media attribute on a <style> block', async () => {
+    const html =
+      '<html><head>' +
+      '<style type="text/css" media="print">.noprint { display: none }</style>' +
+      '</head><body class="noprint"></body></html>';
+    const result = await styleTransformer.transform(makeCtx({ content: html }));
+    expect(result).toContain('<style type="text/css" media="print">transformed-css</style>');
+    expect(result).not.toContain('<style>transformed-css</style>');
+  });
+
+  test('preserves attributes across multiple style blocks with different media', async () => {
+    transformStylesheet.mockResolvedValueOnce('screen-css').mockResolvedValueOnce('print-css');
+    const html =
+      '<html><head>' +
+      '<style>.a { margin: 0; }</style>' +
+      '<style media="print">.b { display: none; }</style>' +
+      '</head><body></body></html>';
+    const result = await styleTransformer.transform(makeCtx({ content: html }));
+    expect(result).toContain('<style>screen-css</style>');
+    expect(result).toContain('<style media="print">print-css</style>');
+  });
+
   test('returns empty string unchanged', async () => {
     const result = await styleTransformer.transform(makeCtx({ content: '' }));
     expect(result).toBe('');
@@ -675,6 +758,46 @@ describe('sanitizerTransformer', () => {
     expect(result).toMatch(/^<\?xml version="1\.0" encoding="utf-8"\?>/);
     expect(result).toContain('<!DOCTYPE html');
   });
+
+  const sanitize = async (text: string) => {
+    const html = `<html><head></head><body><p>${text}</p></body></html>`;
+    return sanitizerTransformer.transform(makeCtx({ content: html }));
+  };
+
+  test('converts RLM misused as half-space between Arabic letters to ZWNJ', async () => {
+    // "mi-ravam" written with RLM (U+200F) instead of ZWNJ (U+200C)
+    const result = await sanitize('می\u200Fروم');
+    expect(result).toContain('می\u200Cروم');
+    expect(result).not.toContain('\u200F');
+  });
+
+  test('converts a run of consecutive RLMs between Arabic letters, preserving length', async () => {
+    const result = await sanitize('ا\u200F\u200Fب');
+    expect(result).toContain('ا\u200C\u200Cب');
+    expect(result).not.toContain('\u200F');
+  });
+
+  test('converts RLM after an Arabic letter with a diacritic', async () => {
+    // letter + kasra (U+0650) + RLM + letter
+    const result = await sanitize('بِ\u200Fب');
+    expect(result).toContain('بِ\u200Cب');
+  });
+
+  test('leaves RLM between Arabic-script digits untouched', async () => {
+    // RLM between digits is a live bidi hint that keeps the digit runs
+    // separate; swapping it for ZWNJ would flip their visual order.
+    const persianDigits = await sanitize('۱\u200F۲');
+    expect(persianDigits).toContain('۱\u200F۲');
+    const arabicDigits = await sanitize('١\u200F٢');
+    expect(arabicDigits).toContain('١\u200F٢');
+  });
+
+  test('leaves RLM next to Latin text or at a text boundary untouched', async () => {
+    const latin = await sanitize('abc\u200Fا');
+    expect(latin).toContain('abc\u200Fا');
+    const boundary = await sanitize('\u200Fاب');
+    expect(boundary).toContain('\u200Fاب');
+  });
 });
 
 // =============================================================================
@@ -683,15 +806,17 @@ describe('sanitizerTransformer', () => {
 
 describe('languageTransformer', () => {
   let languageTransformer: typeof import('@/services/transformers/language').languageTransformer;
-  let isSameLang: ReturnType<typeof vi.fn>;
   let isValidLang: ReturnType<typeof vi.fn>;
+  let detectLanguage: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
     const langMod = await import('@/utils/lang');
-    isSameLang = langMod.isSameLang as ReturnType<typeof vi.fn>;
     isValidLang = langMod.isValidLang as ReturnType<typeof vi.fn>;
-    isSameLang.mockClear();
+    detectLanguage = langMod.detectLanguage as ReturnType<typeof vi.fn>;
     isValidLang.mockClear();
+    detectLanguage.mockClear();
+    isValidLang.mockReturnValue(true);
+    detectLanguage.mockReturnValue('en');
     ({ languageTransformer } = await import('@/services/transformers/language'));
   });
 
@@ -701,7 +826,6 @@ describe('languageTransformer', () => {
 
   test('does not modify html tag when language is valid and matches primary', async () => {
     isValidLang.mockReturnValue(true);
-    isSameLang.mockReturnValue(true);
     const html = '<html lang="en" xml:lang="en"><head></head><body>Hello</body></html>';
     const result = await languageTransformer.transform(
       makeCtx({ content: html, primaryLanguage: 'en' }),
@@ -718,6 +842,89 @@ describe('languageTransformer', () => {
     // When isValidLang(primaryLanguage) is false, detectLanguage is called, returning 'en'
     expect(result).toContain('lang="en"');
     expect(result).toContain('xml:lang="en"');
+  });
+
+  test('re-reads the content when a non-CJK lang is paired with a non-CJK primary', async () => {
+    detectLanguage.mockReturnValue('zh');
+    const html =
+      '<html lang="en-US" xml:lang="en-US"><head></head><body><p>这是一段普通的中文正文。</p></body></html>';
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'en' }),
+    );
+    expect(result).toContain('lang="zh"');
+    expect(result).not.toContain('en-US');
+    expect(result).not.toContain('dir=');
+  });
+
+  // Books imported before the primary language was normalized kept the raw tag.
+  test.each([
+    'en-US',
+    'EN',
+    'eng',
+  ])('treats a stored %s primary as the placeholder', async (primaryLanguage) => {
+    detectLanguage.mockReturnValue('zh');
+    const html = `<html lang="${primaryLanguage}"><head></head><body><p>这是一段普通的中文正文。</p></body></html>`;
+    const result = await languageTransformer.transform(makeCtx({ content: html, primaryLanguage }));
+    expect(result).toContain('lang="zh"');
+  });
+
+  test('detects the language of a CJK section only once', async () => {
+    detectLanguage.mockReturnValue('zh');
+    const html = '<html lang="en"><head></head><body><p>这是一段普通的中文正文。</p></body></html>';
+    await languageTransformer.transform(makeCtx({ content: html, primaryLanguage: 'en' }));
+    expect(detectLanguage).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps a primary language that is not the placeholder', async () => {
+    detectLanguage.mockReturnValue('zh');
+    const html =
+      '<html lang="de-DE" xml:lang="de-DE"><head></head><body><p>这是一段普通的中文正文。</p></body></html>';
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'de' }),
+    );
+    expect(result).toBe(html);
+    expect(detectLanguage).not.toHaveBeenCalled();
+  });
+
+  test('only reads the text that detection samples', async () => {
+    detectLanguage.mockReturnValue('zh');
+    const html = `<html lang="en"><head></head><body><p>${'An English sentence. '.repeat(100)}</p><p>中文</p></body></html>`;
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'en' }),
+    );
+    expect(result).toBe(html);
+    expect(detectLanguage).not.toHaveBeenCalled();
+  });
+
+  test('leaves an English book with CJK fragments alone when the content is not CJK', async () => {
+    detectLanguage.mockReturnValue('en');
+    const html =
+      '<html lang="en"><head></head><body><p>Mostly English with a 中文 word or two.</p></body></html>';
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'en' }),
+    );
+    expect(result).toBe(html);
+    expect(detectLanguage).toHaveBeenCalled();
+  });
+
+  test('does not read the content when it carries no CJK characters', async () => {
+    detectLanguage.mockReturnValue('zh');
+    const html = '<html lang="en"><head></head><body><p>An English sentence.</p></body></html>';
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'en' }),
+    );
+    expect(result).toBe(html);
+    expect(detectLanguage).not.toHaveBeenCalled();
+  });
+
+  test('leaves a book whose lang is already CJK alone', async () => {
+    const html =
+      '<html lang="zh-CN" xml:lang="zh-CN"><head></head><body><p>这是一段普通的中文正文。</p></body></html>';
+    const result = await languageTransformer.transform(
+      makeCtx({ content: html, primaryLanguage: 'zh' }),
+    );
+    expect(result).toBe(html);
+    expect(detectLanguage).not.toHaveBeenCalled();
   });
 });
 
@@ -835,6 +1042,32 @@ describe('nbspTransformer', () => {
         makeCtx({ content: html, primaryLanguage: 'ru' }),
       );
       expect(result).toContain(`и${NBSP}в${NBSP}доме`);
+    });
+
+    test('glues a short preposition to a quoted Cyrillic word', async () => {
+      for (const quotedWord of [
+        '«двуручник»',
+        '&laquo;двуручник&raquo;',
+        '&#171;двуручник&#187;',
+        '“двуручник”',
+        '"двуручник"',
+      ]) {
+        const html = `<p>Он смотрел на ${quotedWord}.</p>`;
+        const result = await nbspTransformer.transform(
+          makeCtx({ content: html, primaryLanguage: 'ru' }),
+        );
+        expect(result).toContain(`на${NBSP}${quotedWord}`);
+        expect(result.length).toBe(html.length);
+      }
+    });
+
+    test('does not glue a quoted Latin word or a completed exclamation', async () => {
+      const html = '<p>Он смотрел на «Google». Не! Потом он ушёл.</p>';
+      const result = await nbspTransformer.transform(
+        makeCtx({ content: html, primaryLanguage: 'ru' }),
+      );
+      expect(result).toContain('на «Google»');
+      expect(result).toContain('Не! Потом');
     });
 
     test('does not split a longer word that begins with a short word', async () => {

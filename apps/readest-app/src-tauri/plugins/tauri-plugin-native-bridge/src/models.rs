@@ -5,6 +5,10 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 pub struct AuthRequest {
     pub auth_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -25,6 +29,20 @@ pub struct CopyURIRequest {
 pub struct CopyURIResponse {
     pub success: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPdfCoverRequest {
+    pub file_path: String,
+    pub max_long_edge: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPdfCoverResponse {
+    pub cover_base64: String,
+    pub cover_mime: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -54,9 +72,21 @@ pub struct UseBackgroundAudioRequest {
     pub enabled: bool,
 }
 
+/// Acquire/release the Android WifiManager MulticastLock so LocalSend
+/// discovery announcements are delivered while the service runs.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetTextSelectionSuppressedRequest {
+pub struct MulticastLockRequest {
+    pub acquire: bool,
+}
+
+/// Which piece of the OS selection UI to gate: "gesture" suppresses the
+/// long-press text-selection gesture (iOS, instant highlight), "menu"
+/// suppresses the floating selection toolbar (Android, #5427).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelectionSuppressedRequest {
+    pub target: String,
     pub suppressed: bool,
 }
 
@@ -174,6 +204,9 @@ pub struct IAPFetchProductsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct IAPPurchaseProductRequest {
     pub product_id: String,
+    /// Supabase user id, surfaced by StoreKit as the transaction's
+    /// `appAccountToken` so a purchase can be attributed server-side.
+    pub app_account_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,6 +235,44 @@ pub struct GetSafeAreaInsetsResponse {
     pub bottom: f64,
     pub left: f64,
     pub right: f64,
+    /// Radius (CSS px) of the rounded bottom screen corners; absent where the
+    /// platform does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_corner_radius: Option<f64>,
+    /// Whether the device is an iPhone Duo (foldable); absent off iOS.
+    #[serde(
+        rename = "isIPhoneDuo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_iphone_duo: Option<bool>,
+    /// iOS: whether the root view controller currently hides the status bar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_bar_hidden: Option<bool>,
+    /// iPhone Duo: hinge status and folding region; absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<FoldState>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldState {
+    /// `closed`, `partial`, `open` or `unknown`.
+    pub status: String,
+    /// Whether the folding region currently divides the display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_active: Option<bool>,
+    /// The folding region in window points (CSS px).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<FoldRegion>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FoldRegion {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,13 +283,34 @@ pub struct GetScreenBrightnessResponse {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SetScreenWakeLockRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetScreenBrightnessRequest {
     pub brightness: f64, // 0.0 to 1.0
+    pub persist: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetScreenBrightnessResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HasAmbientLightSensorResponse {
+    pub available: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbientLightUpdatesResponse {
     pub success: bool,
     pub error: Option<String>,
 }
@@ -264,6 +356,35 @@ pub struct OpenExternalUrlResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ShowLookupPopoverRequest {
     pub word: String,
+    /// iOS only. Omitted by older clients to keep the compact presentation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_screen: Option<bool>,
+}
+
+/// Android: an app that handles `ACTION_PROCESS_TEXT`, for the lookup app picker.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LookupApp {
+    pub package_name: String,
+    pub class_name: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLookupAppsResponse {
+    pub apps: Vec<LookupApp>,
+}
+
+/// Android: the app lookups go to; both fields omitted clears the choice.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLookupAppRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -348,6 +469,18 @@ pub struct ClipUrlRequest {
     pub background: Option<String>,
     #[serde(default)]
     pub foreground: Option<String>,
+    /// Interactive mode: show the page with a Cancel/Capture bar instead
+    /// of the opaque overlay so the user can sign in before capturing.
+    #[serde(default)]
+    pub interactive: Option<bool>,
+    #[serde(default)]
+    pub background_capture: Option<bool>,
+    #[serde(default)]
+    pub sign_in_hint: Option<String>,
+    #[serde(default)]
+    pub capture_label: Option<String>,
+    #[serde(default)]
+    pub cancel_label: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -356,6 +489,91 @@ pub struct ClipUrlResponse {
     /// Rendered `document.documentElement.outerHTML` captured from the
     /// hidden WKWebView / WebView once load+settle completed.
     pub html: String,
+}
+
+/// Args for the in-app web browser (#5775). Mirrors `WebBrowserOptions`
+/// in `web_browser.rs` plus the absolute `download_dir` Rust resolved from
+/// `app_cache_dir()` so native downloads land inside the fs scope.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserRequest {
+    pub url: String,
+    pub download_dir: String,
+    pub capture_script: String,
+    #[serde(default)]
+    pub select_image: Option<bool>,
+    #[serde(default)]
+    pub image_selection_script: String,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub foreground: Option<String>,
+    #[serde(default)]
+    pub is_eink: Option<bool>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserResponse {
+    /// Set when the user tapped [Open] on an imported book in the chrome.
+    #[serde(default)]
+    pub open_book_hash: Option<String>,
+    #[serde(default)]
+    pub page: Option<WebBrowserPage>,
+    #[serde(default)]
+    pub image: Option<WebBrowserImage>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserImage {
+    pub url: String,
+    pub page_url: String,
+}
+
+impl WebBrowserImage {
+    /// Selection never transfers page-local data/blob URLs or native schemes.
+    pub fn is_valid(&self) -> bool {
+        [&self.url, &self.page_url].iter().all(|value| {
+            tauri::Url::parse(value).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+            })
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WebBrowserPage {
+    pub url: String,
+    pub html: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserStatusRequest {
+    /// `importing` | `added` | `failed` | `unsupported`
+    pub state: String,
+    pub filename: String,
+    #[serde(default)]
+    pub book_hash: Option<String>,
+}
+
+/// Read (and delete) a page-HTML file the iOS Share Extension captured
+/// from the user's signed-in Safari tab into the App Group container.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadShareClipHtmlRequest {
+    /// Bare file name inside the App Group `SharedClips/` directory —
+    /// never a path; the native side rejects anything with a separator.
+    pub file_name: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadShareClipHtmlResponse {
+    pub html: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -412,31 +630,231 @@ pub struct RefreshEinkScreenResponse {
     pub error: Option<String>,
 }
 
+/// Capability probe for a deep e-ink full refresh. `supported: false` means no
+/// known vendor mechanism is present on this device (e.g. a non-e-ink Android
+/// phone, or a panel we cannot drive), so the UI should not offer the option.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EinkRefreshSupportedResponse {
+    pub supported: bool,
+}
+
+/// `isBoox` is a device-identity check (always available); `rawDrawing` is
+/// true only when this build was compiled against the BOOX Pen SDK (the
+/// `booxPen` Gradle flavor) and the SDK reports it can drive raw drawing on
+/// this device/firmware. JS treats `rawDrawing: false` as "use the generic
+/// pointer backend", regardless of why.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPenCapabilitiesResponse {
+    pub is_boox: bool,
+    pub raw_drawing: bool,
+}
+
+/// Starts (or restarts) BOOX raw drawing over a region of the webview, in CSS
+/// px. Width and color style the SDK's low-latency preview only; the stored
+/// stroke is drawn by the web canvas.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReadingWidgetBook {
+pub struct StartRawDrawingRequest {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+    pub stroke_width: f64,
+    pub stroke_color: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetBook {
     pub hash: String,
     pub title: String,
     pub author: String,
     pub percent: u8,
+    pub show_progress: bool,
     pub cover_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReadingWidgetTts {
+pub struct BookshelfWidgetTts {
     pub active: bool,
     pub playing: bool,
+}
+
+/// Tiles whose thumbnail could not be written, so the caller can retry them.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdateBookshelfWidgetResponse {
+    pub failed: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateBookshelfWidgetRequest {
+    pub app_widget_id: i32,
+    /// The shelf the widget asked for; native shows a placeholder until they match.
+    pub shelf_id: String,
+    /// Grid tiles in display order.
+    pub items: Vec<BookshelfWidgetItem>,
+    pub section_title: String,
+    pub empty_title: String,
+    #[serde(default)]
+    pub tts: Option<BookshelfWidgetTts>,
+}
+
+/// One grid tile: a book, or a group of books (a mosaic of their covers).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BookshelfWidgetItem {
+    Book(BookshelfWidgetBook),
+    Group(BookshelfWidgetGroupTile),
+}
+
+/// A group tile (e.g. groupBy="series", value="Foundation") with up to 4
+/// member-book cover paths for native to composite into a mosaic.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetGroupTile {
+    pub id: String,
+    pub group_by: String,
+    pub value: String,
+    pub cover_paths: Vec<String>,
+}
+
+/// A placed widget, as chosen in its native configure screen.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetInstance {
+    pub app_widget_id: i32,
+    pub shelf_id: String,
+    pub grid_rows: i32,
+    pub grid_columns: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBookshelfWidgetInstancesResponse {
+    pub instances: Vec<BookshelfWidgetInstance>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetCatalogShelf {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetCatalogLabels {
+    pub title: String,
+    pub rows: String,
+    pub columns: String,
+    pub show_titles: String,
+    pub show_shelf_name: String,
+    pub header_size: String,
+    pub show_tts_bar: String,
+    pub cancel: String,
+    pub save: String,
+    pub edit: String,
+    pub open_app: String,
+}
+
+/// What the native configure screen offers, translated by the app.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookshelfWidgetCatalog {
+    pub shelves: Vec<BookshelfWidgetCatalogShelf>,
+    pub labels: BookshelfWidgetCatalogLabels,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateReadingWidgetRequest {
-    pub books: Vec<ReadingWidgetBook>,
-    pub section_title: String,
+    pub app_widget_id: i32,
+    /// Empty means "nothing currently reading".
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub percent: u8,
+    #[serde(default)]
+    pub cover_path: String,
+    /// The text stats to show in order, already localized by JS.
+    #[serde(default)]
+    pub stats: Vec<String>,
+    #[serde(default)]
+    pub header_text: String,
     pub empty_title: String,
     #[serde(default)]
-    pub tts: Option<ReadingWidgetTts>,
+    pub is_eink: bool,
+    #[serde(default)]
+    pub tts: Option<BookshelfWidgetTts>,
+}
+
+/// The cover, if any, that could not be written, so the caller can retry.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdateReadingWidgetResponse {
+    pub failed: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One placed widget instance's display toggles.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingWidgetInstanceSettings {
+    pub app_widget_id: i32,
+    #[serde(default)]
+    pub show_time_left: bool,
+    #[serde(default = "default_true")]
+    pub show_page_count: bool,
+    #[serde(default)]
+    pub show_pages_remaining: bool,
+    #[serde(default = "default_true")]
+    pub show_header: bool,
+    #[serde(default = "default_true")]
+    pub show_percent: bool,
+    #[serde(default)]
+    pub reference_pages: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingWidgetCatalogLabels {
+    pub title: String,
+    pub show_header: String,
+    pub header_size: String,
+    pub show_tts_bar: String,
+    pub reference_pages: String,
+    pub show_percent: String,
+    pub show_time_left: String,
+    pub show_page_count: String,
+    pub show_pages_remaining: String,
+    pub text_size: String,
+    pub cancel: String,
+    pub save: String,
+}
+
+/// What the native configure screen shows, translated by the app.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingWidgetCatalog {
+    pub labels: ReadingWidgetCatalogLabels,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetReadingWidgetInstancesResponse {
+    pub instances: Vec<ReadingWidgetInstanceSettings>,
 }
 
 /// Region of the webview to snapshot for the mesh page-curl (#555),
@@ -458,4 +876,171 @@ pub struct CaptureWebviewRegionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CaptureWebviewRegionResponse {
     pub data: String,
+}
+
+/// Token for the native cover layer put up by `cover_webview_region`
+/// (#6106): the two-column page curl freezes the on-screen pixels of the
+/// incoming column behind it while the column is captured underneath.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverWebviewRegionResponse {
+    pub token: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UncoverWebviewRegionRequest {
+    pub token: u32,
+}
+
+/// iCloud ubiquity-container probe result. `documents_path` is the absolute
+/// path of the container's Documents folder (created on first probe);
+/// `available: false` covers no-iCloud-session, missing entitlement, and
+/// unsupported platforms alike.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ICloudContainerStatusResponse {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ICloudEnsureDownloadedRequest {
+    /// Absolute path inside the ubiquity container.
+    pub path: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ICloudEnsureDownloadedResponse {
+    /// "ready" | "notFound" | "timeout"
+    pub status: String,
+}
+
+/// Native-only cookie exchange for Android, whose Tauri cookie API is unsupported.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebBrowserCookiesRequest {
+    pub url: String,
+    pub set_cookies: Vec<String>,
+}
+#[derive(Debug, Deserialize)]
+pub struct WebBrowserCookiesResponse {
+    pub cookies: String,
+}
+
+/// Android: whether AnkiDroid is installed and Readest may use its provider (#789).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiStatusResponse {
+    pub installed: bool,
+    pub granted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiPermissionResponse {
+    pub granted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiDeck {
+    pub id: i64,
+    pub name: String,
+}
+
+/// `error` is "permission" or "not_ready" when AnkiDroid can't be read.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiListDecksResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decks: Option<Vec<AnkiDeck>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiReadDeckRequest {
+    /// A deck and its subdecks.
+    pub deck_ids: Vec<i64>,
+    pub with_cards: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiNoteRow {
+    pub id: i64,
+    pub fields: Vec<String>,
+    pub tags: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiCardRow {
+    pub note_id: i64,
+    pub card_type: i32,
+    pub interval: i64,
+}
+
+/// `cards` is omitted on AnkiDroid older than 2.24, which has no cards query.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiReadDeckResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<AnkiNoteRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cards: Option<Vec<AnkiCardRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiOutgoingNote {
+    pub fields: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiAddNotesRequest {
+    pub deck_name: String,
+    pub notes: Vec<AnkiOutgoingNote>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiAddNotesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiTagUpdate {
+    pub id: i64,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiUpdateTagsRequest {
+    pub notes: Vec<AnkiTagUpdate>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnkiUpdateTagsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

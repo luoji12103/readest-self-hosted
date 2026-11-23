@@ -76,6 +76,11 @@ type WebSpeechVoice = SpeechSynthesisVoice & {
   id: string;
 };
 
+// How long to wait for 'voiceschanged' before giving up on the voice list.
+// Chrome populates it asynchronously on first call, so some wait is required;
+// a platform with no voices at all never fires the event.
+const WEB_SPEECH_VOICES_TIMEOUT_MS = 2000;
+
 export class WebSpeechClient implements TTSClient {
   name = 'web-speech';
   initialized = false;
@@ -100,7 +105,11 @@ export class WebSpeechClient implements TTSClient {
       return this.initialized;
     }
     await new Promise<void>((resolve) => {
+      let settled = false;
       const populateVoices = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         this.#voices = this.#synth.getVoices().map((voice) => {
           const webSpeechVoice = voice as WebSpeechVoice;
           webSpeechVoice.id = voice.voiceURI || voice.name;
@@ -110,13 +119,24 @@ export class WebSpeechClient implements TTSClient {
         resolve();
       };
 
+      // A platform with no speech voices installed (a bare Linux desktop with
+      // no speech-dispatcher, headless Chromium) reports an empty voice list
+      // and never fires 'voiceschanged'. Waiting forever wedges the whole of
+      // TTSController.init(), which takes every other engine down with it —
+      // including recorded narration, which needs no system voice at all.
+      const timer = setTimeout(() => {
+        if (settled) return;
+        console.warn('[TTS] no Web Speech voices reported; continuing without them');
+        populateVoices();
+      }, WEB_SPEECH_VOICES_TIMEOUT_MS);
+
       if (this.#synth.getVoices().length > 0) {
         populateVoices();
       } else if (this.#synth.onvoiceschanged !== undefined) {
         this.#synth.onvoiceschanged = populateVoices;
       } else {
         console.warn('Voiceschanged event not supported.');
-        resolve();
+        populateVoices();
       }
     });
     this.initialized = true;
@@ -223,21 +243,32 @@ export class WebSpeechClient implements TTSClient {
 
   async getVoices(lang: string) {
     const locale = lang === 'en' ? getUserLocale(lang) || lang : lang;
-    const isValidVoice = (id: string) => {
-      return !id.includes('com.apple') || id.includes('com.apple.voice.compact');
-    };
     const isNotBlacklisted = (voice: SpeechSynthesisVoice) => {
-      return WEB_SPEECH_BLACKLISTED_VOICES.some((name) => voice.name.includes(name)) === false;
+      return (
+        !voice.voiceURI.startsWith('com.apple.eloquence.') &&
+        !voice.voiceURI.startsWith('com.apple.speech.synthesis.voice.') &&
+        !WEB_SPEECH_BLACKLISTED_VOICES.some((name) => voice.name.includes(name))
+      );
     };
     // Match by primary language so the voice set stays the same across a book
     // whose sections mix region variants (e.g. en-US front matter and en-GB
     // body text); the requested locale's voices sort first. See #4033.
     const filteredVoices = this.#voices
       .filter((voice) => isSameLang(voice.lang, lang))
-      .filter((voice) => isValidVoice(voice.voiceURI || ''))
       .filter(isNotBlacklisted);
+    const availableVoiceIds = new Set(filteredVoices.map((voice) => voice.voiceURI));
     const seenIds = new Set<string>();
     const voices = filteredVoices
+      // Keep compact voices as a fallback when no higher-quality variant is installed.
+      .filter((voice) => {
+        const compactPrefix = 'com.apple.voice.compact.';
+        if (!voice.voiceURI.startsWith(compactPrefix)) return true;
+        const voiceSuffix = voice.voiceURI.slice(compactPrefix.length);
+        return (
+          !availableVoiceIds.has(`com.apple.voice.enhanced.${voiceSuffix}`) &&
+          !availableVoiceIds.has(`com.apple.voice.premium.${voiceSuffix}`)
+        );
+      })
       .map(
         (voice) =>
           ({
@@ -260,6 +291,7 @@ export class WebSpeechClient implements TTSClient {
     const voicesGroup: TTSVoicesGroup = {
       id: 'web-speech-api',
       name: 'Web TTS',
+      engine: this.name,
       voices: voices.sort(TTSUtils.sortVoicesPreferLocaleFunc(locale)),
       disabled: !this.initialized || voices.length === 0,
     };

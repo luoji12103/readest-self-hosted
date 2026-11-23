@@ -1,3 +1,5 @@
+import type { InkStroke } from '@/services/handwriting/model';
+import type { CrossPointAnchor } from '@/types/book';
 export interface DBBook {
   user_id: string;
   book_hash: string;
@@ -5,17 +7,21 @@ export interface DBBook {
   format: string;
   title: string;
   source_title?: string;
+  original_filename?: string | null;
   author: string;
   group_id?: string;
   group_name?: string;
+  group_updated_at?: string | null;
   tags?: string[];
-  progress?: [number, number];
+  progress?: [number, number] | null;
   reading_status?: string;
   reading_status_updated_at?: string | null;
   cover_hash?: string | null;
   cover_updated_at?: string | null;
+  page_count?: number | null;
 
   metadata?: string | null;
+  metadata_updated_at?: string | null;
   created_at?: string;
   updated_at?: string;
   deleted_at?: string | null;
@@ -32,6 +38,8 @@ export interface DBBookConfig {
   rsvp_position?: string;
   search_config?: string;
   view_settings?: string;
+  /** JSON of BookConfig.ttsPacks; merged as a union on the server. */
+  tts_packs?: string;
 
   created_at?: string;
   updated_at?: string;
@@ -45,14 +53,18 @@ export interface DBBookNote {
   id: string;
   type: string;
   cfi?: string;
-  xpointer0?: string;
-  xpointer1?: string;
+  xpointer0?: string | null;
+  xpointer1?: string | null;
   page?: number;
   text?: string;
   style?: string;
   color?: string;
   note: string;
   global?: boolean;
+  /** Handwriting strokes of an `ink` note; null for every other type. */
+  ink?: InkStroke[] | null;
+  /** Where a CrossPoint reader anchors the highlight; null until one is known. */
+  crosspoint?: CrossPointAnchor | null;
 
   created_at?: string;
   updated_at?: string;

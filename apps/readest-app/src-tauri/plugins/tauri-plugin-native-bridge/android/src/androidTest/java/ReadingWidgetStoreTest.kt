@@ -1,49 +1,68 @@
 package com.readest.native_bridge
 
+import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 
-/**
- * Instrumented test (runs on an Android device/emulator).
- *
- * Regression for the widget cover crash: a cover that decodes to exactly 2:3
- * makes the center-crop a no-op, so Bitmap.createBitmap returns the SAME
- * immutable instance as the source. The pre-fix code recycled the source right
- * after, then passed the now-recycled bitmap to createScaledBitmap, throwing
- * "cannot use a recycled source in createBitmap" and killing the app.
- */
+/** Instrumented tests for the reading widget cover writer (run via connectedAndroidTest). */
 @RunWith(AndroidJUnit4::class)
 class ReadingWidgetStoreTest {
+    private val ctx: Context
+        get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    private fun writeCoverPng(name: String): File {
+        val bitmap = Bitmap.createBitmap(240, 360, Bitmap.Config.ARGB_8888)
+        val file = File(ctx.cacheDir, name)
+        file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        bitmap.recycle()
+        return file
+    }
+
     @Test
-    fun writeThumbnail_exact2to3Cover_doesNotCrash() {
-        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+    fun writeCover_skipsTheReencodeUntilTheSourceIsNewer() {
+        val hash = "reading-cover-skip"
+        val src = writeCoverPng("$hash-src.png")
+        val dst = File(ReadingWidgetStore.coversDir(ctx), "$hash.png")
+        dst.delete()
 
-        // 240x360 is exactly 2:3 and small enough to skip downsampling, so the
-        // decoded cover hits the createBitmap same-instance path.
-        val src = Bitmap.createBitmap(240, 360, Bitmap.Config.ARGB_8888)
-        val srcFile = File(ctx.cacheDir, "widget-cover-2x3.png")
-        srcFile.outputStream().use { src.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        src.recycle()
+        assertTrue(ReadingWidgetStore.writeCover(ctx, hash, src.absolutePath))
+        assertTrue(dst.exists())
 
-        val hash = "regression2x3"
-        try {
-            // Pre-fix: throws IllegalArgumentException. Post-fix: writes the PNG.
-            ReadingWidgetStore.writeThumbnail(ctx, hash, srcFile.absolutePath, 42)
+        // A newer PNG than the source is reused, not rewritten.
+        val marker = src.lastModified() + 10_000
+        assertTrue(dst.setLastModified(marker))
+        assertTrue(ReadingWidgetStore.writeCover(ctx, hash, src.absolutePath))
+        assertEquals(marker, dst.lastModified())
 
-            val out = File(ReadingWidgetStore.coversDir(ctx), "$hash.png")
-            assertTrue("thumbnail should be written", out.exists())
-            val decoded = BitmapFactory.decodeFile(out.absolutePath)
-            assertNotNull("thumbnail should decode to a valid bitmap", decoded)
-            out.delete()
-        } finally {
-            srcFile.delete()
-        }
+        // A source touched after the PNG forces a rewrite.
+        assertTrue(src.setLastModified(marker + 10_000))
+        assertTrue(ReadingWidgetStore.writeCover(ctx, hash, src.absolutePath))
+        assertTrue(dst.lastModified() != marker)
+    }
+
+    @Test
+    fun writeCover_failsAndDropsTheStalePngWhenTheSourceIsGone() {
+        val hash = "reading-cover-gone"
+        val src = writeCoverPng("$hash-src.png")
+        assertTrue(ReadingWidgetStore.writeCover(ctx, hash, src.absolutePath))
+        src.delete()
+
+        assertFalse(ReadingWidgetStore.writeCover(ctx, hash, src.absolutePath))
+        assertFalse(File(ReadingWidgetStore.coversDir(ctx), "$hash.png").exists())
+    }
+
+    @Test
+    fun instanceSettings_defaultToRemainingTimeAndPagesOff() {
+        val defaults = ReadingWidgetStore.readInstanceSettings(ctx, appWidgetId = -12345)
+        assertFalse(defaults.showTimeLeft)
+        assertFalse(defaults.showPagesRemaining)
+        assertTrue(defaults.showPercent && defaults.showPageCount && defaults.showHeader)
     }
 }

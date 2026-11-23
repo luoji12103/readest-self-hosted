@@ -33,6 +33,7 @@ const mockManager = vi.hoisted(() => {
         state: string;
         pause: ReturnType<typeof vi.fn>;
         start: ReturnType<typeof vi.fn>;
+        resume?: ReturnType<typeof vi.fn>;
       };
     } | null = null;
     sleepTimer: { timeoutSec: number; firesAt: number } | null = null;
@@ -58,13 +59,15 @@ vi.mock('@/services/tts', () => ({
 import { eventDispatcher } from '@/utils/event';
 import NowPlayingBar from '@/app/library/components/NowPlayingBar';
 
-const makeSession = (state = 'playing') => ({
+const makeSession = (state = 'playing', kind: 'tts' | 'audiobook' = 'tts') => ({
   bookHash: 'hashA',
   bookKey: 'hashA-r1',
   controller: {
+    kind,
     state,
     pause: vi.fn().mockResolvedValue(true),
     start: vi.fn().mockResolvedValue(undefined),
+    resume: vi.fn().mockResolvedValue(undefined),
   },
 });
 
@@ -109,6 +112,26 @@ describe('NowPlayingBar', () => {
     expect(navigateToReader).not.toHaveBeenCalled();
   });
 
+  // #7048: Play after a mid-sentence pause continues in place instead of
+  // re-reading the sentence; other paused flavours still restart.
+  test('play resumes a mid-sentence pause in place', () => {
+    const session = makeSession('paused');
+    mockManager.session = session;
+    render(<NowPlayingBar isSelectMode={false} />);
+    fireEvent.click(screen.getByLabelText('Play'));
+    expect(session.controller.resume).toHaveBeenCalled();
+    expect(session.controller.start).not.toHaveBeenCalled();
+  });
+
+  test('play restarts after a non-resumable pause', () => {
+    const session = makeSession('forward-paused');
+    mockManager.session = session;
+    render(<NowPlayingBar isSelectMode={false} />);
+    fireEvent.click(screen.getByLabelText('Play'));
+    expect(session.controller.start).toHaveBeenCalled();
+    expect(session.controller.resume).not.toHaveBeenCalled();
+  });
+
   test('glyph follows the relayed tts-playback-state channel', async () => {
     mockManager.session = makeSession('playing');
     render(<NowPlayingBar isSelectMode={false} />);
@@ -135,6 +158,14 @@ describe('NowPlayingBar', () => {
     render(<NowPlayingBar isSelectMode={false} />);
     fireEvent.click(screen.getByText('Alice in Wonderland'));
     expect(navigateToReader).toHaveBeenCalledWith(expect.anything(), ['hashA']);
+  });
+
+  test('tapping the body routes an audiobook session to the player instead of the reader', () => {
+    mockManager.session = makeSession('playing', 'audiobook');
+    render(<NowPlayingBar isSelectMode={false} />);
+    fireEvent.click(screen.getByText('Alice in Wonderland'));
+    expect(pushMock).toHaveBeenCalledWith('/player?id=hashA');
+    expect(navigateToReader).not.toHaveBeenCalled();
   });
 
   test('disappears when the manager reports the session stopped', () => {

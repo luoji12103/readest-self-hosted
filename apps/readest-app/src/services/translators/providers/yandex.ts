@@ -3,81 +3,383 @@ import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { isTauriAppPlatform } from '@/services/environment';
 import { normalizeToShortLang } from '@/utils/lang';
 import { TranslationProvider } from '../types';
+import { splitTextIntoSentenceChunks } from '../utils';
+import { YANDEX_REQUEST_HEADERS, YANDEX_SESSION_URL, YANDEX_TRANSLATE_URL } from './yandexShared';
+import { initSimpleCC, runSimpleCC } from '@/utils/simplecc';
 
 /**
- * Based on https://translate.toil.cc/v2/docs API specification
+ * Direct client for the Yandex Translate web API — the same endpoints the
+ * translate.yandex.ru frontend uses (protocol reverse-engineered by the
+ * FOSWLY/translate project). No relay server or API key required.
+ *
+ * Constraints:
+ * - the API rejects texts longer than ~650 chars with 413 "The text size
+ *   exceeds the maximum" (verified empirically — the FOSWLY docs claiming
+ *   10k are outdated), so longer texts are split into chunks;
+ * - the session endpoint validates the Referer header. In the Tauri app we
+ *   send it directly; in web builds the browser cannot spoof it cross-origin,
+ *   so requests go through the same-origin proxy at /api/yandex-translate,
+ *   which attaches the headers server-side.
  */
-async function translateSingleTextForService(
-  text: string,
-  lang: string,
-  service: string,
-): Promise<string[]> {
-  const fetchImpl = isTauriAppPlatform() ? tauriFetch : window.fetch;
-  const url = 'https://translate.toil.cc/v2/translate/';
+const MAX_CHARS_PER_REQUEST = 600;
+const MAX_CONCURRENT_REQUESTS = 3;
+// Yandex cuts longer sentences mid-clause; such sentences are pre-split at clauses.
+const MAX_CHARS_PER_SENTENCE = 250;
+// Reserve two requests for initial and refreshed sessions, and account for
+// every translate chunk potentially retrying once with the refreshed SID.
+const MAX_TRANSLATE_REQUESTS_PER_CALL = 29;
+const TRANSPORT_TIMEOUT_MS = 15_000;
+// The web proxy answers 429 once a user exceeds its per-minute budget; such chunks wait
+// for the Retry-After delay and go out again instead of failing the whole paragraph.
+const MAX_RATE_LIMIT_RETRIES = 3;
+const DEFAULT_RETRY_AFTER_MS = 5_000;
+const MAX_RETRY_AFTER_MS = 60_000;
+const PROXY_URL = '/api/yandex-translate';
 
-  const request = {
-    method: 'POST',
+interface YandexSession {
+  id: string;
+  expiresAt: number;
+}
+
+interface RequestWaiter {
+  start: () => void;
+  abort: () => void;
+}
+
+let cachedSession: YandexSession | null = null;
+// Concurrent translate() calls must not race to create several sessions,
+// so the in-flight creation is shared between callers.
+let sessionPromise: Promise<string> | null = null;
+let activeRequests = 0;
+const requestQueue: RequestWaiter[] = [];
+
+function releaseRequestSlot() {
+  const waiter = requestQueue.shift();
+  if (waiter) {
+    // Transfer the occupied slot directly. Keeping activeRequests unchanged
+    // makes the handoff atomic with respect to fresh callers.
+    waiter.start();
+  } else {
+    activeRequests--;
+  }
+}
+
+async function withRequestLimit<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  if (activeRequests < MAX_CONCURRENT_REQUESTS) {
+    activeRequests++;
+  } else {
+    await new Promise<void>((resolve, reject) => {
+      const waiter: RequestWaiter = {
+        start: () => {
+          signal?.removeEventListener('abort', waiter.abort);
+          resolve();
+        },
+        abort: () => {
+          const index = requestQueue.indexOf(waiter);
+          if (index >= 0) requestQueue.splice(index, 1);
+          reject(signal?.reason);
+        },
+      };
+      requestQueue.push(waiter);
+      signal?.addEventListener('abort', waiter.abort, { once: true });
+    });
+  }
+
+  try {
+    signal?.throwIfAborted();
+    return await task();
+  } finally {
+    releaseRequestSlot();
+  }
+}
+
+const getRequestTarget = (endpoint: 'session' | 'translate', token?: string | null) => {
+  if (isTauriAppPlatform()) {
+    return {
+      fetchImpl: tauriFetch,
+      url: endpoint === 'session' ? YANDEX_SESSION_URL : YANDEX_TRANSLATE_URL,
+      headers: YANDEX_REQUEST_HEADERS,
+      direct: true,
+    };
+  }
+  if (!token) {
+    throw new Error('yandex translate requires authentication in web builds');
+  }
+  return {
+    fetchImpl: window.fetch.bind(window),
+    url: `${PROXY_URL}?endpoint=${endpoint}`,
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({
-      lang: lang,
-      service: service,
-      text: text,
-    }),
+    direct: false,
   };
+};
 
-  const response = await fetchImpl(url, request);
+const withParams = (base: string, params: URLSearchParams) =>
+  `${base}${base.includes('?') ? '&' : '?'}${params}`;
 
-  if (!response.ok) {
-    const response_json = JSON.stringify(await response.json());
-    throw new Error(
-      `${service} failed with status ${response.status}\n${text.length}\n${JSON.stringify(request)}\n${response_json}`,
+async function withRequestSignal<T>(
+  direct: boolean,
+  signal: AbortSignal | undefined,
+  request: (signal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!direct) return request(signal);
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException('Translation request timed out', 'TimeoutError')),
+    TRANSPORT_TIMEOUT_MS,
+  );
+  try {
+    // Keep cancellation active through body consumption, then detach it so
+    // later timeouts/caller aborts cannot reach completed native resources.
+    return await request(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+const retryAfterMs = (response: Response) => {
+  const header = response.headers.get('Retry-After');
+  const seconds = header ? Number(header) : Number.NaN;
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+  // Retry-After may also be an HTTP-date.
+  const delayMs = (header ? Date.parse(header) : Number.NaN) - Date.now();
+  return Number.isFinite(delayMs) && delayMs >= 0
+    ? Math.min(delayMs, MAX_RETRY_AFTER_MS)
+    : DEFAULT_RETRY_AFTER_MS;
+};
+
+const wait = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    signal?.throwIfAborted();
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+
+// yu — random Yandex UID, yum — Metrika timestamp in microseconds
+const genYandexUID = () => BigInt(Math.floor(Math.random() * 1e19)).toString();
+const genYandexMetrikaUID = () => (Date.now() * 1e6).toString();
+
+const baseParams = () => ({
+  srv: 'tr-text',
+  yu: genYandexUID(),
+  yum: genYandexMetrikaUID(),
+});
+
+async function createSession(token?: string | null): Promise<string> {
+  const { fetchImpl, url, headers, direct } = getRequestTarget('session', token);
+  const params = new URLSearchParams(baseParams());
+  const data = await withRequestSignal(direct, undefined, async (signal) => {
+    const response = await withRequestLimit(
+      () => fetchImpl(withParams(url, params), { method: 'POST', headers, signal }),
+      signal,
+    );
+    if (!response.ok) {
+      // Drain the native response before releasing its cancellation deadline.
+      await response.text().catch(() => {});
+      throw new Error(`yandex session request failed with status ${response.status}`);
+    }
+    return response.json();
+  });
+  const session = data?.session;
+  if (
+    typeof session?.id !== 'string' ||
+    !session.id ||
+    !Number.isFinite(session.creationTimestamp) ||
+    session.creationTimestamp <= 0 ||
+    !Number.isFinite(session.maxAge) ||
+    session.maxAge <= 0
+  ) {
+    throw new Error('yandex session request failed: malformed response');
+  }
+  cachedSession = {
+    id: session.id,
+    expiresAt: (session.creationTimestamp + session.maxAge) * 1000,
+  };
+  return session.id;
+}
+
+async function getSession(token?: string | null, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  if (cachedSession && cachedSession.expiresAt > Date.now()) {
+    return cachedSession.id;
+  }
+  sessionPromise ??= createSession(token).finally(() => {
+    sessionPromise = null;
+  });
+  if (!signal) return sessionPromise;
+
+  return new Promise<string>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    sessionPromise!.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', abort);
+    });
+  });
+}
+
+async function translateChunk(
+  text: string,
+  sourceLang: string,
+  targetLang: string,
+  token?: string | null,
+  signal?: AbortSignal,
+  retrySession = true,
+  rateLimitRetries = MAX_RATE_LIMIT_RETRIES,
+): Promise<string> {
+  signal?.throwIfAborted();
+  const sid = await getSession(token, signal);
+  const params = new URLSearchParams({
+    ...baseParams(),
+    sid: `${sid}-5-0`,
+    target_lang: targetLang,
+    reason: 'paste',
+    format: 'text',
+    strategy: '0',
+    disable_cache: 'false',
+    ajax: '1',
+  });
+  if (sourceLang) params.set('source_lang', sourceLang);
+  const body = new URLSearchParams([
+    ['options', '0'],
+    ['text', text],
+  ]);
+
+  const { fetchImpl, url, headers, direct } = getRequestTarget('translate', token);
+  const { response, data } = await withRequestSignal(direct, signal, async (transportSignal) => {
+    const response = await withRequestLimit(
+      () =>
+        fetchImpl(withParams(url, params), {
+          method: 'POST',
+          headers,
+          body: body.toString(),
+          signal: transportSignal,
+        }),
+      transportSignal,
+    );
+    const data = await response.json().catch(() => null);
+    return { response, data };
+  });
+  if (response.status === 429 && rateLimitRetries > 0) {
+    // The request slot and transport deadline are already released here, so waiting
+    // neither blocks other chunks nor counts against the request timeout.
+    await wait(retryAfterMs(response), signal);
+    return translateChunk(
+      text,
+      sourceLang,
+      targetLang,
+      token,
+      signal,
+      retrySession,
+      rateLimitRetries - 1,
     );
   }
-
-  const data = await response.json();
-  if (data && Array.isArray(data.translations)) {
-    return data.translations;
-  } else {
-    // fallback: return original texts if translation failed
-    return [text];
+  if (response.ok && !data) {
+    throw new Error('yandex translate failed: malformed response');
   }
+  const errorCode = typeof data?.code === 'number' ? data.code : null;
+  if (!response.ok || errorCode !== 200 || data?.message) {
+    // Proxy transport errors use { error } without a Yandex `code`; they must
+    // not invalidate a healthy SID or trigger a futile retry.
+    const sessionInvalid = errorCode === 401 || errorCode === 403;
+    if (sessionInvalid && cachedSession?.id === sid) cachedSession = null;
+    if (sessionInvalid && retrySession) {
+      return translateChunk(text, sourceLang, targetLang, token, signal, false, rateLimitRetries);
+    }
+    throw new Error(
+      `yandex translate failed with status ${response.status}: ${data?.message ?? data?.error ?? 'unknown error'}`,
+    );
+  }
+  if (!Array.isArray(data.text) || !data.text.every((item: unknown) => typeof item === 'string')) {
+    throw new Error('yandex translate failed: malformed response');
+  }
+  return data.text.join('');
 }
 
 export const yandexProvider: TranslationProvider = {
   name: 'yandex',
   label: _('Yandex Translate'),
-  authRequired: false,
-  // The upstream translate.toil.cc relay is currently down. Keep the
-  // implementation in tree so we can re-enable it simply by flipping this
-  // flag to `false` (or deleting the line) once the service is healthy.
-  disabled: true,
-  translate: async (texts: string[], sourceLang: string, targetLang: string): Promise<string[]> => {
+  get authRequired() {
+    return !isTauriAppPlatform();
+  },
+  translate: async (
+    texts: string[],
+    sourceLang: string,
+    targetLang: string,
+    token?: string | null,
+    _useCache?: boolean,
+    signal?: AbortSignal,
+  ): Promise<string[]> => {
     if (!texts.length) return [];
 
-    /**
-      Possible options:
-      - yandexcloud: often returns 500: {"error":"The text couldn't be translated, because Forbidden"}
-      - yandexgpt: often better than others
-      - yandextranslate
-      - yandexbrowser
-    */
-    const service = 'yandexgpt';
-
-    // Yandex does not accept "auto" language
-    const source_lang =
-      sourceLang == 'AUTO' ? 'en' : normalizeToShortLang(sourceLang).toLowerCase();
-    const target_lang = normalizeToShortLang(targetLang).toLowerCase();
-    const lang = `${source_lang}-${target_lang}`;
-
-    const responses = await Promise.all(
-      texts.map(async (text) => {
-        return await translateSingleTextForService(text, lang, service);
-      }),
+    const normalizeLang = (lang: string) => {
+      const normalized = normalizeToShortLang(lang).toLowerCase();
+      return normalized === 'zh' || normalized.startsWith('zh-') ? 'zh' : normalized;
+    };
+    // The classic Yandex endpoint auto-detects only when source_lang is absent;
+    // passing source_lang=auto is rejected as "Invalid parameter: source_lang".
+    const source_lang = sourceLang === 'AUTO' ? '' : normalizeLang(sourceLang);
+    const target_lang = normalizeLang(targetLang);
+    const chunkedTexts = texts.map((text) =>
+      splitTextIntoSentenceChunks(text, MAX_CHARS_PER_REQUEST, MAX_CHARS_PER_SENTENCE),
     );
+    const chunkCount = chunkedTexts.reduce((total, chunks) => total + chunks.length, 0);
+    if (chunkCount > MAX_TRANSLATE_REQUESTS_PER_CALL) {
+      throw new Error(
+        `yandex translate request requires ${chunkCount} chunks; maximum is ${MAX_TRANSLATE_REQUESTS_PER_CALL}`,
+      );
+    }
 
-    const translatedTexts = responses.flat();
-    return translatedTexts;
+    const results = new Array<string>(texts.length);
+    const jobs = chunkedTexts.flatMap((chunks, textIndex) =>
+      chunks.map((chunk, chunkIndex) => ({ chunk, chunkIndex, textIndex })),
+    );
+    const translatedChunks = chunkedTexts.map((chunks) => new Array<string>(chunks.length));
+    let nextJob = 0;
+    const worker = async () => {
+      while (nextJob < jobs.length) {
+        signal?.throwIfAborted();
+        const job = jobs[nextJob++]!;
+        translatedChunks[job.textIndex]![job.chunkIndex] = await translateChunk(
+          job.chunk,
+          source_lang,
+          target_lang,
+          token,
+          signal,
+        );
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MAX_CONCURRENT_REQUESTS, jobs.length) }, () => worker()),
+    );
+    translatedChunks.forEach((chunks, index) => {
+      results[index] = chunks.join('');
+    });
+
+    // Yandex only speaks `zh`, and it is Simplified: `normalizeLang` above
+    // collapses every zh variant onto it, so a zh-TW/zh-HK/zh-MO reader was
+    // handed Simplified text labelled as their language. Convert the reply
+    // locally instead -- unlike DeepL, there is no target code to ask for.
+    if (normalizeToShortLang(targetLang) === 'zh-Hant') {
+      await initSimpleCC();
+      return results.map((text) => (text ? runSimpleCC(text, 's2t') : text));
+    }
+
+    return results;
   },
 };

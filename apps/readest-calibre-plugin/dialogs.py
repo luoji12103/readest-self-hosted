@@ -22,7 +22,17 @@ from calibre.gui2 import error_dialog, open_url
 
 from calibre_plugins.readest.api import ReadestAPIError
 from calibre_plugins.readest.oauth import PROVIDERS, OAuthCallbackServer, build_authorize_url
-from calibre_plugins.readest.worker import STATUS_LABELS, PushWorker
+from calibre_plugins.readest.worker import (
+    CHECK_LABELS,
+    STATUS_LABELS,
+    PushWorker,
+    StatusWorker,
+)
+
+try:
+    load_translations()
+except NameError:
+    pass
 
 OAUTH_WAIT_SECONDS = 300
 
@@ -53,7 +63,7 @@ class LoginDialog(QDialog):
         self.oauth_server = None
         self.oauth_waiter = None
 
-        self.setWindowTitle('Log in to Readest')
+        self.setWindowTitle(_('Log in to Readest'))
         layout = QVBoxLayout()
         self.setLayout(layout)
 
@@ -61,19 +71,19 @@ class LoginDialog(QDialog):
         self.email_edit = QLineEdit(self)
         self.password_edit = QLineEdit(self)
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow('Email:', self.email_edit)
-        form.addRow('Password:', self.password_edit)
+        form.addRow(_('Email:'), self.email_edit)
+        form.addRow(_('Password:'), self.password_edit)
         layout.addLayout(form)
 
-        self.login_btn = QPushButton('Log in', self)
+        self.login_btn = QPushButton(_('Log in'), self)
         self.login_btn.clicked.connect(self.password_login)
         layout.addWidget(self.login_btn)
 
-        layout.addWidget(QLabel('Or sign in with your browser:'))
+        layout.addWidget(QLabel(_('Or sign in with your browser:')))
         providers_layout = QHBoxLayout()
         for provider in PROVIDERS:
             btn = QPushButton(provider.capitalize(), self)
-            btn.clicked.connect(lambda _=False, p=provider: self.oauth_login(p))
+            btn.clicked.connect(lambda checked=False, p=provider: self.oauth_login(p))
             providers_layout.addWidget(btn)
         layout.addLayout(providers_layout)
 
@@ -89,14 +99,14 @@ class LoginDialog(QDialog):
         email = self.email_edit.text().strip()
         password = self.password_edit.text()
         if not email or not password:
-            self.status_label.setText('Please enter both email and password.')
+            self.status_label.setText(_('Please enter both email and password.'))
             return
-        self.status_label.setText('Logging in…')
+        self.status_label.setText(_('Logging in…'))
         self.login_btn.setEnabled(False)
         try:
             self.user = self.client.sign_in_password(email, password)
         except ReadestAPIError as err:
-            self.status_label.setText('Login failed: %s' % err)
+            self.status_label.setText(_('Login failed: %s') % err)
             self.login_btn.setEnabled(True)
             return
         self.accept()
@@ -108,26 +118,27 @@ class LoginDialog(QDialog):
         self.oauth_waiter = _OAuthWaiter(self, self.oauth_server)
         self.oauth_waiter.got_tokens.connect(self.oauth_finished)
         self.oauth_waiter.timed_out.connect(
-            lambda: self.status_label.setText('Browser login timed out. Try again.')
+            lambda: self.status_label.setText(_('Browser login timed out. Try again.'))
         )
         self.oauth_waiter.start()
-        self.status_label.setText('Waiting for the browser login to complete…')
+        self.status_label.setText(_('Waiting for the browser login to complete…'))
         open_url(QUrl(build_authorize_url(self.client.supabase_url, provider, port)))
 
     def oauth_finished(self, tokens):
         if tokens.get('error'):
             self.status_label.setText(
-                'Login failed: %s' % (tokens.get('error_description') or tokens['error'])
+                _('Login failed: %s')
+                % (tokens.get('error_description') or tokens['error'])
             )
             return
         if not tokens.get('access_token') or not tokens.get('refresh_token'):
-            self.status_label.setText('Login failed: the browser callback carried no session.')
+            self.status_label.setText(_('Login failed: the browser callback carried no session.'))
             return
         self.client.set_session(tokens)
         try:
             self.user = self.client.get_user()
         except ReadestAPIError as err:
-            self.status_label.setText('Login failed: %s' % err)
+            self.status_label.setText(_('Login failed: %s') % err)
             return
         self.accept()
 
@@ -152,33 +163,37 @@ class LoginDialog(QDialog):
         QDialog.done(self, result)
 
 
-class PushDialog(QDialog):
-    """Per-book status table for a push run, modeled on BookFusion's sync log."""
+class _RunDialog(QDialog):
+    """Per-book status table for one worker run, modeled on BookFusion's sync log."""
+
+    worker_class = None
+    title = ''
+    labels = {}
+    failure_title = ''
+
+    def heading(self, count):
+        """Heading line for a run over `count` books (translated plural)."""
+        return ''
 
     def __init__(self, parent, db, book_ids, client, include_custom_columns):
         QDialog.__init__(self, parent)
         self.db = db
-        self.worker = PushWorker(self, db, book_ids, client, include_custom_columns)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.book_status.connect(self.on_book_status)
-        self.worker.done.connect(self.on_done)
+        self.marks = {}
 
-        self.setWindowTitle('Push to Readest')
+        self.setWindowTitle(self.title)
         self.setMinimumSize(520, 380)
         layout = QVBoxLayout()
         self.setLayout(layout)
 
         count = len(book_ids)
-        layout.addWidget(
-            QLabel('Pushing %d %s to your Readest library…' % (count, _plural(count)))
-        )
+        layout.addWidget(QLabel(self.heading(count)))
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, count)
         layout.addWidget(self.progress_bar)
 
         self.table = QTableWidget(0, 3, self)
-        self.table.setHorizontalHeaderLabels(['Book', 'Status', 'Details'])
+        self.table.setHorizontalHeaderLabels([_('Book'), _('Status'), _('Details')])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 220)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -192,17 +207,21 @@ class PushDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
+        self.worker = self.worker_class(self, db, book_ids, client, include_custom_columns)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.book_status.connect(self.on_book_status)
+        self.worker.done.connect(self.on_done)
         self.worker.start()
 
     def on_progress(self, done, total):
         self.progress_bar.setValue(done)
 
     def on_book_status(self, book_id, status, detail):
-        title = self.db.field_for('title', book_id) or 'Unknown'
+        title = self.db.field_for('title', book_id) or _('Unknown')
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(title))
-        self.table.setItem(row, 1, QTableWidgetItem(STATUS_LABELS.get(status, status)))
+        self.table.setItem(row, 1, QTableWidgetItem(self.labels.get(status, status)))
         self.table.setItem(row, 2, QTableWidgetItem(detail))
         self.table.scrollToBottom()
 
@@ -210,16 +229,43 @@ class PushDialog(QDialog):
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.summary_label.setText(message)
         self.buttons.setStandardButtons(QDialogButtonBox.StandardButton.Close)
+        # Read on the GUI thread once the worker is finished, so ui.py can
+        # apply them to the library view.
+        self.marks = dict(self.worker.marks)
         if not ok and self.table.rowCount() == 0:
-            error_dialog(self, 'Push to Readest failed', message, show=True)
+            error_dialog(self, self.failure_title, message, show=True)
 
     def reject(self):
         if self.worker.isRunning():
             self.worker.cancel()
-            self.summary_label.setText('Canceling…')
+            self.summary_label.setText(_('Canceling…'))
             return
         QDialog.reject(self)
 
 
-def _plural(count):
-    return 'book' if count == 1 else 'books'
+class PushDialog(_RunDialog):
+    worker_class = PushWorker
+    title = _('Push to Readest')
+    labels = STATUS_LABELS
+    failure_title = _('Push to Readest failed')
+
+    def heading(self, count):
+        return ngettext(
+            'Pushing %d book to your Readest library…',
+            'Pushing %d books to your Readest library…',
+            count,
+        ) % count
+
+
+class StatusDialog(_RunDialog):
+    worker_class = StatusWorker
+    title = _('Readest status')
+    labels = CHECK_LABELS
+    failure_title = _('Readest status check failed')
+
+    def heading(self, count):
+        return ngettext(
+            'Checking %d book against your Readest library…',
+            'Checking %d books against your Readest library…',
+            count,
+        ) % count

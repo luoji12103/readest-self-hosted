@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock dependencies before importing the module under test
-vi.mock('foliate-js/opds.js', () => ({
+vi.mock('foliate-js/opds.js', async (importOriginal) => ({
+  ...((await importOriginal()) as object),
   isOPDSCatalog: vi.fn((type: string) => {
     return (
       type.includes('application/opds+json') ||
@@ -44,11 +45,13 @@ vi.mock('@/app/opds/utils/opdsReq', () => ({
   fetchWithAuth: vi.fn(),
 }));
 
+import { getOpenSearch } from 'foliate-js/opds.js';
 import {
   groupByArray,
   parseMediaType,
   isSearchLink,
   expandOPDSSearchTemplate,
+  normalizeOpenSearchTemplates,
   resolveURL,
   getFileExtFromPath,
   getSafeDOMParserMimeType,
@@ -60,7 +63,7 @@ import {
   getUnaddedPopularCatalogs,
   formatContributorName,
 } from '@/app/opds/utils/opdsUtils';
-import type { OPDSBaseLink, OPDSCatalog } from '@/types/opds';
+import type { OPDSBaseLink, OPDSCatalog, OPDSSearch } from '@/types/opds';
 import { fetchWithAuth } from '@/app/opds/utils/opdsReq';
 
 const mockFetchWithAuth = vi.mocked(fetchWithAuth);
@@ -328,6 +331,61 @@ describe('opdsUtils', () => {
     });
   });
 
+  describe('normalizeOpenSearchTemplates', () => {
+    const openSearchDoc = (template: string): Document =>
+      new DOMParser().parseFromString(
+        `<?xml version="1.0" encoding="UTF-8"?>
+         <OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+           <ShortName>Calibre</ShortName>
+           <Url type="application/atom+xml;profile=opds-catalog" template="${template}"/>
+         </OpenSearchDescription>`,
+        'application/xml',
+      );
+
+    const searchFor = (template: string, term: string) => {
+      const search = getOpenSearch(normalizeOpenSearchTemplates(openSearchDoc(template))) as
+        | OPDSSearch
+        | undefined;
+      return {
+        params: search?.params.map((param) => param.name) ?? [],
+        url: search?.search(new Map([[undefined, new Map([['searchTerms', term]])]])),
+      };
+    };
+
+    // readest issue #5500: a Nextcloud-hosted Calibre2OPDS catalog publishes its
+    // OpenSearch template with the placeholder braces percent-encoded, so the
+    // literal `{searchTerms}` reached the server instead of the typed term.
+    it('substitutes a percent-encoded {searchTerms} placeholder', () => {
+      expect(searchFor('https://cal/opds/search?query=%7BsearchTerms%7D', 'Prime')).toEqual({
+        params: ['searchTerms'],
+        url: 'https://cal/opds/search?query=Prime',
+      });
+    });
+
+    it('substitutes lowercase percent-encoded braces', () => {
+      expect(searchFor('https://cal/opds/search?query=%7bsearchTerms%7d', 'Prime')).toEqual({
+        params: ['searchTerms'],
+        url: 'https://cal/opds/search?query=Prime',
+      });
+    });
+
+    it('leaves a template with literal braces working', () => {
+      expect(searchFor('https://cal/opds/search?query={searchTerms}', 'Prime')).toEqual({
+        params: ['searchTerms'],
+        url: 'https://cal/opds/search?query=Prime',
+      });
+    });
+
+    it('keeps percent escapes other than braces intact', () => {
+      expect(
+        searchFor('https://cal/opds/search?path=a%2Fb&amp;query=%7BsearchTerms%7D', 'Prime'),
+      ).toEqual({
+        params: ['searchTerms'],
+        url: 'https://cal/opds/search?path=a%2Fb&query=Prime',
+      });
+    });
+  });
+
   describe('resolveURL', () => {
     it('should resolve an absolute URL relative to a base URL', () => {
       const result = resolveURL('/feed/new', 'https://example.com/opds');
@@ -374,6 +432,36 @@ describe('opdsUtils', () => {
       const result = resolveURL('feed.xml?page=2', '/opds/catalog/');
       // The function strips search params for non-scheme relativeTo
       expect(result).not.toContain('page=2');
+    });
+
+    // bookserver.mek.oszk.hu (readest issue #5300) serves its catalog over HTTPS
+    // but publishes absolute `http://` links to itself; its plain-HTTP vhost
+    // 301-redirects to an unrelated host that 404s, so every sub-feed failed.
+    it('should keep same-host links on https when the feed was fetched over https', () => {
+      const result = resolveURL(
+        'http://bookserver.mek.oszk.hu/abcrend.atom',
+        'https://bookserver.mek.oszk.hu/',
+      );
+      expect(result).toBe('https://bookserver.mek.oszk.hu/abcrend.atom');
+    });
+
+    it('should upgrade same-host links behind the proxy base too', () => {
+      const proxyBase = '/api/opds/proxy?url=https%3A%2F%2Fexample.com%2Fopds';
+      expect(resolveURL('http://example.com/feed/new', proxyBase)).toBe(
+        'https://example.com/feed/new',
+      );
+    });
+
+    it('should leave cross-host http links untouched', () => {
+      expect(resolveURL('http://other.com/feed', 'https://example.com/opds')).toBe(
+        'http://other.com/feed',
+      );
+    });
+
+    it('should not upgrade when the feed itself was fetched over http', () => {
+      expect(resolveURL('http://example.com/feed', 'http://example.com/opds')).toBe(
+        'http://example.com/feed',
+      );
     });
   });
 
@@ -765,7 +853,7 @@ describe('opdsUtils', () => {
         headers: new Headers(),
       } as Response);
 
-      await validateOPDSURL('https://example.com/opds', 'user', 'pass', true, customHeaders);
+      await validateOPDSURL('https://example.com/opds', 'user', 'pass', true, customHeaders, true);
 
       expect(mockFetchWithAuth).toHaveBeenCalledWith(
         'https://example.com/opds',
@@ -774,6 +862,7 @@ describe('opdsUtils', () => {
         true,
         expect.objectContaining({ signal: expect.anything() }),
         customHeaders,
+        true,
       );
     });
   });

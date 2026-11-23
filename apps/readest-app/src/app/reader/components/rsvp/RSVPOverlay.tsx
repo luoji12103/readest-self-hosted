@@ -1,10 +1,10 @@
 'use client';
 
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import clsx from 'clsx';
 import { Insets } from '@/types/misc';
 import { RsvpState, RSVPController } from '@/services/rsvp';
-import { containsCJK, isRTLText } from '@/services/rsvp/utils';
+import { containsCJK, isRTLText, splitAtFocus } from '@/services/rsvp/utils';
 import { useThemeStore } from '@/store/themeStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { TOCItem } from '@/libs/document';
@@ -30,6 +30,8 @@ import { getPopupPosition, Position } from '@/utils/sel';
 import { Overlay } from '@/components/Overlay';
 import DictionarySheet from '@/app/reader/components/annotator/DictionarySheet';
 import DictionaryPopup from '@/app/reader/components/annotator/DictionaryPopup';
+import type { VocabularyCapture } from '@/app/reader/components/annotator/DictionaryResultsView';
+import { sentenceAt } from '@/services/vocabulary/sentence';
 import TTSFollowIndicator, { TtsSyncStatus } from '@/app/reader/components/tts/TTSFollowIndicator';
 import { Toggle } from '@/components/primitives/toggle';
 
@@ -89,10 +91,87 @@ const CONTEXT_WINDOW_AFTER = 1000;
 // 0.5–3.0 range the TTS panel slider clamps to, in 0.25 steps.
 const TTS_RATE_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0];
 
+// Nudge used by the -/+ pair inside the WPM dropdown (#5820). The transport
+// buttons, the swipe and the arrow keys keep the coarse 50 WPM step; the
+// presets below the field jump by 50 too, so this is the only fine control.
+const WPM_FINE_STEP = 10;
+
 // Dictionary lookup popup sizing (mirrors the reader's Annotator popup).
 const DICT_POPUP_PADDING = 10;
 const DICT_POPUP_MAX_WIDTH = 480;
 const DICT_POPUP_MAX_HEIGHT = 360;
+
+interface WpmEntryProps {
+  controller: RSVPController;
+  wpm: number;
+  bgColor: string;
+}
+
+// Exact entry + fine nudge at the top of the WPM dropdown (#5820): the presets
+// jump by 50, too coarse to settle on e.g. 325 WPM from a phone. Sticky so it
+// stays reachable while the list scrolls under it. The typed draft lives here
+// so it dies with the dropdown instead of resurfacing the next time it opens.
+const WpmEntry: React.FC<WpmEntryProps> = ({ controller, wpm, bgColor }) => {
+  const _ = useTranslation();
+  // Text of the field while it is being typed into; null shows the live wpm.
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const commitDraft = () => {
+    if (draft === null) return;
+    // setWpm clamps to the supported range; an emptied field just falls back
+    // to the current speed.
+    if (draft !== '') controller.setWpm(parseInt(draft, 10));
+    setDraft(null);
+  };
+
+  return (
+    <div
+      className='sticky top-0 z-10 flex items-center justify-between gap-1 border-b border-gray-500/20 px-2 py-1.5'
+      style={{ backgroundColor: bgColor }}
+    >
+      <button
+        aria-label={_('Decrease speed')}
+        className='flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border-none bg-transparent transition-colors hover:bg-gray-500/20 active:scale-95'
+        onClick={() => controller.setWpm(wpm - WPM_FINE_STEP)}
+      >
+        <IoRemove className='h-4 w-4' />
+      </button>
+      <input
+        type='text'
+        inputMode='numeric'
+        enterKeyHint='done'
+        aria-label={_('Words per minute')}
+        value={draft ?? String(wpm)}
+        className='eink-bordered w-14 rounded-md border border-gray-500/20 bg-gray-500/10 px-1 py-0.5 text-center text-sm font-semibold tabular-nums focus:outline-hidden'
+        onFocus={(e) => e.target.select()}
+        onChange={(e) => {
+          if (/^\d*$/.test(e.target.value)) setDraft(e.target.value);
+        }}
+        onBlur={commitDraft}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur();
+          else if (e.key === 'Escape') setDraft(null);
+        }}
+      />
+      <button
+        aria-label={_('Increase speed')}
+        className='flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border-none bg-transparent transition-colors hover:bg-gray-500/20 active:scale-95'
+        onClick={() => controller.setWpm(wpm + WPM_FINE_STEP)}
+      >
+        <IoAdd className='h-4 w-4' />
+      </button>
+    </div>
+  );
+};
+
+// The sentence a looked-up word sits in; the bare word if the range can't be read.
+const sentenceAround = (range: Range, word: string): string => {
+  try {
+    return sentenceAt(range) || word;
+  } catch {
+    return word;
+  }
+};
 
 interface RSVPOverlayProps {
   gridInsets: Insets;
@@ -130,6 +209,8 @@ interface RSVPOverlayProps {
   onRequestNextPage: () => void;
   /** Opens the dictionary management settings from the lookup header gear. */
   onManageDictionary?: () => void;
+  /** The book lookups are saved under in the vocabulary builder (#789). */
+  vocabularyBook?: { lang: string; hash?: string; title?: string; author?: string };
 }
 
 const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
@@ -139,6 +220,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
   currentChapterHref,
   fontFamily,
   lang,
+  vocabularyBook,
   ttsSyncStatus = 'idle',
   estimated = false,
   ttsActive = false,
@@ -226,6 +308,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
     word: string;
     position: Position;
     trianglePosition: Position;
+    capture?: VocabularyCapture;
   } | null>(null);
   const touchStartX = useRef(0);
   const touchStartY = useRef(0);
@@ -287,6 +370,10 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
       // Dictionary management (settings dialog) opens OVER RSVP; let it own the
       // keyboard so its inputs accept space and Escape closes it, not RSVP.
       if (isSettingsDialogOpen) return;
+      // A focused text field (the WPM entry in the speed dropdown) owns its
+      // keystrokes: arrows move the caret, Space/digits type, Escape discards
+      // the draft. The reader's own shortcuts already ignore inputs.
+      if (event.target instanceof HTMLInputElement && event.target.type === 'text') return;
 
       switch (event.key) {
         case ' ':
@@ -348,16 +435,30 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
   const effectiveChapterHref = currentChapterHref;
 
   // Word display helpers
-  const wordBefore = currentWord ? currentWord.text.substring(0, currentWord.orpIndex) : '';
-  const orpChar = currentWord ? currentWord.text.charAt(currentWord.orpIndex) : '';
-  const wordAfter = currentWord ? currentWord.text.substring(currentWord.orpIndex + 1) : '';
+  const {
+    before: wordBefore,
+    focus: orpChar,
+    after: wordAfter,
+  } = currentWord
+    ? splitAtFocus(currentWord.text, currentWord.orpIndex)
+    : { before: '', focus: '', after: '' };
   const isCJKWord = currentWord ? containsCJK(currentWord.text) : false;
   // RTL words (Arabic, Hebrew, …) must never be split into before/orp/after
   // spans: slicing by character index breaks letter shaping and reverses the
   // visual order. Render them whole instead, like CJK Highlight Word (#4630).
   const isRTLWord = currentWord ? isRTLText(currentWord.text) : false;
+  const isWholeWord = isRTLWord || (isCJKWord && highlightWholeWord);
   const wordLetterSpacing = undefined;
-  const wordSideOffset = isCJKWord ? '0.45em' : '0.3em';
+  // The before/after text sits half a focus letter away from the center. A
+  // focus cluster of several code points (Bengali কি, ন্তু) is wider than one
+  // letter, so measure it instead of overlapping the text after it (#7024).
+  const orpRef = useRef<HTMLSpanElement>(null);
+  const [clusterSideOffset, setClusterSideOffset] = useState<string | null>(null);
+  useLayoutEffect(() => {
+    const width = orpChar.length > 1 ? orpRef.current?.offsetWidth : undefined;
+    setClusterSideOffset(width ? `${width / 2}px` : null);
+  }, [orpChar, isWholeWord, fontSizeIndex, fontFamily]);
+  const wordSideOffset = clusterSideOffset ?? (isCJKWord ? '0.45em' : '0.3em');
 
   // Time remaining calculation
   const getTimeRemaining = useCallback((): string | null => {
@@ -587,9 +688,19 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
       DICT_POPUP_PADDING,
     );
 
-    setDict({ word: lookup.text, position, trianglePosition });
+    const capture: VocabularyCapture | undefined = vocabularyBook && {
+      lang: vocabularyBook.lang,
+      occurrence: {
+        sentence: sentenceAround(lookup.range, lookup.text),
+        bookHash: vocabularyBook.hash,
+        bookTitle: vocabularyBook.title,
+        bookAuthor: vocabularyBook.author,
+        at: Date.now(),
+      },
+    };
+    setDict({ word: lookup.text, position, trianglePosition, capture });
     setLookup(null);
-  }, [lookup, state.playing, controller]);
+  }, [lookup, state.playing, controller, vocabularyBook]);
 
   const closeLookup = useCallback(() => {
     setDict(null);
@@ -685,11 +796,17 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
   return (
     <div
       data-testid='rsvp-overlay'
+      data-capture-blocking-overlay='true'
       aria-label={_('Speed Reading')}
       className='fixed inset-0 z-[100] flex select-none flex-col'
       style={{
         paddingTop: `${gridInsets.top}px`,
         paddingBottom: `${gridInsets.bottom * 0.33}px`,
+        // Physical (not logical) padding: in landscape the notch and rounded
+        // corners sit on a fixed side of the device, so these must not flip
+        // with the book's reading direction.
+        paddingLeft: `${gridInsets.left}px`,
+        paddingRight: `${gridInsets.right}px`,
         backgroundColor: bgColor,
         color: fgColor,
         backdropFilter: 'none',
@@ -808,9 +925,11 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
             <>
               <Overlay onDismiss={() => setShowWpmDropdown(false)} />
               <div
+                data-testid='rsvp-wpm-dropdown'
                 className='absolute end-0 top-full z-[100] mt-1.5 max-h-64 min-w-[7rem] overflow-y-auto rounded-2xl border border-gray-500/20 shadow-2xl'
                 style={{ backgroundColor: bgColor }}
               >
+                <WpmEntry controller={controller} wpm={state.wpm} bgColor={bgColor} />
                 {controller.getWpmOptions().map((wpm) => (
                   <button
                     key={wpm}
@@ -977,7 +1096,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
                 }}
               >
                 {currentWord ? (
-                  isRTLWord || (isCJKWord && highlightWholeWord) ? (
+                  isWholeWord ? (
                     // Whole-word mode: center the full word and color it, instead
                     // of anchoring a single focus character. Used for CJK Highlight
                     // Word and always for RTL words, whose shaping/order would
@@ -999,6 +1118,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
                         {wordBefore}
                       </span>
                       <span
+                        ref={orpRef}
                         className='rsvp-word-orp relative z-10 font-bold'
                         style={{ color: effectiveOrpColor }}
                       >
@@ -1050,7 +1170,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
             aria-valuenow={Math.round(state.progress)}
             aria-valuemin={0}
             aria-valuemax={100}
-            className='relative h-2 cursor-pointer overflow-visible rounded bg-gray-500/30'
+            className='relative h-2 cursor-pointer overflow-visible rounded-sm bg-gray-500/30'
             // touch-action: none keeps mobile browsers from claiming the
             // gesture for scroll/pan, which would fire pointercancel and
             // break the drag-to-seek pointer capture mid-gesture.
@@ -1068,11 +1188,11 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
             title={_('Drag to seek')}
           >
             <div
-              className={`absolute left-0 top-0 h-full rounded ${isProgressBarDragging ? '' : 'transition-[width] duration-100'}`}
+              className={`absolute left-0 top-0 h-full rounded-sm ${isProgressBarDragging ? '' : 'transition-[width] duration-100'}`}
               style={{ width: `${state.progress}%`, backgroundColor: accentColor }}
             />
             <div
-              className={`absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full shadow ${isProgressBarDragging ? '' : 'transition-[left] duration-100'}`}
+              className={`absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full shadow-sm ${isProgressBarDragging ? '' : 'transition-[left] duration-100'}`}
               style={{ left: `${state.progress}%`, backgroundColor: accentColor }}
             />
           </div>
@@ -1207,7 +1327,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
             <label className='flex cursor-pointer items-center gap-1.5 font-medium opacity-80'>
               <span className='mr-0.5 font-medium opacity-50'>{_('Punctuation Delay')}</span>
               <select
-                className='cursor-pointer rounded border border-gray-500/30 bg-gray-500/20 px-1.5 py-1 text-xs font-medium transition-colors hover:border-gray-500/40 hover:bg-gray-500/30'
+                className='cursor-pointer rounded-sm border border-gray-500/30 bg-gray-500/20 px-1.5 py-1 text-xs font-medium transition-colors hover:border-gray-500/40 hover:bg-gray-500/30'
                 style={{ color: 'inherit' }}
                 value={state.punctuationPauseMs}
                 onChange={(e) => controller.setPunctuationPause(parseInt(e.target.value, 10))}
@@ -1225,7 +1345,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
               <span className='mr-0.5 font-medium opacity-50'>{_('Start Delay')}</span>
               <select
                 data-testid='rsvp-start-delay-select'
-                className='cursor-pointer rounded border border-gray-500/30 bg-gray-500/20 px-1.5 py-1 text-xs font-medium transition-colors hover:border-gray-500/40 hover:bg-gray-500/30'
+                className='cursor-pointer rounded-sm border border-gray-500/30 bg-gray-500/20 px-1.5 py-1 text-xs font-medium transition-colors hover:border-gray-500/40 hover:bg-gray-500/30'
                 style={{ color: 'inherit' }}
                 value={state.startDelaySeconds}
                 onChange={(e) => controller.setStartDelay(parseInt(e.target.value, 10))}
@@ -1342,6 +1462,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
           <DictionarySheet
             word={dict.word}
             lang={lang}
+            capture={dict.capture}
             onDismiss={closeLookup}
             onManage={onManageDictionary}
           />
@@ -1353,6 +1474,7 @@ const RSVPOverlay: React.FC<RSVPOverlayProps> = ({
             <DictionaryPopup
               word={dict.word}
               lang={lang}
+              capture={dict.capture}
               position={dict.position}
               trianglePosition={dict.trianglePosition}
               popupWidth={Math.min(

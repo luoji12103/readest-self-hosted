@@ -10,6 +10,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { debounce } from '@/utils/debounce';
 import { eventDispatcher } from '@/utils/event';
 import type { BookNote } from '@/types/book';
+import { recordFlow } from '@/services/sync/dataFlow/log';
 import { FileSyncEngine } from '@/services/sync/file/engine';
 import { FileSyncError } from '@/services/sync/file/provider';
 import { createAppLocalStore } from '@/services/sync/file/appLocalStore';
@@ -55,8 +56,9 @@ import { useWindowActiveChanged } from './useWindowActiveChanged';
  * one result would silently drop whichever mirror lost the race.
  *
  * Energy budget — these constants are deliberately tuned for mobile:
- *   - Push debounce: 15 s. Real reading sessions involve continuous page-turns,
- *     so a longer window collapses many turns into one PUT.
+ *   - Push debounce: 5 s. Long enough to collapse a swipe burst into one PUT,
+ *     short enough that an ordinary page-turn cadence (well over 5 s per page)
+ *     still publishes each position instead of resetting the timer forever.
  *   - Pull cooldown: 60 s. Window focus shouldn't trigger a fresh fetch on every
  *     alt-tab; once a minute is plenty for cross-device drift.
  *   - Open-pull skip: 30 s. Quickly closing/reopening a book shouldn't re-fetch
@@ -69,8 +71,16 @@ import { useWindowActiveChanged } from './useWindowActiveChanged';
  *   - 'prompt': not implemented — falls back to 'silent'
  */
 
-/** Debounce window for auto-push triggered by progress / booknote churn. */
-const PUSH_DEBOUNCE_MS = 15_000;
+/**
+ * Debounce window for auto-push triggered by progress / booknote churn.
+ *
+ * Trailing-only: every page turn restarts the timer, so the window is the
+ * longest a position can sit unpublished during a reading pause. At 15 s a
+ * steady reader kept resetting it and their position reached the other device
+ * minutes late, or not until the book was closed (#5883). 5 s matches KOSync's
+ * push debounce and sits between Readest Cloud's 3 s and the old value.
+ */
+const PUSH_DEBOUNCE_MS = 5_000;
 /** Minimum gap between automatic pulls (e.g. window-focus, open-book). */
 const PULL_COOLDOWN_MS = 60_000;
 /**
@@ -91,6 +101,13 @@ export const remoteProgressApplied = (
   localLocation: string | null | undefined,
   mergedLocation: string | null | undefined,
 ): boolean => !!mergedLocation && mergedLocation !== localLocation;
+
+const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+// A book's config file carries its progress and notes together, so one sync
+// is one entry, shown as progress unless this backend syncs notes alone.
+const flowOf = (connector: FileSyncBackendKind, wantProgress: boolean) =>
+  ({ connector, kind: wantProgress ? 'progress' : 'notes' }) as const;
 
 export const useFileSync = (bookKey: string) => {
   const _ = useTranslation();
@@ -207,6 +224,9 @@ export const useFileSync = (bookKey: string) => {
           case 'onedrive':
             next = { ...next, onedrive: { ...next.onedrive, lastSyncedAt: ts } };
             break;
+          case 'icloud':
+            next = { ...next, icloud: { ...next.icloud, lastSyncedAt: ts } };
+            break;
         }
       }
       setSettings(next);
@@ -311,11 +331,18 @@ export const useFileSync = (bookKey: string) => {
       if (!wantProgress && !wantNotes) continue;
       try {
         await engine.pushBookConfig(book, config, ensureDeviceId(kind));
+        recordFlow({ ...flowOf(kind, wantProgress), direction: 'push', bookTitle: book.title });
         // This backend's session is proven live — clear its own expired-auth
         // notice without touching a sibling's (still-expired) one.
         authNotifiedRef.current.delete(kind);
         pushedKinds.push(kind);
       } catch (e) {
+        recordFlow({
+          ...flowOf(kind, wantProgress),
+          direction: 'push',
+          bookTitle: book.title,
+          error: describeError(e),
+        });
         handleSyncError(kind, 'file sync push failed', e);
       }
     }
@@ -354,9 +381,23 @@ export const useFileSync = (bookKey: string) => {
       try {
         const result = await engine.pushBookFile(book);
         if (result.uploaded) uploadedKinds.push(kind);
+        recordFlow({
+          connector: kind,
+          direction: 'push',
+          kind: 'books',
+          bookTitle: book.title,
+          count: result.uploaded ? 1 : 0,
+        });
       } catch (e) {
         // Reset this backend's lock so a later trigger retries it.
         fileSyncedRef.current.delete(kind);
+        recordFlow({
+          connector: kind,
+          direction: 'push',
+          kind: 'books',
+          bookTitle: book.title,
+          error: describeError(e),
+        });
         handleSyncError(kind, 'file sync book push failed', e);
       }
     }
@@ -431,6 +472,12 @@ export const useFileSync = (bookKey: string) => {
       const before = working;
       try {
         const result = await engine.pullBookConfig(book, working);
+        recordFlow({
+          ...flowOf(kind, wantProgress),
+          direction: 'pull',
+          bookTitle: book.title,
+          count: result.changed ? 1 : 0,
+        });
         lastPulledAtRef.current = Date.now();
         // This backend's getAccessToken succeeded — clear its own
         // expired-session notice without touching a sibling's.
@@ -456,6 +503,12 @@ export const useFileSync = (bookKey: string) => {
         }
         working = merged;
       } catch (e) {
+        recordFlow({
+          ...flowOf(kind, wantProgress),
+          direction: 'pull',
+          bookTitle: book.title,
+          error: describeError(e),
+        });
         handleSyncError(kind, 'file sync pull failed', e);
       }
     }
@@ -472,9 +525,9 @@ export const useFileSync = (bookKey: string) => {
       const previousById = new Map((config.booknotes ?? []).map((n) => [n.id, n]));
       for (const note of mergedNotes) {
         const prev = previousById.get(note.id);
-        if (note.deletedAt && (!prev || !prev.deletedAt)) {
+        if (note.type === 'annotation' && note.deletedAt && (!prev || !prev.deletedAt)) {
           getViewsById(bookKey.split('-')[0]!).forEach((v) => removeBookNoteOverlays(v, note));
-        } else if (!note.deletedAt && note.cfi && view) {
+        } else if (note.type === 'annotation' && !note.deletedAt && note.cfi && view) {
           try {
             view.addAnnotation(note);
           } catch {
@@ -485,15 +538,29 @@ export const useFileSync = (bookKey: string) => {
     }
 
     setConfig(bookKey, working);
-    // Parity with the native cloud sync: surface the same top-right hint when a
-    // remote reading position was fetched and applied. `working` is already
-    // masked per backend, so this is false when every pulling backend opted
-    // out of progress.
+    // Parity with the native cloud sync (and KOSync): a merged remote position
+    // has to move the LIVE view, not just the stored config. Writing the config
+    // alone left the reader on the old page until the book was closed and
+    // reopened, while the hint below already claimed the progress had been
+    // applied (#5883). `working` is masked per backend, so this is skipped when
+    // every pulling backend opted out of progress.
     if (remoteProgressApplied(config.location, working.location)) {
-      eventDispatcher.dispatch('hint', {
-        bookKey,
-        message: _('Reading Progress Synced'),
-      });
+      const view = getView(bookKey);
+      // Don't yank the view while previewing a deep-link target — the user came
+      // here to look at a specific annotation. The merged config is already
+      // stored, so the next open resolves to the synced position normally.
+      const previewing = useReaderStore.getState().getViewState(bookKey)?.previewMode;
+      if (view && !previewing) {
+        // `view.goTo` swallows its own resolution failures, so an unresolvable
+        // remote CFI leaves the reader where it is instead of throwing here.
+        await view.goTo(working.location!);
+        // Announce only once the position is actually on screen, so the hint
+        // never lies about what the user is looking at.
+        eventDispatcher.dispatch('hint', {
+          bookKey,
+          message: _('Reading Progress Synced'),
+        });
+      }
     }
     const latest = getConfig(bookKey);
     if (latest) await saveConfig(envConfig, bookKey, latest, settings);

@@ -8,6 +8,7 @@ CREATE TABLE public.books (
   format text NULL,
   title text NULL,
   source_title text NULL,
+  original_filename text NULL,
   author text NULL,
   "group" text NULL,
   tags text[] NULL,
@@ -21,8 +22,11 @@ CREATE TABLE public.books (
   reading_status_updated_at timestamp with time zone NULL,
   cover_hash text NULL,
   cover_updated_at timestamp with time zone NULL,
+  metadata_updated_at timestamp with time zone NULL,
   group_id text NULL,
   group_name text NULL,
+  group_updated_at timestamp with time zone NULL,
+  page_count integer NULL,
   metadata json NULL,
   CONSTRAINT books_pkey PRIMARY KEY (user_id, book_hash),
   CONSTRAINT books_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users (id) ON DELETE CASCADE
@@ -65,6 +69,7 @@ CREATE TABLE public.book_configs (
   rsvp_position text NULL,
   search_config jsonb NULL,
   view_settings jsonb NULL,
+  tts_packs jsonb NULL,
   created_at timestamp with time zone NULL DEFAULT now(),
   updated_at timestamp with time zone NULL DEFAULT now(),
   deleted_at timestamp with time zone NULL,
@@ -93,6 +98,8 @@ CREATE TABLE public.book_notes (
   note text NULL,
   page integer NULL,
   global boolean NULL,
+  ink jsonb NULL,
+  crosspoint jsonb NULL,
   created_at timestamp with time zone NULL DEFAULT now(),
   updated_at timestamp with time zone NULL DEFAULT now(),
   deleted_at timestamp with time zone NULL,
@@ -117,6 +124,7 @@ CREATE TABLE public.files (
   deleted_at timestamp with time zone NULL,
   CONSTRAINT files_pkey PRIMARY KEY (id),
   CONSTRAINT files_file_key_key UNIQUE (file_key),
+  CONSTRAINT files_file_size_nonnegative CHECK (file_size >= 0),
   CONSTRAINT files_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users (id) ON DELETE CASCADE
 );
 
@@ -133,4 +141,4 @@ CREATE POLICY files_delete ON public.files FOR DELETE USING (auth.uid() = user_i
 GRANT ALL ON public.books TO authenticated;
 GRANT ALL ON public.book_configs TO authenticated;
 GRANT ALL ON public.book_notes TO authenticated;
-GRANT ALL ON public.files TO authenticated;
+GRANT SELECT ON public.files TO authenticated;

@@ -1,6 +1,7 @@
 import { AppService } from '@/types/system';
 import { READEST_NODE_BASE_URL, READEST_WEB_BASE_URL } from './constants';
 import { getRuntimeConfig } from './runtimeConfig';
+import { getOSPlatform } from '@/utils/misc';
 
 declare global {
   interface Window {
@@ -20,6 +21,17 @@ export const getBaseUrl = () =>
 export const getNodeBaseUrl = () =>
   process.env['NEXT_PUBLIC_NODE_BASE_URL'] ?? READEST_NODE_BASE_URL;
 
+/**
+ * Whether window move/resize has to be driven from JS with pointer events.
+ * Linux runs on CEF, where the mouse press is owned by Chromium's X
+ * connection: the runtime's `startDragging` (`_NET_WM_MOVERESIZE` from winit's
+ * connection) is refused by the window manager, and the undecorated window has
+ * no native resize borders either. Every other platform keeps the runtime's
+ * own drag.
+ */
+export const needsPointerWindowControls = () =>
+  isTauriAppPlatform() && typeof navigator !== 'undefined' && getOSPlatform() === 'linux';
+
 export const isMacPlatform = () =>
   typeof window !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform);
 
@@ -32,6 +44,11 @@ const isWebDevMode = () => process.env['NODE_ENV'] === 'development' && isWebApp
 // for production build or tauri app use the production Web API
 export const getAPIBaseUrl = () => (isWebDevMode() ? '/api' : `${getBaseUrl()}/api`);
 
+// Readest Voice synthesizes on the production GPU service, which a local dev
+// server cannot reach: its routes use the production Web API even under
+// `pnpm dev-web` (a self-hosted apiBaseUrl still applies).
+export const getReadestVoiceAPIBaseUrl = () => `${getBaseUrl()}/api`;
+
 // For Node.js API that currently not supported in some edge runtimes
 export const getNodeAPIBaseUrl = () => (isWebDevMode() ? '/api' : `${getNodeBaseUrl()}/api`);
 
@@ -43,8 +60,13 @@ let nativeAppService: AppService | null = null;
 const getNativeAppService = async () => {
   if (!nativeAppService) {
     const { NativeAppService } = await import('@/services/nativeAppService');
-    nativeAppService = new NativeAppService();
-    await nativeAppService.init();
+    // Publish the singleton only after `init` resolves. Assigning first meant a
+    // failed init left a half-built service cached forever: every later caller
+    // got it back without re-running init, and `getInitializedAppService`
+    // handed synchronous callers an object whose paths were never resolved.
+    const service = new NativeAppService();
+    await service.init();
+    nativeAppService = service;
   }
   return nativeAppService;
 };
@@ -53,8 +75,9 @@ let webAppService: AppService | null = null;
 const getWebAppService = async () => {
   if (!webAppService) {
     const { WebAppService } = await import('@/services/webAppService');
-    webAppService = new WebAppService();
-    await webAppService.init();
+    const service = new WebAppService();
+    await service.init();
+    webAppService = service;
   }
   return webAppService;
 };

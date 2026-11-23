@@ -79,18 +79,36 @@ export class HardcoverSyncMapStore {
         window.localStorage.removeItem(key);
         continue;
       }
+      let row: HardcoverSyncMapRow;
       try {
-        const row = JSON.parse(raw) as HardcoverSyncMapRow;
-        await this.upsertRow(db, row);
+        row = JSON.parse(raw) as HardcoverSyncMapRow;
+        if (
+          !row ||
+          typeof row.book_hash !== 'string' ||
+          typeof row.note_id !== 'string' ||
+          typeof row.payload_hash !== 'string' ||
+          !Number.isFinite(row.hardcover_journal_id) ||
+          !Number.isFinite(row.synced_at)
+        ) {
+          throw new Error('Invalid legacy Hardcover mapping');
+        }
       } catch (error) {
         console.error('Failed to migrate Hardcover mapping from localStorage:', error);
+        window.localStorage.removeItem(key);
+        continue;
       }
+      // Keep identity conflicts for recovery without overwriting another mapping.
+      if (row.book_hash !== bookHash || key !== `${prefix}${row.note_id}`) {
+        throw new Error('Legacy Hardcover mapping identity does not match its storage key');
+      }
+      // Preserve the legacy mapping and abort sync if persistence fails.
+      await this.upsertRow(db, row);
       window.localStorage.removeItem(key);
     }
   }
 
   async loadForBook(bookHash: string): Promise<void> {
-    this.loadedBookHash = bookHash;
+    this.loadedBookHash = null;
     this.mappings.clear();
     this.modified = false;
 
@@ -107,6 +125,7 @@ export class HardcoverSyncMapStore {
         this.mappings.set(row.note_id, row);
       }
     });
+    this.loadedBookHash = bookHash;
   }
 
   async flush(): Promise<void> {
@@ -143,6 +162,11 @@ export class HardcoverSyncMapStore {
     return best;
   }
 
+  // Every journal entry the loaded book's notes are mapped to, deleted notes included.
+  journalIds(): number[] {
+    return [...this.mappings.values()].map((row) => row.hardcover_journal_id);
+  }
+
   async upsertMapping(
     bookHash: string,
     noteId: string,
@@ -160,5 +184,18 @@ export class HardcoverSyncMapStore {
       synced_at: Date.now(),
     });
     this.modified = true;
+  }
+
+  // Forget every note -> journal mapping for a book. Used when the book is
+  // linked to a different Hardcover book: the journal entries belong to the
+  // old one, so the notes must be inserted afresh rather than updated in place.
+  async clearForBook(bookHash: string): Promise<void> {
+    await this.withDb(async (db) => {
+      await db.execute('DELETE FROM hardcover_note_mappings WHERE book_hash = ?', [bookHash]);
+    });
+    if (this.loadedBookHash === bookHash) {
+      this.mappings.clear();
+      this.modified = false;
+    }
   }
 }

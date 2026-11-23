@@ -3,12 +3,15 @@ import React, { useEffect, useRef } from 'react';
 import { useEnv } from '@/context/EnvContext';
 
 import { tauriHandleMinimize, tauriHandleToggleMaximize, tauriHandleClose } from '@/utils/window';
-import { isTauriAppPlatform } from '@/services/environment';
+import { isTauriAppPlatform, needsPointerWindowControls } from '@/services/environment';
+import { startPointerWindowMove } from '@/utils/windowPointerDrag';
 import { useTranslation } from '@/hooks/useTranslation';
+
+const DRAG_INPUT_THRESHOLD = 4;
 
 interface WindowButtonsProps {
   className?: string;
-  headerRef?: React.RefObject<HTMLDivElement | null>;
+  headerRef?: React.RefObject<HTMLElement | null>;
   showMinimize?: boolean;
   showMaximize?: boolean;
   showClose?: boolean;
@@ -66,19 +69,71 @@ const WindowButtons: React.FC<WindowButtonsProps> = ({
     );
   };
 
+  const startWindowMove = async (e: MouseEvent) => {
+    if (needsPointerWindowControls()) {
+      startPointerWindowMove(e);
+    } else {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      getCurrentWindow().startDragging();
+    }
+  };
+
+  // An unfocused title-bar search field drags the window like the bar around
+  // it; a click without movement focuses it, and once focused it selects text.
+  const handleDragInputMouseDown = (input: HTMLInputElement, e: MouseEvent) => {
+    e.preventDefault();
+    const onMove = (move: MouseEvent) => {
+      // The release was missed (e.g. outside the window): drop the press.
+      if ((move.buttons & 1) === 0) {
+        stop();
+        return;
+      }
+      const dx = Math.abs(move.screenX - e.screenX);
+      const dy = Math.abs(move.screenY - e.screenY);
+      if (dx > DRAG_INPUT_THRESHOLD || dy > DRAG_INPUT_THRESHOLD) {
+        stop();
+        startWindowMove(e);
+      }
+    };
+    const onUp = () => {
+      stop();
+      input.focus();
+    };
+    const stop = () => {
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('mouseup', onUp, true);
+      window.removeEventListener('blur', stop);
+    };
+    window.addEventListener('mousemove', onMove, true);
+    window.addEventListener('mouseup', onUp, true);
+    // Losing focus mid-press (e.g. Alt+Tab) can swallow the release.
+    window.addEventListener('blur', stop);
+  };
+
   const handleMouseDown = async (e: MouseEvent) => {
     const target = e.target as HTMLElement;
+
+    if (
+      e.buttons === 1 &&
+      target instanceof HTMLInputElement &&
+      target.classList.contains('window-drag-input') &&
+      !target.disabled &&
+      document.activeElement !== target
+    ) {
+      handleDragInputMouseDown(target, e);
+      return;
+    }
 
     if (isExcludedElement(target)) {
       return;
     }
 
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
     if (e.buttons === 1) {
       if (e.detail === 2) {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
         getCurrentWindow().toggleMaximize();
       } else {
-        getCurrentWindow().startDragging();
+        startWindowMove(e);
       }
     }
   };
@@ -146,10 +201,12 @@ const WindowButtons: React.FC<WindowButtonsProps> = ({
   };
 
   useEffect(() => {
-    if (!isTauriAppPlatform()) return;
+    if (!isTauriAppPlatform() || !appService?.hasWindowBar) return;
     const headerElement = headerRef?.current;
     if (!headerElement) return;
 
+    // Lets CSS style a window-drag-input only where it really drags the window.
+    headerElement.setAttribute('data-window-drag', '');
     headerElement.addEventListener('mousedown', handleMouseDown);
     headerElement.addEventListener('pointerdown', handlePointerDown);
     headerElement.addEventListener('pointermove', handlePointerMove);
@@ -157,6 +214,7 @@ const WindowButtons: React.FC<WindowButtonsProps> = ({
     headerElement.addEventListener('pointercancel', handlePointerUp);
 
     return () => {
+      headerElement.removeAttribute('data-window-drag');
       headerElement.removeEventListener('mousedown', handleMouseDown);
       headerElement.removeEventListener('pointerdown', handlePointerDown);
       headerElement.removeEventListener('pointermove', handlePointerMove);
@@ -164,7 +222,7 @@ const WindowButtons: React.FC<WindowButtonsProps> = ({
       headerElement.removeEventListener('pointercancel', handlePointerUp);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [appService?.hasWindowBar, headerRef]);
 
   const handleMinimize = async () => {
     if (onMinimize) {

@@ -1,0 +1,203 @@
+import { describe, expect, it } from 'vitest';
+import {
+  applyBookmarkResult,
+  buildBookmarkExchangeBook,
+} from '@/services/bookorbit/bookmarkExchange';
+import { bookOrbitKey, bookOrbitNoteId, formatKoDatetime } from '@/services/bookorbit/noteMapping';
+import type { BookmarkExchangeBookResult } from '@/services/bookorbit/types';
+import type { BookNote } from '@/types/book';
+
+const HASH = 'b'.repeat(32);
+
+const makeBookmark = (overrides: Partial<BookNote>): BookNote => ({
+  id: 'bm1',
+  type: 'bookmark',
+  cfi: 'epubcfi(/6/8!/4/2/1:0)',
+  xpointer0: '/body/DocFragment[4]/body/p[1]/text().0',
+  text: 'page text',
+  note: '',
+  createdAt: Date.UTC(2026, 7, 1, 8, 0, 0),
+  updatedAt: Date.UTC(2026, 7, 1, 8, 0, 0),
+  ...overrides,
+});
+
+const identityOf = (note: BookNote) => formatKoDatetime(note.createdAt);
+
+const noChapter = () => null;
+
+const emptyResult = (
+  overrides: Partial<BookmarkExchangeBookResult> = {},
+): BookmarkExchangeBookResult => ({
+  hash: HASH,
+  bookId: 1,
+  toApply: { add: [], delete: [] },
+  more: false,
+  ...overrides,
+});
+
+describe('buildBookmarkExchangeBook', () => {
+  it('includes only live bookmarks and uses pos-based keys', () => {
+    const live = makeBookmark({ id: 'live' });
+    const annotation = makeBookmark({ id: 'ann', type: 'annotation' });
+    const tombstoned = makeBookmark({ id: 'gone', deletedAt: Date.now() });
+
+    const { request, keyToNote } = buildBookmarkExchangeBook(
+      HASH,
+      [live, annotation, tombstoned],
+      identityOf,
+      noChapter,
+      0,
+    );
+
+    expect(request.keysComplete).toBe(true);
+    expect(request.keys).toEqual([
+      { k: bookOrbitKey(identityOf(live), live.xpointer0!), dt: identityOf(live) },
+    ]);
+    // `text` is the local page-context label, not the user's note, so it is
+    // not echoed as the wire note that would become the dogear's title.
+    expect(request.changes).toEqual([{ datetime: identityOf(live), pos: live.xpointer0 }]);
+    expect(keyToNote.get(request.keys[0]!.k)).toBe(live);
+  });
+
+  it('caps changes past the watermark', () => {
+    const old = makeBookmark({ id: 'old' });
+    const fresh = makeBookmark({
+      id: 'fresh',
+      createdAt: Date.UTC(2026, 7, 3),
+      updatedAt: Date.UTC(2026, 7, 3),
+    });
+    const { request } = buildBookmarkExchangeBook(
+      HASH,
+      [old, fresh],
+      identityOf,
+      noChapter,
+      Date.UTC(2026, 7, 2),
+    );
+    expect(request.changes).toHaveLength(1);
+    expect(request.changes[0]!.datetime).toBe(identityOf(fresh));
+  });
+
+  it('sends the chapter instead of the local page snippet as the dogear title', () => {
+    // A Readest bookmark always carries a page-context label in `text` and an
+    // empty `note` (BookmarkToggler), and BookOrbit derives a dogear title from
+    // note, else chapter, else a page label — so echoing `text` as the note
+    // would keep the chapter from ever titling the dogear.
+    const live = makeBookmark({ id: 'live', note: '', text: 'page text' });
+    const { request } = buildBookmarkExchangeBook(HASH, [live], identityOf, () => 'Chapter 4', 0);
+    expect(request.changes[0]).toEqual({
+      datetime: identityOf(live),
+      pos: live.xpointer0,
+      chapter: 'Chapter 4',
+    });
+
+    // No chapter resolved: the server falls back to its own page label rather
+    // than a snippet, and no empty chapter is sent.
+    const none = buildBookmarkExchangeBook(HASH, [live], identityOf, noChapter, 0);
+    expect(none.request.changes[0]).toEqual({
+      datetime: identityOf(live),
+      pos: live.xpointer0,
+    });
+  });
+
+  it('still sends a user-authored note, which is what should title the dogear', () => {
+    const noted = makeBookmark({ id: 'noted', note: 'Remember this', text: 'page text' });
+    const { request } = buildBookmarkExchangeBook(HASH, [noted], identityOf, () => 'Chapter 4', 0);
+    expect(request.changes[0]).toEqual({
+      datetime: identityOf(noted),
+      pos: noted.xpointer0,
+      note: 'Remember this',
+      chapter: 'Chapter 4',
+    });
+  });
+
+  it('echoes the server title of a pulled dogear so the re-push does not rename it', () => {
+    // A pulled dogear keeps the server title in `text` and is re-pushed on the
+    // next pass (createdAt is the pull time); the server treats a differing
+    // derived title as a device edit, so sending only the chapter would
+    // replace a title authored on another device.
+    const pos = '/body/DocFragment[4]/body/p[1]/text().0';
+    const pulled = makeBookmark({
+      id: bookOrbitNoteId(HASH, 'bookmark', pos),
+      xpointer0: pos,
+      text: 'Remember this',
+    });
+    const { request } = buildBookmarkExchangeBook(HASH, [pulled], identityOf, () => 'Ch 4', 0);
+    expect(request.changes[0]!.note).toBe('Remember this');
+  });
+
+  it('caps the wire note at the 500-character DTO limit', () => {
+    const noted = makeBookmark({ id: 'long', note: 'x'.repeat(600) });
+    const { request } = buildBookmarkExchangeBook(HASH, [noted], identityOf, noChapter, 0);
+    expect(request.changes[0]!.note).toHaveLength(500);
+  });
+});
+
+describe('applyBookmarkResult', () => {
+  const NOW = Date.UTC(2026, 7, 5, 12, 0, 0);
+
+  it('creates a bookmark note from an add and acks with the device identity', async () => {
+    const add = {
+      serverId: 3,
+      pos: '/body/DocFragment[6]/body/p[1]/text().0',
+      pageno: 9,
+      title: 'Chapter 2',
+    };
+    const plan = await applyBookmarkResult(
+      HASH,
+      emptyResult({ toApply: { add: [add], delete: [] } }),
+      new Map(),
+      async () => ({ cfi: 'epubcfi(/6/12!/4/2/1:0)', page: 9, verified: true }),
+      NOW,
+    );
+
+    expect(plan.upserts).toHaveLength(1);
+    const note = plan.upserts[0]!;
+    expect(note.id).toBe(bookOrbitNoteId(HASH, 'bookmark', add.pos));
+    expect(note.type).toBe('bookmark');
+    expect(note.cfi).toBe('epubcfi(/6/12!/4/2/1:0)');
+    expect(note.xpointer0).toBe(add.pos);
+    expect(note.text).toBe('Chapter 2');
+    expect(note.page).toBe(9);
+    expect(note.createdAt).toBe(NOW);
+
+    const identityDatetime = formatKoDatetime(NOW);
+    expect(plan.ack.applied).toEqual([
+      {
+        serverId: 3,
+        status: 'applied',
+        key: bookOrbitKey(identityDatetime, add.pos),
+        datetime: identityDatetime,
+        pos: add.pos,
+      },
+    ]);
+    expect(plan.identities).toEqual([{ noteId: note.id, datetime: identityDatetime, serverId: 3 }]);
+  });
+
+  it('acks failed for unresolvable adds and applied for deletes', async () => {
+    const local = makeBookmark({ id: 'gone-soon' });
+    const key = bookOrbitKey(identityOf(local), local.xpointer0!);
+    const plan = await applyBookmarkResult(
+      HASH,
+      emptyResult({
+        toApply: {
+          add: [{ serverId: 8, pos: '/nowhere', pageno: null, title: 'x' }],
+          delete: [
+            { serverId: 5, key, datetime: identityOf(local) },
+            { serverId: 6, key: 'c'.repeat(32), datetime: null },
+          ],
+        },
+      }),
+      new Map([[key, local]]),
+      async () => null,
+      NOW,
+    );
+
+    expect(plan.upserts).toHaveLength(0);
+    expect(plan.ack.applied).toEqual([{ serverId: 8, status: 'failed' }]);
+    expect(plan.deleteNoteIds).toEqual(['gone-soon']);
+    expect(plan.ack.deleted).toEqual([
+      { serverId: 5, status: 'applied' },
+      { serverId: 6, status: 'applied' },
+    ]);
+  });
+});

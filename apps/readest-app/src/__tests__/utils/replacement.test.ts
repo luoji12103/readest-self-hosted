@@ -89,6 +89,7 @@ describe('proofreadTransformer', () => {
     rules: ProofreadRule[] | undefined,
     content: string,
     sectionHref?: string,
+    sectionCfi?: string,
   ): TransformContext => {
     const viewSettings = {
       proofreadRules: rules,
@@ -101,6 +102,7 @@ describe('proofreadTransformer', () => {
       content,
       isFixedLayout: false,
       sectionHref,
+      sectionCfi,
       transformers: ['proofread'],
     };
   };
@@ -356,6 +358,51 @@ describe('proofreadTransformer', () => {
   });
 
   describe('selection scope', () => {
+    // A rule's sectionHref is the TOC href captured at the reading position,
+    // which names the nearest preceding nav entry -- a different file whenever
+    // the spine item has no TOC entry of its own. The rule's own CFI names its
+    // spine item, so the section match rides on that when the book has spine
+    // CFIs (#6148).
+    const selectionRule = (over: Partial<ProofreadRule> = {}): ProofreadRule => ({
+      id: '1',
+      scope: 'selection',
+      pattern: 'test',
+      replacement: 'REPLACED',
+      enabled: true,
+      isRegex: false,
+      caseSensitive: true,
+      order: 1,
+      wholeWord: true,
+      sectionHref: 'chapter1.html',
+      cfi: 'epubcfi(/6/14!/4/2,/1:0,/1:4)',
+      ...over,
+    });
+
+    test('applies a rule whose stale sectionHref names another file in the same spine item', async () => {
+      const ctx = createMockContext(
+        [selectionRule({ sectionHref: 'contents.html' })],
+        '<html><body><p>test content</p></body></html>',
+        'chapter7.html',
+        'epubcfi(/6/14)',
+      );
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain('REPLACED');
+    });
+
+    test('skips a rule anchored in a different spine item even when the href matches', async () => {
+      const ctx = createMockContext(
+        [selectionRule()],
+        '<html><body><p>test content</p></body></html>',
+        'chapter1.html',
+        'epubcfi(/6/16)',
+      );
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain('test content');
+      expect(result).not.toContain('REPLACED');
+    });
+
     test('should skip selection rules without matching sectionHref', async () => {
       const rules: ProofreadRule[] = [
         {
@@ -1025,6 +1072,179 @@ describe('proofreadTransformer', () => {
 
       expect(result).toContain('cafe');
       expect(result).not.toContain('café');
+    });
+
+    test('should replace Unicode punctuation adjacent to letters', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'opening-quote',
+          scope: 'book',
+          pattern: '«',
+          replacement: '',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: true,
+        },
+        {
+          id: 'closing-quote',
+          scope: 'book',
+          pattern: '»',
+          replacement: '',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 2,
+          wholeWord: true,
+        },
+      ];
+      const ctx = createMockContext(
+        rules,
+        '<section aria-labelledby="greeting"><h2 id="greeting" lang="ru" dir="auto">«Привет»</h2></section>',
+      );
+      const result = await proofreadTransformer.transform(ctx, {
+        docType: 'application/xhtml+xml',
+      });
+      const doc = new DOMParser().parseFromString(result, 'application/xhtml+xml');
+      const section = doc.querySelector('section');
+      const heading = doc.querySelector('#greeting');
+
+      expect(result).toContain('Привет');
+      expect(result).not.toMatch(/[«»]/u);
+      expect(section?.getAttribute('aria-labelledby')).toBe('greeting');
+      expect(heading?.getAttribute('lang')).toBe('ru');
+      expect(heading?.getAttribute('dir')).toBe('auto');
+    });
+
+    test('should replace punctuation adjacent to letters across scripts', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'punctuation-regex',
+          scope: 'book',
+          pattern: '[«»،「」]',
+          replacement: '',
+          enabled: true,
+          isRegex: true,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: false,
+        },
+      ];
+      const ctx = createMockContext(
+        rules,
+        '<p lang="ru">«Привет»</p><p lang="ar" dir="rtl">،مرحبا</p><p lang="zh">「你好」</p>',
+      );
+      const result = await proofreadTransformer.transform(ctx);
+      const doc = new DOMParser().parseFromString(result, 'text/html');
+      const arabic = doc.querySelector('[lang="ar"]');
+
+      expect(result).toContain('Привет');
+      expect(result).toContain('مرحبا');
+      expect(result).toContain('你好');
+      expect(result).not.toMatch(/[«»،「」]/u);
+      expect(arabic?.getAttribute('dir')).toBe('rtl');
+    });
+
+    test('should replace adjacent Unicode punctuation in the TTS-only pipeline', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'tts-quotes',
+          scope: 'book',
+          pattern: '[«»]',
+          replacement: '',
+          enabled: true,
+          isRegex: true,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: false,
+          onlyForTTS: true,
+        },
+      ];
+      const ctx = createMockContext(rules, '<speak xml:lang="ru">«Привет»</speak>');
+      const result = await proofreadTransformer.transform(ctx, {
+        docType: 'text/xml',
+        onlyForTTS: true,
+      });
+      const doc = new DOMParser().parseFromString(result, 'text/xml');
+
+      expect(result).toContain('Привет');
+      expect(result).not.toMatch(/[«»]/u);
+      expect(doc.documentElement.getAttribute('xml:lang')).toBe('ru');
+    });
+
+    test('should preserve Unicode word boundaries for matches containing letters', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'cyrillic-word',
+          scope: 'book',
+          pattern: 'Привет',
+          replacement: 'Здравствуйте',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: true,
+        },
+      ];
+      const ctx = createMockContext(rules, '<p>СуперПривет Привет</p>');
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain('СуперПривет Здравствуйте');
+    });
+
+    test('should preserve existing boundaries for non-punctuation marks and symbols', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'combining-mark',
+          scope: 'book',
+          pattern: '\u0301',
+          replacement: '',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: true,
+        },
+        {
+          id: 'currency-symbol',
+          scope: 'book',
+          pattern: '€',
+          replacement: '',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 2,
+          wholeWord: true,
+        },
+      ];
+      const decomposed = 'e\u0301';
+      const ctx = createMockContext(rules, `<p>${decomposed} A€B</p>`);
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain(decomposed);
+      expect(result).toContain('A€B');
+    });
+
+    test('should preserve word-like connector punctuation in mixed regex patterns', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'mixed-punctuation',
+          scope: 'book',
+          pattern: '[«_»]',
+          replacement: '',
+          enabled: true,
+          isRegex: true,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: false,
+        },
+      ];
+      const ctx = createMockContext(rules, '<p>«Привет» foo_bar</p>');
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain('Привет foo_bar');
+      expect(result).not.toMatch(/[«»]/u);
     });
 
     test('should handle special regex characters in simple mode', async () => {

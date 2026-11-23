@@ -1,3 +1,4 @@
+import { mergeBookshelfStates } from '@/services/bookshelves/state';
 import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { isTauriAppPlatform } from '@/services/environment';
@@ -38,6 +39,8 @@ export interface CloudSyncProviderFlags {
   s3?: { enabled: boolean; providerSelectedAt?: number };
   /** Optional: absent on payloads from pre-OneDrive windows (treated as unchanged). */
   onedrive?: { enabled: boolean; providerSelectedAt?: number };
+  /** Optional: absent on payloads from pre-iCloud windows (treated as unchanged). */
+  icloud?: { enabled: boolean; providerSelectedAt?: number };
   /**
    * Optional in two senses: absent on payloads from pre-#5062 windows, and
    * absent when the source window has never had the slice written. `enabled`
@@ -49,6 +52,7 @@ export interface CloudSyncProviderFlags {
 }
 
 export interface SettingsSyncPayload {
+  bookshelves?: SystemSettings['bookshelves'];
   /** Label of the window that persisted the change, so receivers ignore their own echo. */
   sourceLabel: string;
   globalViewSettings: SystemSettings['globalViewSettings'];
@@ -70,7 +74,7 @@ export const mergeSyncedGlobalSettings = (
   local: SystemSettings,
   payload: Pick<
     SettingsSyncPayload,
-    'globalViewSettings' | 'globalReadSettings' | 'cloudSyncProviders'
+    'globalViewSettings' | 'globalReadSettings' | 'cloudSyncProviders' | 'bookshelves'
   >,
 ): SystemSettings => {
   const merged: SystemSettings = {
@@ -78,6 +82,8 @@ export const mergeSyncedGlobalSettings = (
     globalViewSettings: payload.globalViewSettings,
     globalReadSettings: payload.globalReadSettings,
   };
+  if (payload.bookshelves)
+    merged.bookshelves = mergeBookshelfStates(local.bookshelves, payload.bookshelves);
   if (payload.cloudSyncProviders) {
     merged.webdav = { ...local.webdav, ...payload.cloudSyncProviders.webdav };
     merged.googleDrive = { ...local.googleDrive, ...payload.cloudSyncProviders.googleDrive };
@@ -86,6 +92,9 @@ export const mergeSyncedGlobalSettings = (
     }
     if (payload.cloudSyncProviders.onedrive) {
       merged.onedrive = { ...local.onedrive, ...payload.cloudSyncProviders.onedrive };
+    }
+    if (payload.cloudSyncProviders.icloud) {
+      merged.icloud = { ...local.icloud, ...payload.cloudSyncProviders.icloud };
     }
     if (payload.cloudSyncProviders.readestCloud) {
       merged.readestCloud = {
@@ -110,6 +119,7 @@ export const broadcastGlobalSettings = async (
   try {
     const payload: SettingsSyncPayload = {
       sourceLabel: getCurrentWindow().label,
+      bookshelves: settings.bookshelves,
       globalViewSettings: settings.globalViewSettings,
       globalReadSettings: settings.globalReadSettings,
     };
@@ -130,6 +140,10 @@ export const broadcastGlobalSettings = async (
         onedrive: {
           enabled: !!settings.onedrive?.enabled,
           providerSelectedAt: settings.onedrive?.providerSelectedAt,
+        },
+        icloud: {
+          enabled: !!settings.icloud?.enabled,
+          providerSelectedAt: settings.icloud?.providerSelectedAt,
         },
       };
       if (settings.readestCloud) {

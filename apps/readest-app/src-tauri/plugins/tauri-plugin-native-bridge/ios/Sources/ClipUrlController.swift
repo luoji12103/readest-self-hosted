@@ -18,6 +18,13 @@ class ClipUrlArgs: Decodable {
   let savedTitle: String?
   let background: String?
   let foreground: String?
+  // Interactive mode: show the page with a Cancel/Capture bar instead of
+  // the opaque overlay so the user can sign in before capturing.
+  let interactive: Bool?
+  let backgroundCapture: Bool?
+  let signInHint: String?
+  let captureLabel: String?
+  let cancelLabel: String?
 
   // Resolved getters with the same fallbacks the Rust impl uses.
   var resolvedOverlayTitle: String { overlayTitle ?? "Saving to Readest" }
@@ -25,6 +32,9 @@ class ClipUrlArgs: Decodable {
   var resolvedCapturingStatus: String { capturingStatus ?? "Capturing article…" }
   var resolvedBackground: String { background ?? "#1f2024" }
   var resolvedForeground: String { foreground ?? "#f5f5f7" }
+  var resolvedSignInHint: String { signInHint ?? "Sign in if needed, then capture" }
+  var resolvedCaptureLabel: String { captureLabel ?? "Capture" }
+  var resolvedCancelLabel: String { cancelLabel ?? "Cancel" }
 }
 
 /// Errors surfaced to the JS caller through `invoke.reject`. Strings
@@ -34,23 +44,27 @@ enum ClipUrlError: Error {
   case invalidUrl
   case loadFailed(String)
   case timedOut
+  // User closed the interactive sign-in capture. Shared cancel vocabulary
+  // with `ClipUrlController.kt` — the JS side matches this string to stay
+  // quiet on user-initiated cancels.
+  case cancelled
 
   var message: String {
     switch self {
     case .invalidUrl: return "Invalid URL"
     case .loadFailed(let detail): return "Could not fetch this page: \(detail)"
     case .timedOut: return "Page took too long to load"
+    case .cancelled: return "Capture cancelled"
     }
   }
 }
 
 /// Full-screen view controller that loads `options.url` in a WKWebView,
 /// shows a deliberate "Saving…" overlay over the article render so the
-/// user sees expected progress (not a website flashing by), and once
-/// `webView(_:didFinish:)` fires + a 3 s settle window passes — long
-/// enough for in-flight lazy-loaders / Cloudflare-style JS challenges
-/// to resolve — captures `document.documentElement.outerHTML` and
-/// hands it back via the completion handler.
+/// user sees expected progress (not a website flashing by), then waits
+/// for rendered text after `webView(_:didFinish:)` + a 3 s settle window.
+/// Captures `document.documentElement.outerHTML` within the load budget
+/// and hands it back via the completion handler.
 ///
 /// Mirrors the desktop `clip_url` flow shape: same Chrome UA, same
 /// fingerprint mask, same overlay (rendered via Swift here instead of
@@ -77,9 +91,11 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
 
   private var webView: WKWebView!
   private var overlayView: UIView!
-  private var statusLabel: UILabel!
+  private var statusLabel: UILabel?
   private var didFinishOrFail = false
   private var captureFired = false
+  private var completed = false
+  private var contentWaitEnded = false
   private var timeoutWorkItem: DispatchWorkItem?
 
   init(args: ClipUrlArgs, completion: @escaping (Result<String, ClipUrlError>) -> Void) {
@@ -95,16 +111,28 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     fatalError("init(coder:) is not supported for ClipUrlController")
   }
 
+  private var interactiveMode: Bool { args.interactive == true }
+
   override func viewDidLoad() {
     super.viewDidLoad()
-    setUpWebView()
-    setUpOverlay()
+    view.backgroundColor = UIColor(hexString: args.resolvedBackground) ?? .black
+    if interactiveMode {
+      // Interactive: the page is visible under a Cancel/Capture bar so
+      // the user can sign in first. The WKWebsiteDataStore is the app's
+      // default (persistent) store, so the session survives for every
+      // later headless clip.
+      let bar = setUpActionBar()
+      setUpWebView(below: bar)
+    } else {
+      setUpWebView(below: nil)
+      if args.backgroundCapture != true { setUpOverlay() }
+    }
     startCapture()
   }
 
   // MARK: - Setup
 
-  private func setUpWebView() {
+  private func setUpWebView(below bar: UIView?) {
     let config = WKWebViewConfiguration()
     // Inject the same fingerprint-mask script the desktop flow uses,
     // before any page script runs, so `navigator.webdriver` and the
@@ -133,12 +161,80 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     wv.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(wv)
     NSLayoutConstraint.activate([
-      wv.topAnchor.constraint(equalTo: view.topAnchor),
+      wv.topAnchor.constraint(equalTo: bar?.bottomAnchor ?? view.topAnchor),
       wv.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       wv.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       wv.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
     self.webView = wv
+  }
+
+  /// Interactive-mode top bar: hint text + Cancel + a solid Capture
+  /// button, drawn with the caller's theme colours and extending under
+  /// the status bar (content laid out inside the safe area).
+  private func setUpActionBar() -> UIView {
+    let bg = UIColor(hexString: args.resolvedBackground) ?? .black
+    let fg = UIColor(hexString: args.resolvedForeground) ?? .white
+
+    let bar = UIView()
+    bar.backgroundColor = bg
+    bar.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(bar)
+
+    let hint = UILabel()
+    hint.text = args.resolvedSignInHint
+    hint.textColor = fg.withAlphaComponent(0.7)
+    hint.font = UIFont.systemFont(ofSize: 13)
+    hint.numberOfLines = 2
+    hint.lineBreakMode = .byTruncatingTail
+    hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    hint.translatesAutoresizingMaskIntoConstraints = false
+    bar.addSubview(hint)
+
+    let cancel = UIButton(type: .system)
+    cancel.setTitle(args.resolvedCancelLabel, for: .normal)
+    cancel.setTitleColor(fg, for: .normal)
+    cancel.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+    cancel.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+    cancel.translatesAutoresizingMaskIntoConstraints = false
+    bar.addSubview(cancel)
+
+    let capture = UIButton(type: .system)
+    capture.setTitle(args.resolvedCaptureLabel, for: .normal)
+    capture.setTitleColor(bg, for: .normal)
+    capture.titleLabel?.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+    capture.backgroundColor = fg
+    capture.layer.cornerRadius = 16
+    capture.contentEdgeInsets = UIEdgeInsets(top: 6, left: 16, bottom: 6, right: 16)
+    capture.addTarget(self, action: #selector(captureTapped), for: .touchUpInside)
+    capture.translatesAutoresizingMaskIntoConstraints = false
+    bar.addSubview(capture)
+
+    NSLayoutConstraint.activate([
+      bar.topAnchor.constraint(equalTo: view.topAnchor),
+      bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+      hint.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+      hint.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+      hint.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -8),
+      hint.centerYAnchor.constraint(equalTo: capture.centerYAnchor),
+
+      cancel.leadingAnchor.constraint(greaterThanOrEqualTo: hint.trailingAnchor, constant: 12),
+      cancel.centerYAnchor.constraint(equalTo: capture.centerYAnchor),
+
+      capture.leadingAnchor.constraint(equalTo: cancel.trailingAnchor, constant: 12),
+      capture.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+    ])
+    return bar
+  }
+
+  @objc private func cancelTapped() {
+    finish(.failure(.cancelled))
+  }
+
+  @objc private func captureTapped() {
+    captureOuterHtml()
   }
 
   private func setUpOverlay() {
@@ -194,6 +290,21 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
       status.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24),
       status.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
     ])
+    let cancel = UIButton(type: .system)
+    cancel.setTitle(args.resolvedCancelLabel, for: .normal)
+    cancel.setTitleColor(fg, for: .normal)
+    cancel.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+    cancel.translatesAutoresizingMaskIntoConstraints = false
+    cancel.layer.borderWidth = 1
+    cancel.layer.borderColor = fg.cgColor
+    cancel.layer.cornerRadius = 6
+    overlay.addSubview(cancel)
+    NSLayoutConstraint.activate([
+      cancel.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+      cancel.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 16),
+      cancel.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+      cancel.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+    ])
     self.overlayView = overlay
   }
 
@@ -212,11 +323,23 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     req.setValue(ClipUrlController.browserUserAgent, forHTTPHeaderField: "User-Agent")
     webView.load(req)
 
-    // Hard timeout — fires even if `didFinish` never does (SPA, redirect
-    // chain, JS challenge that never resolves). Same 30 s budget as the
-    // desktop flow.
+    // Interactive capture waits for the user's tap — no deadline.
+    if interactiveMode { return }
+
+    // Give client-rendered pages the remaining budget to produce content.
+    // At 27 s also allow short pages (including real login walls), leaving
+    // time for evaluation. Empty/loading documents still time out.
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + ClipUrlController.hardTimeoutSeconds - ClipUrlController.loadSettleSeconds
+    ) { [weak self] in
+      guard let self = self, !self.completed else { return }
+      self.contentWaitEnded = true
+      self.captureOuterHtml(requireReady: true)
+    }
+
+    // Keep the deadline active while a JavaScript evaluation is pending too.
     let work = DispatchWorkItem { [weak self] in
-      guard let self = self, !self.captureFired else { return }
+      guard let self = self, !self.completed else { return }
       clipLogger.warning("clip_url: hard timeout after \(ClipUrlController.hardTimeoutSeconds, privacy: .public)s")
       self.finish(.failure(.timedOut))
     }
@@ -226,21 +349,26 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    // Interactive capture is user-driven: the page keeps navigating
+    // (login redirects) until Capture is tapped.
+    guard !interactiveMode else { return }
     guard !didFinishOrFail else { return }
     didFinishOrFail = true
-    statusLabel.text = args.resolvedCapturingStatus
-    // Settle then capture. Matches the 3 s post-load delay in the
-    // desktop init script — long enough for in-flight asset fetches
-    // and lazy-load IntersectionObservers to fire.
+    statusLabel?.text = args.resolvedCapturingStatus
+    // Navigation can finish before an SPA has rendered its article.
+    // Keep the usual settle delay, then wait for content within the budget.
     DispatchQueue.main.asyncAfter(deadline: .now() + ClipUrlController.loadSettleSeconds) {
       [weak self] in
-      self?.captureOuterHtml()
+      self?.captureOuterHtml(requireReady: true)
     }
   }
 
   func webView(
     _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
   ) {
+    // A failed hop mid-sign-in shouldn't tear the flow down — the page
+    // renders its own error and the user can retry or cancel.
+    if interactiveMode { return }
     if didFinishOrFail { return }
     didFinishOrFail = true
     finish(.failure(.loadFailed(error.localizedDescription)))
@@ -250,16 +378,27 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
     withError error: Error
   ) {
+    if interactiveMode { return }
     if didFinishOrFail { return }
     didFinishOrFail = true
     finish(.failure(.loadFailed(error.localizedDescription)))
   }
 
-  private func captureOuterHtml() {
-    guard !captureFired else { return }
+  private func captureOuterHtml(requireReady: Bool = false) {
+    guard !captureFired && !completed else { return }
     captureFired = true
-    webView.evaluateJavaScript("document.documentElement.outerHTML") { [weak self] result, error in
-      guard let self = self else { return }
+    // Match the converter's 400-character quality floor while waiting.
+    // Manual capture and checks after 27 s still return short login pages.
+    let minTextChars = requireReady && !contentWaitEnded ? 400 : 0
+    webView.evaluateJavaScript("(function() { if (\(requireReady) && (document.readyState === 'loading' || !document.body || !document.body.innerText.trim() || document.body.innerText.trim().length < \(minTextChars))) return null; var root = document.documentElement.cloneNode(true); root.setAttribute('data-readest-url', location.href); return root.outerHTML; })()") { [weak self] result, error in
+      guard let self = self, !self.completed else { return }
+      if requireReady && error == nil && !(result is String) {
+        self.captureFired = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+          self?.captureOuterHtml(requireReady: true)
+        }
+        return
+      }
       if let html = result as? String, !html.isEmpty {
         clipLogger.log("clip_url: captured \(html.count, privacy: .public) chars")
         self.finish(.success(html))
@@ -271,6 +410,8 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
   }
 
   private func finish(_ result: Result<String, ClipUrlError>) {
+    guard !completed else { return }
+    completed = true
     timeoutWorkItem?.cancel()
     timeoutWorkItem = nil
     // Stop the WebView before dismissing — otherwise its JS keeps
@@ -279,6 +420,13 @@ final class ClipUrlController: UIViewController, WKNavigationDelegate {
     webView?.stopLoading()
     webView?.navigationDelegate = nil
 
+    if args.backgroundCapture == true && !interactiveMode {
+      willMove(toParent: nil)
+      view.removeFromSuperview()
+      removeFromParent()
+      completion(result)
+      return
+    }
     dismiss(animated: true) { [completion] in
       completion(result)
     }

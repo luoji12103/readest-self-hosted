@@ -48,6 +48,26 @@ require_marker() {
   fi
 }
 
+# Release dispatch is explicit; the backfill workflow only reports missing tags.
+python3 - <<'PYTHON'
+import re
+from pathlib import Path
+
+for filename in ('release-selfhost.yml', 'backfill-selfhost-releases.yml'):
+    text = (Path('.github/workflows') / filename).read_text()
+    events = text.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+    if re.findall(r'^  ([\w_]+):', events, re.M) != ['workflow_dispatch']:
+        raise SystemExit(f'{filename} must only run on manual dispatch')
+
+backfill = Path('.github/workflows/backfill-selfhost-releases.yml').read_text()
+if not re.search(r'^permissions:\n  contents: read\n\s*\njobs:', backfill, re.M):
+    raise SystemExit('The backfill report must have read-only permissions')
+if 'GITHUB_STEP_SUMMARY' not in backfill or 'contents: write' in backfill or 'actions: write' in backfill:
+    raise SystemExit('Backfill must report tags without requesting write access')
+if re.search(r'gh\s+workflow\s+run|gh\s+release\s+(create|edit|upload)|git\s+push|prepare-selfhost-backport\.sh', backfill):
+    raise SystemExit('Backfill must not publish, prepare tags or dispatch releases')
+PYTHON
+
 # These markers intentionally contain literal shell variable references.
 # shellcheck disable=SC2016
 for marker in \

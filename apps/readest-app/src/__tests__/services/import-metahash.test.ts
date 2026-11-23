@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Book } from '@/types/book';
 import { getMetadataHash } from '@/utils/book';
+import { transformBookFromDB, transformBookToDB } from '@/utils/transform';
 
 const mockOpen = vi.hoisted(() => vi.fn());
 const mockPartialMD5 = vi.hoisted(() => vi.fn());
@@ -32,7 +33,8 @@ vi.mock('@/libs/storage', () => ({
 }));
 
 import { BaseAppService } from '@/services/appService';
-import { buildBookLookupIndex } from '@/services/bookService';
+import { WebAppService } from '@/services/webAppService';
+import { buildBookLookupIndex, refreshBookMetadata } from '@/services/bookService';
 
 // Concrete test subclass of BaseAppService with mocked fs
 class TestAppService extends BaseAppService {
@@ -148,14 +150,34 @@ describe('importBook metaHash deduplication', () => {
 
     // Should return the existing book, not a new one
     expect(result).toBe(existingBook);
-    // Library should still have only one book
-    expect(books.length).toBe(1);
+    // One live book plus the tombstone row left for the retired hash
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
     // Hash should be updated to new file's content hash
     expect(existingBook.hash).toBe('new-hash-456');
     // Metadata should be overridden
     expect(existingBook.metadata).toEqual(TEST_METADATA);
     // metaHash should be set
     expect(existingBook.metaHash).toBe(metaHash);
+  });
+
+  it('clears file-sync deletion authorization when re-importing the same hash', async () => {
+    const existingBook = makeBook({
+      deletedAt: 100,
+      fileSyncDeletionRequestedAt: 100,
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue(existingBook.hash);
+    setupMockBookDoc();
+
+    const result = await service.importBook(
+      new File(['same content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(result).toBe(existingBook);
+    expect(existingBook.deletedAt).toBeNull();
+    expect(existingBook.fileSyncDeletionRequestedAt).toBeNull();
   });
 
   // Cross-device file-update convergence (issue #4544 §E): re-importing an
@@ -179,8 +201,323 @@ describe('importBook metaHash deduplication', () => {
 
     expect(result).toBe(existingBook);
     expect(existingBook.hash).toBe('new-hash-456');
-    // uploadedAt cleared → autoUpload / manual upload re-pushes the new file.
+    // uploadedAt cleared → book sync / manual upload re-pushes the new file.
     expect(existingBook.uploadedAt).toBeNull();
+  });
+
+  // The re-key retires the old hash's directory on this device. Without a
+  // tombstone row, sync peers whose library still lists the old hash keep
+  // re-adding it as a live card whose file no longer exists ("Book file not
+  // found"), because nothing ever told them the hash was retired.
+  it('leaves a deletedAt tombstone for the hash a metaHash re-key retires', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(existingBook.hash).toBe('new-hash-456');
+    const tombstones = books.filter((b) => b.hash === 'old-hash-123');
+    expect(tombstones).toHaveLength(1);
+    // A fresh stamp so the tombstone wins row-level LWW at sync peers.
+    expect(tombstones[0]!.deletedAt).toBeTruthy();
+    expect(tombstones[0]!.updatedAt).toBeGreaterThanOrEqual(tombstones[0]!.deletedAt!);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  // A finished badge asserts about the retired file's content, and the
+  // reader's automatic status never demotes (only unread→reading and
+  // ≥100%→finished), so a finished book re-keyed to an updated build would
+  // stay badged Finished forever. Park it unread the same way the manual
+  // "Mark as Unread" does: a field-only flip — position, notes and progress
+  // stay, so opening the new build resumes where the old one left off.
+  it('parks a finished book as unread when an updated build re-keys it', async () => {
+    const existingBook = makeBook({
+      hash: 'old-hash-123',
+      metaHash: getMetadataHash(TEST_METADATA),
+      readingStatus: 'finished',
+      readingStatusUpdatedAt: Date.now() - 60000,
+      progress: [10, 10],
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+    const stampBefore = Date.now();
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(existingBook.hash).toBe('new-hash-456');
+    expect(existingBook.readingStatus).toBe('unread');
+    // Fresh field-LWW stamp, or a peer holding the retired status wins it back.
+    expect(existingBook.readingStatusUpdatedAt).toBeGreaterThanOrEqual(stampBefore);
+    expect(existingBook.progress).toEqual([10, 10]);
+    // The tombstone keeps the pre-import status for the retired hash.
+    const tombstone = books.find((b) => b.hash === 'old-hash-123');
+    expect(tombstone?.readingStatus).toBe('finished');
+  });
+
+  // A peer may have stamped the finished status with a clock ahead of this
+  // device. The flip must land strictly ahead of the retired stamp, or the
+  // field-level sync merges (the file-sync side compares with a strict >)
+  // restore finished on the next pull.
+  it('keeps the unread stamp ahead of a future-dated finished status', async () => {
+    const futureStamp = Date.now() + 3_600_000;
+    const existingBook = makeBook({
+      hash: 'old-hash-123',
+      metaHash: getMetadataHash(TEST_METADATA),
+      readingStatus: 'finished',
+      readingStatusUpdatedAt: futureStamp,
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(existingBook.readingStatus).toBe('unread');
+    expect(existingBook.readingStatusUpdatedAt!).toBeGreaterThan(futureStamp);
+  });
+
+  it('keeps the finished status when the same bytes are re-imported', async () => {
+    const existingBook = makeBook({
+      hash: 'old-hash-123',
+      metaHash: getMetadataHash(TEST_METADATA),
+      readingStatus: 'finished',
+      readingStatusUpdatedAt: Date.now() - 60000,
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('old-hash-123');
+    setupMockBookDoc();
+
+    await service.importBook(
+      new File(['same content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(existingBook.readingStatus).toBe('finished');
+  });
+
+  it('leaves reading and abandoned statuses alone across a re-key', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const readingBook = makeBook({
+      hash: 'hash-reading',
+      metaHash,
+      readingStatus: 'reading',
+      progress: [50, 200],
+    });
+    const abandonedBook = makeBook({
+      hash: 'hash-abandoned',
+      metaHash,
+      readingStatus: 'abandoned',
+    });
+    const books: Book[] = [readingBook, abandonedBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(readingBook.hash).toBe('new-hash-456');
+    expect(readingBook.readingStatus).toBe('reading');
+    expect(readingBook.progress).toEqual([50, 200]);
+    // The duplicate is retired but its parked status is not rewritten.
+    expect(abandonedBook.deletedAt).toBeTruthy();
+    expect(abandonedBook.readingStatus).toBe('abandoned');
+  });
+
+  it('strands no tombstone when the import fails before the rollback point', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) =>
+      ['old-hash-123/config.json', 'old-hash-123'].includes(path),
+    );
+    fs.readFile.mockResolvedValue(
+      JSON.stringify({
+        audiobook: {
+          version: 1,
+          files: [
+            {
+              id: 'audio-0',
+              name: 'book.m4b',
+              path: 'old-hash-123/audiobook/1-audio-0-book.m4b',
+              duration: 100,
+            },
+          ],
+          chapters: [],
+          mappings: [],
+          createdAt: 1,
+        },
+      }),
+    );
+    fs.copyFile.mockRejectedValue(new Error('audio copy failed'));
+
+    await expect(
+      service.importBook(
+        new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+        books,
+      ),
+    ).rejects.toThrow('audio copy failed');
+
+    expect(books).toHaveLength(1);
+    expect(books[0]).toBe(existingBook);
+    expect(existingBook.hash).toBe('old-hash-123');
+    expect(existingBook.deletedAt).toBeNull();
+  });
+
+  // One book, last import wins: re-importing the retired file is just another
+  // update. The tombstone is un-deleted and the newer row is merged into it and
+  // retired, so the library still shows one card.
+  it('re-importing the retired file makes it the book again and retires the newer row', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const liveBook = makeBook({ hash: 'new-hash-456', metaHash });
+    const tombstone = makeBook({
+      hash: 'old-hash-123',
+      metaHash,
+      deletedAt: Date.now() - 5000,
+    });
+    const books: Book[] = [liveBook, tombstone];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    mockPartialMD5.mockResolvedValue('old-hash-123');
+    setupMockBookDoc();
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) => path === 'new-hash-456');
+
+    const result = await service.importBook(
+      new File(['old content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    expect(result).toBe(tombstone);
+    expect(tombstone.deletedAt).toBeNull();
+    expect(liveBook.deletedAt).toBeTruthy();
+    // A fresh stamp so the retirement wins row-level LWW at sync peers.
+    expect(liveBook.updatedAt).toBeGreaterThanOrEqual(liveBook.deletedAt!);
+    expect(fs.removeDir).toHaveBeenCalledWith('new-hash-456', 'Books', true);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  // library/page.tsx reuses one lookup index across an import batch, so the
+  // tombstone appended on a re-key must also take over the retired hash in
+  // byHash: an in-session re-import of the old file then takes the book back,
+  // matching what a fresh session (index rebuilt from library.json) does.
+  it('registers the tombstone in the lookup index so an in-session re-import takes the book back', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const liveBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [liveBook];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    // Import the updated build: re-keys the row and leaves a tombstone.
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+    expect(liveBook.hash).toBe('new-hash-456');
+    const tombstone = lookupIndex.byHash.get('old-hash-123');
+    expect(tombstone?.deletedAt).toBeTruthy();
+
+    // Re-import the retired build in the SAME session.
+    mockPartialMD5.mockResolvedValue('old-hash-123');
+    setupMockBookDoc();
+    const result = await service.importBook(
+      new File(['old content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    expect(result).toBe(tombstone);
+    expect(tombstone!.deletedAt).toBeNull();
+    expect(liveBook.deletedAt).toBeTruthy();
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  // The restored row was deleted when the batch's index was built, so it is in
+  // neither byMetaKey nor byStableKey. A third build in the same batch must
+  // still find it and update it, not shelve a second card.
+  it('a later build in the same batch updates the restored row', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const liveBook = makeBook({ hash: 'new-hash-456', metaHash });
+    const tombstone = makeBook({
+      hash: 'old-hash-123',
+      metaHash,
+      deletedAt: Date.now() - 5000,
+    });
+    const books: Book[] = [liveBook, tombstone];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    mockPartialMD5.mockResolvedValue('old-hash-123');
+    setupMockBookDoc();
+    await service.importBook(
+      new File(['old content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    mockPartialMD5.mockResolvedValue('newest-hash-789');
+    setupMockBookDoc();
+    const result = await service.importBook(
+      new File(['newest content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    expect(result).toBe(tombstone);
+    expect(tombstone.hash).toBe('newest-hash-789');
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  // The migrated config carries the old hash's notes sync watermark, so notes
+  // older than it would never be pushed under the new hash, and a peer whose
+  // metaHash differs (a fresh uuid per build) would never see them.
+  it('resets the notes sync watermark when the config moves to a new hash', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) => path === 'old-hash-123/config.json');
+    fs.readFile.mockResolvedValue(JSON.stringify({ lastSyncedAtNotes: Date.now() }));
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    const configWrite = fs.writeFile.mock.calls.find(
+      (c: unknown[]) => c[0] === 'new-hash-456/config.json',
+    );
+    expect(JSON.parse(configWrite![2] as string).lastSyncedAtNotes).toBe(0);
   });
 
   it('should not match metaHash for deleted books', async () => {
@@ -235,6 +572,183 @@ describe('importBook metaHash deduplication', () => {
     expect(writtenConfig.readProgress).toBe(0.5);
     // Should have removed old directory
     expect(fs.removeDir).toHaveBeenCalledWith('old-hash-123', 'Books', true);
+  });
+
+  it('copies paired audiobook files and rewrites their paths before removing the old hash', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) =>
+      ['old-hash-123/config.json', 'old-hash-123'].includes(path),
+    );
+    fs.readFile.mockResolvedValue(
+      JSON.stringify({
+        audiobook: {
+          version: 1,
+          files: [
+            {
+              id: 'audio-0',
+              name: 'book.m4b',
+              path: 'old-hash-123/audiobook/1-audio-0-book.m4b',
+              duration: 100,
+            },
+          ],
+          chapters: [],
+          mappings: [],
+          createdAt: 1,
+        },
+      }),
+    );
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(fs.createDir).toHaveBeenCalledWith('new-hash-456/audiobook', 'Books', true);
+    expect(fs.copyFile).toHaveBeenCalledWith(
+      'old-hash-123/audiobook/1-audio-0-book.m4b',
+      'Books',
+      'new-hash-456/audiobook/1-audio-0-book.m4b',
+      'Books',
+    );
+    const configWrite = fs.writeFile.mock.calls.find(
+      (call: unknown[]) => call[0] === 'new-hash-456/config.json',
+    );
+    const writtenConfig = JSON.parse(configWrite![2] as string);
+    expect(writtenConfig.audiobook.files[0].path).toBe('new-hash-456/audiobook/1-audio-0-book.m4b');
+    expect(
+      fs.writeFile.mock.invocationCallOrder[fs.writeFile.mock.calls.indexOf(configWrite!)],
+    ).toBeLessThan(fs.removeDir.mock.invocationCallOrder[0]!);
+  });
+
+  it('carries a streamed pairing over unchanged, copying nothing', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) =>
+      ['old-hash-123/config.json', 'old-hash-123'].includes(path),
+    );
+    fs.readFile.mockResolvedValue(
+      JSON.stringify({
+        audiobook: {
+          version: 1,
+          files: [{ id: 'abs', name: 'Book', path: 'abs://srv1/item1', duration: 100 }],
+          chapters: [],
+          mappings: [],
+          createdAt: 1,
+          source: { kind: 'audiobookshelf', serverId: 'srv1', itemId: 'item1', tracks: [] },
+        },
+      }),
+    );
+
+    await service.importBook(
+      new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(fs.createDir).not.toHaveBeenCalledWith('new-hash-456/audiobook', 'Books', true);
+    expect(fs.copyFile).not.toHaveBeenCalled();
+    const configWrite = fs.writeFile.mock.calls.find(
+      (call: unknown[]) => call[0] === 'new-hash-456/config.json',
+    );
+    const writtenConfig = JSON.parse(configWrite![2] as string);
+    expect(writtenConfig.audiobook.files[0].path).toBe('abs://srv1/item1');
+    expect(writtenConfig.audiobook.source.itemId).toBe('item1');
+    expect(fs.removeDir).toHaveBeenCalledWith('old-hash-123', 'Books', true);
+  });
+
+  it('keeps the old book directory when paired-audio migration fails', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) =>
+      ['old-hash-123/config.json', 'old-hash-123'].includes(path),
+    );
+    fs.readFile.mockResolvedValue(
+      JSON.stringify({
+        audiobook: {
+          version: 1,
+          files: [
+            {
+              id: 'audio-0',
+              name: 'book.m4b',
+              path: 'old-hash-123/audiobook/1-audio-0-book.m4b',
+              duration: 100,
+            },
+          ],
+          chapters: [],
+          mappings: [],
+          createdAt: 1,
+        },
+      }),
+    );
+    fs.copyFile.mockRejectedValue(new Error('audio copy failed'));
+
+    await expect(
+      service.importBook(
+        new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+        books,
+      ),
+    ).rejects.toThrow('audio copy failed');
+
+    expect(fs.removeDir).not.toHaveBeenCalledWith('old-hash-123', 'Books', true);
+    expect(existingBook.hash).toBe('old-hash-123');
+    expect(existingBook.deletedAt).toBeNull();
+  });
+
+  it('rejects paired-audio paths outside the book being migrated', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const existingBook = makeBook({ hash: 'old-hash-123', metaHash });
+    const books: Book[] = [existingBook];
+    mockPartialMD5.mockResolvedValue('new-hash-456');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) =>
+      ['old-hash-123/config.json', 'old-hash-123'].includes(path),
+    );
+    fs.readFile.mockResolvedValue(
+      JSON.stringify({
+        audiobook: {
+          version: 1,
+          files: [
+            {
+              id: 'audio-0',
+              name: 'book.m4b',
+              path: 'another-book/audiobook/book.m4b',
+              duration: 100,
+            },
+          ],
+          chapters: [],
+          mappings: [],
+          createdAt: 1,
+        },
+      }),
+    );
+
+    await expect(
+      service.importBook(
+        new File(['new content'], 'test.epub', { type: 'application/epub+zip' }),
+        books,
+      ),
+    ).rejects.toThrow('Invalid paired audiobook path');
+
+    expect(fs.copyFile).not.toHaveBeenCalled();
+    expect(fs.removeDir).not.toHaveBeenCalledWith('old-hash-123', 'Books', true);
+    expect(existingBook.hash).toBe('old-hash-123');
   });
 
   it('should prefer exact file hash match over metaHash match', async () => {
@@ -621,6 +1135,570 @@ describe('importBook metaHash aggregation', () => {
     // Merged booknotes from both
     expect(writtenConfig.booknotes).toHaveLength(2);
   });
+
+  it('preserves a duplicate pairing when the progress-winning config has none', async () => {
+    const metaHash = getMetadataHash(TEST_METADATA);
+    const exactMatch = makeBook({ hash: 'exact-hash', metaHash });
+    const pairedDuplicate = makeBook({ hash: 'paired-hash', metaHash });
+    const books: Book[] = [exactMatch, pairedDuplicate];
+    mockPartialMD5.mockResolvedValue('exact-hash');
+    setupMockBookDoc();
+
+    const fs = service.getFs();
+    fs.exists.mockImplementation(async (path: string) => {
+      if (path.endsWith('/config.json')) return true;
+      return path === 'paired-hash';
+    });
+    fs.readFile.mockImplementation(async (path: string) => {
+      if (path === 'exact-hash/config.json') {
+        return JSON.stringify({ progress: [90, 100], location: 'winner' });
+      }
+      if (path === 'paired-hash/config.json') {
+        return JSON.stringify({
+          progress: [10, 100],
+          audiobook: {
+            version: 1,
+            files: [
+              {
+                id: 'audio-0',
+                name: 'book.m4b',
+                path: 'paired-hash/audiobook/1-audio-0-book.m4b',
+                duration: 100,
+              },
+            ],
+            chapters: [],
+            mappings: [],
+            createdAt: 1,
+          },
+        });
+      }
+      return '{}';
+    });
+
+    await service.importBook(
+      new File(['same content'], 'test.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(fs.copyFile).toHaveBeenCalledWith(
+      'paired-hash/audiobook/1-audio-0-book.m4b',
+      'Books',
+      'exact-hash/audiobook/1-audio-0-book.m4b',
+      'Books',
+    );
+    const configWrite = fs.writeFile.mock.calls.find(
+      (call: unknown[]) => call[0] === 'exact-hash/config.json',
+    );
+    const writtenConfig = JSON.parse(configWrite![2] as string);
+    expect(writtenConfig.progress).toEqual([90, 100]);
+    expect(writtenConfig.audiobook.files[0].path).toBe('exact-hash/audiobook/1-audio-0-book.m4b');
+    expect(
+      fs.writeFile.mock.invocationCallOrder[fs.writeFile.mock.calls.indexOf(configWrite!)],
+    ).toBeLessThan(fs.removeDir.mock.invocationCallOrder[0]!);
+  });
+});
+
+// PDF metadata is often generic (e.g. every PowerPoint export is titled
+// "PowerPoint Presentation" with the same author), so metaHash alone wrongly
+// collapses distinct PDFs into one book (issue #5411). PDF metaHash is salted
+// with the original filename so only same-named files dedupe.
+describe('importBook PDF filename-aware dedup', () => {
+  let service: TestAppService;
+
+  const PDF_METADATA = {
+    title: 'PowerPoint Presentation',
+    author: 'Alice Author',
+    language: 'en',
+  };
+
+  function setupMockPdfDoc(metadata = PDF_METADATA) {
+    const bookDoc = {
+      metadata: { ...metadata },
+      getCover: vi.fn().mockResolvedValue(null),
+    };
+    mockOpen.mockResolvedValue({ book: bookDoc, format: 'PDF' });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    service = new TestAppService();
+    const fs = service.getFs();
+    fs.exists.mockResolvedValue(false);
+    fs.createDir.mockResolvedValue(undefined);
+    fs.writeFile.mockResolvedValue(undefined);
+    fs.removeDir.mockResolvedValue(undefined);
+    fs.readFile.mockResolvedValue('{}');
+  });
+
+  it('imports PDFs with identical metadata but different filenames as separate books', async () => {
+    const books: Book[] = [];
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-1');
+    setupMockPdfDoc();
+    const book1 = await service.importBook(
+      new File(['slides 1'], 'lecture-01.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-2');
+    setupMockPdfDoc();
+    const book2 = await service.importBook(
+      new File(['slides 2'], 'lecture-02.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    expect(book2).not.toBe(book1);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(2);
+    expect(book1).toMatchObject({
+      title: 'lecture-01',
+      originalFilename: 'lecture-01.pdf',
+      sourceTitle: PDF_METADATA.title,
+      metadata: PDF_METADATA,
+      metaHash: getMetadataHash(PDF_METADATA, 'lecture-01'),
+    });
+    expect(book2).toMatchObject({ title: 'lecture-02', originalFilename: 'lecture-02.pdf' });
+  });
+
+  it('still dedupes a PDF re-imported with the same filename and metadata', async () => {
+    const books: Book[] = [];
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-1');
+    setupMockPdfDoc();
+    const book1 = await service.importBook(
+      new File(['v1'], 'deck.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-2');
+    setupMockPdfDoc();
+    const book2 = await service.importBook(
+      new File(['v2'], 'deck.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    expect(book2).toBe(book1);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+    expect(book1!.hash).toBe('pdf-hash-2');
+  });
+
+  it('refreshes parsed metadata without comparing stored bytes on an exact-hash PDF re-import', async () => {
+    const originalMetadata = {
+      title: 'Canon R7 Custom Buttons',
+      author: 'Canon',
+      language: 'en',
+    };
+    const changedMetadata = { ...originalMetadata, author: 'Canon.com' };
+    const existingBook = makeBook({
+      hash: 'same-partial-hash',
+      format: 'PDF' as Book['format'],
+      metaHash: getMetadataHash(originalMetadata, 'canon-r7-custom-buttons'),
+      title: originalMetadata.title,
+      sourceTitle: originalMetadata.title,
+      author: originalMetadata.author,
+      metadata: originalMetadata,
+    });
+    const originalFile = new File(['original metadata bytes'], 'canon-r7-custom-buttons.pdf', {
+      type: 'application/pdf',
+    });
+    const changedFile = new File(['changed metadata bytes'], 'canon-r7-custom-buttons.pdf', {
+      type: 'application/pdf',
+    });
+
+    mockPartialMD5.mockResolvedValue(existingBook.hash);
+    setupMockPdfDoc(changedMetadata);
+    service.getFs().exists.mockImplementation(async (path: string) => path.endsWith('.pdf'));
+    service.getFs().openFile.mockResolvedValue(originalFile);
+
+    const imported = await service.importBook(changedFile, [existingBook]);
+
+    expect(imported).toBe(existingBook);
+    expect(existingBook).toMatchObject({
+      title: originalMetadata.title,
+      metaHash: getMetadataHash(originalMetadata, 'canon-r7-custom-buttons'),
+    });
+    expect(existingBook.originalFilename).toBeUndefined();
+    expect(existingBook.sourceTitle).toBe(originalMetadata.title);
+    expect(existingBook.author).toBe(changedMetadata.author);
+    expect(existingBook.metadata).toEqual(changedMetadata);
+    expect(existingBook.metadataUpdatedAt).toBe(existingBook.updatedAt);
+    expect(service.getFs().openFile).not.toHaveBeenCalled();
+  });
+
+  it('preserves an edited PDF title and both hashes on reimport', async () => {
+    const books: Book[] = [];
+    mockPartialMD5.mockResolvedValue('pdf-hash');
+    setupMockPdfDoc();
+    const book = (await service.importBook(new File(['pdf'], 'Original.pdf'), books))!;
+    const originalMetaHash = book.metaHash;
+    book.title = 'My edited title';
+
+    setupMockPdfDoc({ ...PDF_METADATA, author: 'Updated author' });
+    const reimported = await service.importBook(new File(['pdf'], 'Renamed.pdf'), books);
+
+    expect(reimported).toBe(book);
+    expect(reimported).toMatchObject({
+      title: 'My edited title',
+      hash: 'pdf-hash',
+      metaHash: originalMetaHash,
+      originalFilename: 'Original.pdf',
+    });
+  });
+
+  it('preserves an existing PDF with no original filename on external reimport', async () => {
+    const legacy = makeBook({
+      hash: 'legacy-pdf',
+      format: 'PDF',
+      title: 'Existing title',
+      metaHash: 'existing-meta-hash',
+      sourceTitle: PDF_METADATA.title,
+    });
+    mockPartialMD5.mockResolvedValue(legacy.hash);
+    setupMockPdfDoc();
+    const reimported = await service.importBook(new File(['pdf'], 'New name.pdf'), [legacy]);
+    expect(reimported).toMatchObject({
+      title: 'Existing title',
+      hash: 'legacy-pdf',
+      metaHash: 'existing-meta-hash',
+    });
+    expect(reimported!.originalFilename).toBeUndefined();
+  });
+
+  it('keeps the original filename and PDF title when re-importing the managed copy', async () => {
+    mockPartialMD5.mockResolvedValue('pdf-hash-1');
+    setupMockPdfDoc();
+    const books: Book[] = [];
+    const book = await service.importBook(new File(['pdf'], 'Device_Manual_V2.1.PDF'), books);
+
+    service.getFs().openFile.mockResolvedValue(new File(['pdf'], 'PowerPoint Presentation.pdf'));
+    setupMockPdfDoc();
+    const reimported = await service.importBook(
+      '/library/Books/pdf-hash-1/PowerPoint Presentation.pdf',
+      books,
+    );
+
+    expect(reimported).toBe(book);
+    expect(reimported).toMatchObject({
+      originalFilename: 'Device_Manual_V2.1.PDF',
+      title: 'Device_Manual_V2.1',
+      sourceTitle: PDF_METADATA.title,
+    });
+  });
+
+  it.each([
+    'windows',
+    'macos',
+    'ios',
+    'linux',
+  ] as const)('preserves synced managed-copy identity using %s path comparison', async (osPlatform) => {
+    mockPartialMD5.mockResolvedValue('pdf-hash-1');
+    setupMockPdfDoc();
+    const imported = await service.importBook(new File(['pdf'], 'Device_Manual_V2.1.PDF'), []);
+    const dbBook = transformBookToDB(imported!, 'test-user');
+    const synced = transformBookFromDB({ ...dbBook, original_filename: undefined });
+    expect(synced.originalFilename).toBeUndefined();
+    service.getFs().getPrefix.mockResolvedValue('/library/Books');
+    service.getFs().openFile.mockResolvedValue(new File(['pdf'], 'PowerPoint Presentation.pdf'));
+    setupMockPdfDoc();
+    service.osPlatform = osPlatform;
+
+    const reimported = await service.importBook(
+      osPlatform === 'linux'
+        ? '/library/Books/pdf-hash-1/PowerPoint Presentation.pdf'
+        : '/LIBRARY/BOOKS/pdf-hash-1/POWERPOINT PRESENTATION.PDF',
+      [synced],
+    );
+
+    expect(reimported).toBe(synced);
+    expect(reimported).toMatchObject({
+      title: 'Device_Manual_V2.1',
+      metaHash: imported!.metaHash,
+      sourceTitle: PDF_METADATA.title,
+    });
+    expect(reimported!.originalFilename).toBeUndefined();
+  });
+
+  it.each([
+    ['EPUB', 'novel.epub'],
+    ['MOBI', 'novel.mobi'],
+    ['CBZ', 'comic.cbz'],
+    ['FB2', 'novel.fb2'],
+    ['MD', 'notes.md'],
+    ['HTML', 'article.html'],
+  ] as const)('saves the original basename for %s without replacing its metadata title', async (format, name) => {
+    mockPartialMD5.mockResolvedValue('book-hash');
+    mockOpen.mockResolvedValue({
+      format,
+      book: { metadata: { ...TEST_METADATA }, getCover: vi.fn().mockResolvedValue(null) },
+    });
+
+    const book = await service.importBook(new File(['book'], name), []);
+
+    expect(book).toMatchObject({ originalFilename: name, title: TEST_METADATA.title });
+  });
+
+  it.each([
+    ['/home/reader/manuals/安全 Manual.v2.pdf', '安全 Manual.v2.pdf'],
+    ['C:\\Users\\reader\\manuals\\Device_Manual.pdf', 'Device_Manual.pdf'],
+  ])('saves only the basename when importing %s', async (path, name) => {
+    mockPartialMD5.mockResolvedValue('pdf-hash');
+    setupMockPdfDoc();
+    service.getFs().openFile.mockResolvedValue(new File(['pdf'], name));
+
+    const book = await service.importBook(path, []);
+
+    expect(book).toMatchObject({ originalFilename: name, title: name.replace(/\.pdf$/, '') });
+  });
+
+  it.each([
+    'file',
+    'path',
+  ] as const)('keeps PDFs with question marks distinct when importing a %s', async (source) => {
+    const books: Book[] = [];
+    for (const revision of [1, 2]) {
+      const name = `manual?rev${revision}.pdf`;
+      mockPartialMD5.mockResolvedValue(`pdf-revision-${revision}`);
+      setupMockPdfDoc();
+      service.getFs().openFile.mockResolvedValue(new File(['pdf'], name));
+      const book = await service.importBook(
+        source === 'file' ? new File([`revision ${revision}`], name) : `/library/${name}`,
+        books,
+      );
+      expect(book).toMatchObject({
+        originalFilename: name,
+        title: `manual?rev${revision}`,
+        metaHash: getMetadataHash(PDF_METADATA, `manual?rev${revision}`),
+      });
+    }
+    expect(books.filter((book) => !book.deletedAt)).toHaveLength(2);
+  });
+
+  it.each([
+    'file',
+    'path',
+  ] as const)('preserves literal POSIX backslashes when importing a %s', async (source) => {
+    for (const edition of ['first', 'second']) {
+      const name = `${edition}\\chapter.pdf`;
+      mockPartialMD5.mockResolvedValue(`pdf-${edition}`);
+      setupMockPdfDoc();
+      service.getFs().openFile.mockResolvedValue(new File(['pdf'], name));
+      const book = await service.importBook(
+        source === 'file' ? new File([edition], name) : `/library/${name}`,
+        [],
+      );
+      expect(book).toMatchObject({
+        originalFilename: name,
+        title: `${edition}\\chapter`,
+        metaHash: getMetadataHash(PDF_METADATA, 'chapter'),
+      });
+    }
+  });
+
+  it.each([
+    ['https://example.com/manual.pdf?token=abc.def', undefined, 'manual.pdf'],
+    ['https://example.com/manual.pdf#page=2', undefined, 'manual.pdf'],
+    ['https://example.com/manual.pdf?token=abc.def#page=2', undefined, 'manual.pdf'],
+    ['https://example.com/manual.pdf#page=2', 'resolved?edition#1.pdf', 'resolved?edition#1.pdf'],
+    ['https://example.com/C%2B%2B.pdf', undefined, 'C++.pdf'],
+    ['https://example.com/manual.pdf?type=application/pdf', undefined, 'manual.pdf'],
+    ['https://example.com/manual.pdf?token=%FF', undefined, 'manual.pdf'],
+    ['https://example.com/manual%FF.pdf', undefined, 'manual%FF.pdf'],
+    ['https://example.com/one%5Cpart.pdf', undefined, 'one\\part.pdf'],
+    ['https://example.com/two%5Cpart.pdf', undefined, 'two\\part.pdf'],
+  ])('uses a clean URL fallback for %s while preserving resolved filename %s', async (url, resolvedFilename, name) => {
+    mockPartialMD5.mockResolvedValue('pdf-hash');
+    setupMockPdfDoc();
+    const web = new WebAppService();
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { 'content-length': '3', 'content-type': 'application/pdf' },
+      }),
+    );
+    const file = await web.fs.openFile(url, 'None', resolvedFilename, fetcher);
+    service.getFs().openFile.mockResolvedValue(file);
+
+    const book = await service.importBook(url, []);
+    const title = name.slice(0, -4);
+    expect(book).toMatchObject({
+      originalFilename: name,
+      title,
+      metaHash: getMetadataHash(PDF_METADATA, title.replace(/\\/g, '/').split('/').pop()),
+    });
+  });
+
+  it('keeps decoded URL slashes in the displayed import filename', async () => {
+    const web = new WebAppService();
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { 'content-length': '3', 'content-type': 'application/pdf' },
+      }),
+    );
+    for (const prefix of ['one', 'two']) {
+      const url = `https://example.com/${prefix}%2Fpart.pdf`;
+      const file = await web.fs.openFile(url, 'None', undefined, fetcher);
+      service.getFs().openFile.mockResolvedValue(file);
+      mockPartialMD5.mockResolvedValue(`pdf-${prefix}`);
+      setupMockPdfDoc();
+
+      const book = await service.importBook(url, []);
+
+      expect(book).toMatchObject({
+        originalFilename: `${prefix}/part.pdf`,
+        title: `${prefix}/part`,
+        metaHash: getMetadataHash(PDF_METADATA, 'part'),
+      });
+    }
+  });
+
+  it('uses the existing metadata hash calculation for an extensionless PDF', async () => {
+    mockPartialMD5.mockResolvedValue('pdf-download');
+    setupMockPdfDoc();
+    const book = await service.importBook(new File(['pdf'], 'download'), []);
+    expect(book).toMatchObject({
+      hash: 'pdf-download',
+      title: 'download',
+      originalFilename: 'download',
+      metaHash: getMetadataHash(PDF_METADATA, 'download'),
+    });
+  });
+
+  it('keeps a legacy PDF metadata hash and its batch index unchanged', async () => {
+    const legacyHash = getMetadataHash(PDF_METADATA, 'download');
+    const legacy: Book = {
+      hash: 'legacy-pdf',
+      format: 'PDF',
+      title: 'download',
+      sourceTitle: PDF_METADATA.title,
+      author: PDF_METADATA.author,
+      metadata: PDF_METADATA,
+      metaHash: legacyHash,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const books = [legacy];
+    const lookupIndex = buildBookLookupIndex(books);
+    mockPartialMD5.mockResolvedValue('legacy-pdf');
+    setupMockPdfDoc();
+    await service.importBook(new File(['pdf'], 'download'), books, { lookupIndex });
+
+    expect(legacy.metaHash).toBe(legacyHash);
+    expect(lookupIndex.byMetaKey.get(`${legacyHash}:PDF`)).toEqual([legacy]);
+    expect(books.filter((book) => !book.deletedAt)).toHaveLength(1);
+    expect(legacy.hash).toBe('legacy-pdf');
+    expect(service.getFs().removeDir).not.toHaveBeenCalled();
+  });
+
+  it('keeps PDF title and hashes when its managed filename is sanitized', async () => {
+    const books: Book[] = [];
+    mockPartialMD5.mockResolvedValue('untitled-download');
+    setupMockPdfDoc({ ...PDF_METADATA, title: '' });
+    const book = await service.importBook(new File(['pdf'], 'download?rev1'), books);
+    const originalMetaHash = book!.metaHash;
+    const originalTitle = book!.title;
+
+    setupMockPdfDoc({ ...PDF_METADATA, title: '' });
+    service.getFs().openFile.mockResolvedValue(new File(['pdf'], 'download_rev1.pdf'));
+    const reimported = await service.importBook(
+      '/library/Books/untitled-download/download_rev1.pdf',
+      books,
+    );
+    expect(reimported!.title).toEqual(originalTitle);
+    expect(reimported!.metaHash).toBe(originalMetaHash);
+    expect(reimported!.originalFilename).toBe('download?rev1');
+  });
+
+  it('saves the resolved Android provider name instead of the opaque content URI', async () => {
+    mockPartialMD5.mockResolvedValue('pdf-hash');
+    setupMockPdfDoc();
+    service.getFs().openFile.mockResolvedValue(new File(['pdf'], 'Original Manual.pdf'));
+
+    const book = await service.importBook(
+      'content://com.android.providers.downloads.documents/document/7421',
+      [],
+    );
+
+    expect(book).toMatchObject({
+      originalFilename: 'Original Manual.pdf',
+      title: 'Original Manual',
+      metaHash: getMetadataHash(PDF_METADATA, 'Original Manual'),
+    });
+  });
+
+  it('preserves the unmodified basename before removing a download duplicate marker', async () => {
+    mockPartialMD5.mockResolvedValue('pdf-hash');
+    setupMockPdfDoc();
+
+    const book = await service.importBook(new File(['pdf'], 'manual.pdf (1)'), []);
+
+    expect(book).toMatchObject({ originalFilename: 'manual.pdf (1)', title: 'manual' });
+  });
+
+  // Issue #7313: web-novel downloaders save each chapter as its own HTML file
+  // carrying the book's title and author, so metadata alone merges chapters.
+  it('imports HTML chapters with identical metadata as separate books', async () => {
+    const books: Book[] = [];
+    for (const name of ['0001.html', '0002.htm']) {
+      mockPartialMD5.mockResolvedValue(`html-${name}`);
+      mockOpen.mockResolvedValue({
+        book: { metadata: { ...PDF_METADATA }, getCover: vi.fn().mockResolvedValue(null) },
+        format: 'HTML',
+      });
+      const book = await service.importBook(new File(['chapter'], name), books);
+      expect(book!.metaHash).toBe(getMetadataHash(PDF_METADATA, name.replace(/\..*$/, '')));
+    }
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(2);
+  });
+
+  it('salts the metaHash when re-importing an HTML book that has none', async () => {
+    const books: Book[] = [makeBook({ hash: 'html-old', format: 'HTML' })];
+    mockPartialMD5.mockResolvedValue('html-old');
+    mockOpen.mockResolvedValue({
+      book: { metadata: { ...PDF_METADATA }, getCover: vi.fn().mockResolvedValue(null) },
+      format: 'HTML',
+    });
+
+    const book = await service.importBook(new File(['chapter'], '0003.html'), books);
+
+    expect(book!.metaHash).toBe(getMetadataHash(PDF_METADATA, '0003'));
+  });
+
+  it('refreshBookMetadata preserves the salted metaHash for HTML', async () => {
+    const book = makeBook({ hash: 'html-hash', format: 'HTML', metaHash: 'salted-import-hash' });
+    const fs = service.getFs();
+    fs.exists.mockResolvedValue(true);
+    fs.openFile.mockResolvedValue(new File(['html'], 'Test Book.html'));
+    mockOpen.mockResolvedValue({
+      book: { metadata: { ...PDF_METADATA }, getCover: vi.fn().mockResolvedValue(null) },
+      format: 'HTML',
+    });
+
+    await refreshBookMetadata(fs as unknown as Parameters<typeof refreshBookMetadata>[0], book);
+
+    expect(book.metaHash).toBe('salted-import-hash');
+  });
+
+  it('refreshBookMetadata preserves the salted metaHash for PDFs', async () => {
+    // The original filename is lost after import (files are stored under the
+    // metadata title), so re-parsing the file cannot reproduce the salt and
+    // must keep the metaHash stamped at import time.
+    const book = makeBook({
+      hash: 'pdf-hash-1',
+      format: 'PDF' as Book['format'],
+      metaHash: 'salted-import-hash',
+    });
+
+    const fs = service.getFs();
+    fs.exists.mockResolvedValue(true);
+    fs.openFile.mockResolvedValue(new File(['pdf'], 'Test Book.pdf'));
+    setupMockPdfDoc();
+
+    const refreshed = await refreshBookMetadata(
+      fs as unknown as Parameters<typeof refreshBookMetadata>[0],
+      book,
+    );
+
+    expect(refreshed).toBe(true);
+    expect(book.metaHash).toBe('salted-import-hash');
+  });
 });
 
 describe('importBook with BookLookupIndex', () => {
@@ -694,5 +1772,313 @@ describe('importBook with BookLookupIndex', () => {
     expect(lookupIndex.byFilePath.get('/lib/a.epub')).toBe(inPlaceBook);
     expect(lookupIndex.byFilePath.has('/lib/b.epub')).toBe(false);
     expect(lookupIndex.byFilePath.has('https://example.com/c.epub')).toBe(false);
+  });
+});
+
+// Issue #5959: AO3 serves calibre-built EPUBs, and calibre mints a fresh random
+// dc:identifier uuid on every export. Re-importing the same work after an update
+// therefore misses both the partialMD5 and the metaHash lookup, and the reader
+// ends up with two library entries instead of an updated one.
+describe('importBook volatile-identifier dedup (issue #5959)', () => {
+  let service: TestAppService;
+
+  const AO3_TITLE = 'The Amazing Traveling Circus Part 2 - The Golden Butterfly';
+  const metadataWithUuid = (uuid: string) => ({
+    title: AO3_TITLE,
+    author: 'KicsterAsh',
+    language: 'en',
+    identifier: uuid,
+    altIdentifier: `urn:uuid:${uuid}`,
+  });
+
+  const OLD_METADATA = metadataWithUuid('08bc8344-c0c9-485c-afcb-c15202570205');
+  const NEW_METADATA = metadataWithUuid('d559a18b-88fa-4560-9f1d-4922e2471ba4');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    service = new TestAppService();
+    const fs = service.getFs();
+    fs.exists.mockResolvedValue(false);
+    fs.createDir.mockResolvedValue(undefined);
+    fs.writeFile.mockResolvedValue(undefined);
+    fs.removeDir.mockResolvedValue(undefined);
+    fs.readFile.mockResolvedValue('{}');
+  });
+
+  it('updates the existing book when the re-download only re-mints the uuid', async () => {
+    const existingBook = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      sourceTitle: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('new-file-hash');
+    setupMockBookDoc(NEW_METADATA);
+
+    const result = await service.importBook(
+      new File(['updated fic'], 'The_Amazing_Traveling.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(result).toBe(existingBook);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+    expect(existingBook.hash).toBe('new-file-hash');
+    expect(existingBook.metaHash).toBe(getMetadataHash(NEW_METADATA));
+    expect(existingBook.metadata).toEqual(NEW_METADATA);
+  });
+
+  it('matches through the lookup index used by batch imports', async () => {
+    const existingBook = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+    });
+    const books: Book[] = [existingBook];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    mockPartialMD5.mockResolvedValue('new-file-hash');
+    setupMockBookDoc(NEW_METADATA);
+
+    const result = await service.importBook(
+      new File(['updated fic'], 'The_Amazing_Traveling.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    expect(result).toBe(existingBook);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  it('re-importing an older build retires the newer one even though the uuid differs', async () => {
+    const liveBook = makeBook({
+      hash: 'new-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(NEW_METADATA),
+      metadata: NEW_METADATA,
+    });
+    const tombstone = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+      deletedAt: Date.now() - 5000,
+    });
+    const books: Book[] = [liveBook, tombstone];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    mockPartialMD5.mockResolvedValue('old-file-hash');
+    setupMockBookDoc(OLD_METADATA);
+
+    const result = await service.importBook(
+      new File(['older fic'], 'The_Amazing_Traveling.epub', { type: 'application/epub+zip' }),
+      books,
+      { lookupIndex },
+    );
+
+    expect(result).toBe(tombstone);
+    expect(tombstone.deletedAt).toBeNull();
+    expect(liveBook.deletedAt).toBeTruthy();
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(1);
+  });
+
+  it('keeps different works apart even when both carry a random uuid', async () => {
+    const otherMetadata = { ...NEW_METADATA, title: 'A Completely Different Fic' };
+    const existingBook = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+    });
+    const books: Book[] = [existingBook];
+
+    mockPartialMD5.mockResolvedValue('other-file-hash');
+    setupMockBookDoc(otherMetadata);
+
+    const result = await service.importBook(
+      new File(['another fic'], 'other.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(result).not.toBe(existingBook);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(2);
+  });
+
+  // The reporter of #5959 had set their own cover art on the book. The merge
+  // re-keys the row to the incoming file's hash directory and retires the old
+  // one, so a cover the user chose has to travel with it.
+  it('carries a cover the user chose across the merge', async () => {
+    const existingBook = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+      coverUpdatedAt: Date.now() - 60000,
+    });
+    const books: Book[] = [existingBook];
+    const fs = service.getFs();
+    const present = new Set<string>(['old-file-hash/cover.png']);
+    fs.exists.mockImplementation(async (path: string) => present.has(path));
+    fs.copyFile.mockImplementation(async (_src: string, _sb: string, dst: string) => {
+      present.add(dst);
+    });
+    fs.writeFile.mockImplementation(async (path: string) => {
+      present.add(path);
+    });
+
+    mockPartialMD5.mockResolvedValue('new-file-hash');
+    mockOpen.mockResolvedValue({
+      book: {
+        metadata: NEW_METADATA,
+        getCover: vi.fn().mockResolvedValue(new Blob(['embedded'], { type: 'image/png' })),
+      },
+      format: 'EPUB',
+    });
+
+    await service.importBook(
+      new File(['updated fic'], 'The_Amazing_Traveling.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(fs.copyFile).toHaveBeenCalledWith(
+      'old-file-hash/cover.png',
+      'Books',
+      'new-file-hash/cover.png',
+      'Books',
+    );
+    // ...and the file's own artwork must not overwrite the carried one.
+    expect(fs.writeFile).not.toHaveBeenCalledWith(
+      'new-file-hash/cover.png',
+      'Books',
+      expect.anything(),
+    );
+    expect(existingBook.coverImageUrl).toBe(await service.generateCoverImageUrl(existingBook));
+  });
+
+  it("lets the new file's own cover win when the user never chose one", async () => {
+    const existingBook = makeBook({
+      hash: 'old-file-hash',
+      title: AO3_TITLE,
+      author: 'KicsterAsh',
+      metaHash: getMetadataHash(OLD_METADATA),
+      metadata: OLD_METADATA,
+    });
+    const books: Book[] = [existingBook];
+    const fs = service.getFs();
+    const present = new Set<string>(['old-file-hash/cover.png']);
+    fs.exists.mockImplementation(async (path: string) => present.has(path));
+    fs.writeFile.mockImplementation(async (path: string) => {
+      present.add(path);
+    });
+
+    mockPartialMD5.mockResolvedValue('new-file-hash');
+    mockOpen.mockResolvedValue({
+      book: {
+        metadata: NEW_METADATA,
+        getCover: vi.fn().mockResolvedValue(new Blob(['embedded'], { type: 'image/png' })),
+      },
+      format: 'EPUB',
+    });
+
+    await service.importBook(
+      new File(['updated fic'], 'The_Amazing_Traveling.epub', { type: 'application/epub+zip' }),
+      books,
+    );
+
+    expect(fs.copyFile).not.toHaveBeenCalledWith(
+      'old-file-hash/cover.png',
+      'Books',
+      'new-file-hash/cover.png',
+      'Books',
+    );
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      'new-file-hash/cover.png',
+      'Books',
+      expect.anything(),
+    );
+  });
+
+  it('leaves the PDF filename rule from #5411 alone', async () => {
+    const pdfMetadata = (uuid: string) => ({
+      title: 'PowerPoint Presentation',
+      author: 'Alice Author',
+      language: 'en',
+      altIdentifier: `urn:uuid:${uuid}`,
+    });
+    const setupMockPdfDoc = (metadata: Record<string, unknown>) => {
+      mockOpen.mockResolvedValue({
+        book: { metadata, getCover: vi.fn().mockResolvedValue(null) },
+        format: 'PDF',
+      });
+    };
+    const books: Book[] = [];
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-1');
+    setupMockPdfDoc(pdfMetadata('4444dddd-4444-4444-8444-444444444444'));
+    const first = await service.importBook(
+      new File(['slides 1'], 'lecture-01.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    mockPartialMD5.mockResolvedValue('pdf-hash-2');
+    setupMockPdfDoc(pdfMetadata('5555eeee-5555-4555-8555-555555555555'));
+    const second = await service.importBook(
+      new File(['slides 2'], 'lecture-02.pdf', { type: 'application/pdf' }),
+      books,
+    );
+
+    expect(second).not.toBe(first);
+    expect(books.filter((b) => !b.deletedAt)).toHaveLength(2);
+  });
+
+  // Issue #7150: an FB2's document-info id is a GUID its editor mints once for
+  // the document and keeps across revisions, so it tells two FB2s with the
+  // same title and author apart rather than marking a throwaway export.
+  it('keeps two FB2 documents of the same title apart (issue #7150)', async () => {
+    const fb2Metadata = (id: string) => ({
+      title: 'Реквием для убийцы',
+      author: [{ name: 'Джеймс Хэдли Чейз', sortAs: 'Чейз, Джеймс Хэдли' }],
+      language: 'ru',
+      identifier: id,
+    });
+    const setupMockFb2Doc = (metadata: Record<string, unknown>) => {
+      mockOpen.mockResolvedValue({
+        book: { metadata, getCover: vi.fn().mockResolvedValue(null) },
+        format: 'FB2',
+      });
+    };
+    const books: Book[] = [];
+    const lookupIndex = buildBookLookupIndex(books);
+
+    mockPartialMD5.mockResolvedValue('fb2-hash-1');
+    setupMockFb2Doc(fb2Metadata('BBF748F5-2994-4DE2-B907-6C2B05324A92'));
+    const first = await service.importBook(
+      new File(['ocr 2012'], '041 1957 Реквием для убийцы.fb2'),
+      books,
+      { lookupIndex },
+    );
+
+    mockPartialMD5.mockResolvedValue('fb2-hash-2');
+    setupMockFb2Doc(fb2Metadata('A75CD08C-B1D1-4F5C-BAEF-13EEAF130115'));
+    const second = await service.importBook(
+      new File(['fb tools 2006'], '041 1957 Реквием для убийцы 2.fb2'),
+      books,
+      { lookupIndex },
+    );
+
+    expect(second).not.toBe(first);
+    expect(books.filter((b) => !b.deletedAt).map((b) => b.hash)).toEqual([
+      'fb2-hash-1',
+      'fb2-hash-2',
+    ]);
   });
 });

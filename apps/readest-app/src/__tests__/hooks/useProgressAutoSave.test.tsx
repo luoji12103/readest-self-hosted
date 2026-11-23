@@ -62,11 +62,34 @@ vi.mock('@/store/settingsStore', () => ({
 }));
 
 import { useProgressAutoSave } from '@/app/reader/hooks/useProgressAutoSave';
+import { eventDispatcher } from '@/utils/event';
 
 const flushDebouncedSave = async () => {
   await act(async () => {
     // debounce 1000ms + inner setTimeout 500ms + slack
     vi.advanceTimersByTime(2000);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  });
+};
+
+const setVisibility = (state: 'visible' | 'hidden') => {
+  Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+};
+
+// Simulate the app losing the foreground (power button / HOME / app switch)
+// WITHOUT advancing the debounce timers — the whole point is that the save
+// must land before the ~1.5s debounce would have fired.
+const backgroundApp = async () => {
+  await act(async () => {
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  });
+};
+
+const firePageHide = async () => {
+  await act(async () => {
+    window.dispatchEvent(new Event('pagehide'));
     for (let i = 0; i < 10; i++) await Promise.resolve();
   });
 };
@@ -77,10 +100,12 @@ beforeEach(() => {
   h.state.config = { location: 'cfi-loc', updatedAt: 1000 };
   h.state.progress = { location: 'cfi-loc' };
   h.state.previewMode = false;
+  setVisibility('visible');
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  setVisibility('visible');
   cleanup();
 });
 
@@ -136,6 +161,95 @@ describe('useProgressAutoSave', () => {
     h.state.progress = { location: 'cfi-different' };
     renderHook(() => useProgressAutoSave('h1-view1'));
     await flushDebouncedSave();
+
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('persists immediately when the app is backgrounded, before the debounce fires', async () => {
+    // Issue #5859: on Android (worst on Boox e-ink) the app is frozen/killed
+    // in the background well inside the ~1.5s save debounce, and no close event
+    // fires on sleep/HOME/kill — only visibilitychange. The last page turn must
+    // be written to disk the moment we lose the foreground.
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+
+    // User turns a page; the debounce is now pending but has NOT fired.
+    h.state.config = { location: 'cfi-loc-next', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-loc-next' };
+    rerender();
+
+    // Background the app without advancing any timers.
+    await backgroundApp();
+
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('persists on pagehide (webview teardown / reload)', async () => {
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    h.state.config = { location: 'cfi-loc-next', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-loc-next' };
+    rerender();
+
+    await firePageHide();
+
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+  });
+
+  // #7041: the close-time cloud push asks for this save first, so the push
+  // carries the updatedAt of the position it sends.
+  test('flush-progress-save persists a moved position at once', async () => {
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    h.state.config = { location: 'cfi-loc-back', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-loc-back' };
+    rerender();
+
+    await act(async () => {
+      await eventDispatcher.dispatch('flush-progress-save', { bookKey: 'h2-view1' });
+    });
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await eventDispatcher.dispatch('flush-progress-save', { bookKey: 'h1-view1' });
+    });
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not double-write: a debounced save then a background flush persists once', async () => {
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    h.state.config = { location: 'cfi-loc-next', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-loc-next' };
+    rerender();
+    await flushDebouncedSave(); // debounce lands first
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+
+    await backgroundApp(); // nothing new to write
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not persist on background when nothing moved since open (issue #4222 guard)', async () => {
+    renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    await backgroundApp();
+
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('skips background flush while in preview mode', async () => {
+    h.state.previewMode = true;
+    h.state.config = { location: 'cfi-different', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-different' };
+    renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    await backgroundApp();
 
     expect(h.saveConfigMock).not.toHaveBeenCalled();
   });

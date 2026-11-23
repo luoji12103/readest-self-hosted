@@ -10,6 +10,7 @@ import { NavigationHandlers } from './types';
 import { getNavigationIcon } from './utils';
 import Button from '@/components/Button';
 import Slider from '@/components/Slider';
+import PageJumpInput from './PageJumpInput';
 
 interface NavigationPanelProps {
   bookKey: string;
@@ -20,6 +21,8 @@ interface NavigationPanelProps {
   bottomOffset: string;
   sliderHeight: number;
   forceMobileLayout: boolean;
+  // Keeps the panel clear of iPhone Duo's side status strip (#6307).
+  insetStyle?: React.CSSProperties;
 }
 
 export const NavigationPanel: React.FC<NavigationPanelProps> = ({
@@ -31,11 +34,13 @@ export const NavigationPanel: React.FC<NavigationPanelProps> = ({
   bottomOffset,
   sliderHeight,
   forceMobileLayout,
+  insetStyle,
 }) => {
   const _ = useTranslation();
   const { appService } = useEnv();
-  const { getView, getViewSettings } = useReaderStore();
+  const { getView, getProgress, getViewSettings } = useReaderStore();
   const view = getView(bookKey);
+  const progress = getProgress(bookKey);
   const viewSettings = getViewSettings(bookKey);
 
   const [progressValue, setProgressValue] = React.useState(
@@ -49,9 +54,18 @@ export const NavigationPanel: React.FC<NavigationPanelProps> = ({
     }
   }, [progressValid, progressFraction]);
 
+  // The page label previews the slider while it is dragged, until the reader
+  // relocates and reports the real page.
+  const [previewFraction, setPreviewFraction] = React.useState<number | null>(null);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPreviewFraction(null);
+  }, [progress]);
+
   const handleProgressChange = useCallback(
     (value: number) => {
       setProgressValue(value);
+      setPreviewFraction(value / 100);
       navigationHandlers.onProgressChange(value);
     },
     [navigationHandlers],
@@ -77,16 +91,29 @@ export const NavigationPanel: React.FC<NavigationPanelProps> = ({
         bottom: appService?.isAndroidApp
           ? `calc(env(safe-area-inset-bottom) + 64px)`
           : bottomOffset,
+        ...insetStyle,
       }}
     >
-      <div className='flex w-full items-center justify-between gap-x-6'>
-        <Slider
-          label={_('Reading Progress')}
-          heightPx={sliderHeight}
-          bubbleLabel={`${Math.round(progressValue)}%`}
-          initialValue={progressValue}
-          onChange={handleProgressChange}
-        />
+      <div className='flex w-full flex-col items-center gap-y-4'>
+        {progressValid && (
+          <div className='eink-bordered bg-base-100 rounded-full px-2 py-1'>
+            <PageJumpInput
+              bookKey={bookKey}
+              showFraction
+              previewFraction={previewFraction}
+              className='text-base'
+            />
+          </div>
+        )}
+        <div className='flex w-full items-center justify-between gap-x-6'>
+          <Slider
+            label={_('Reading Progress')}
+            heightPx={sliderHeight}
+            bubbleLabel={`${Math.round(progressValue)}%`}
+            initialValue={progressValue}
+            onChange={handleProgressChange}
+          />
+        </div>
       </div>
       <div className='flex w-full items-center justify-between gap-x-6'>
         <Button

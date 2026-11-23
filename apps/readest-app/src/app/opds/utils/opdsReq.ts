@@ -8,10 +8,11 @@ import {
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { READEST_OPDS_USER_AGENT } from '@/services/constants';
 import {
-  OPDSCustomHeaders,
-  normalizeOPDSCustomHeaders,
-  serializeOPDSCustomHeaders,
-} from './customHeaders';
+  CustomHeaders,
+  normalizeCustomHeaders,
+  serializeCustomHeaders,
+} from '@/utils/customHeaders';
+import { tlsFetch } from '@/utils/tls';
 
 const getOpdsProxyUrl = () => `${getAPIBaseUrl()}/opds/proxy`;
 const getNodeOpdsProxyUrl = () => `${getNodeAPIBaseUrl()}/opds/proxy`;
@@ -46,6 +47,42 @@ export const needsProxy = (url: string): boolean => {
   return isWebAppPlatform() && url.startsWith('http');
 };
 
+/**
+ * On iOS/macOS the webview serves the app from the secure `tauri://localhost`
+ * origin, so a plain-http cover in an <img> is mixed content. WebKit's Local
+ * Network Access rules only let it through when the host is an address WebKit
+ * classifies as local (e.g. 192.168.x.x); a Tailscale 100.x address or any
+ * hostname is blocked before a request is ever sent (#6637). Such images are
+ * downloaded natively into the cache instead.
+ */
+export const needsNativeImageFetch = (url: string): boolean => {
+  return isTauriAppPlatform() && url.startsWith('http:');
+};
+
+/**
+ * tauri-plugin-http appends the webview origin (`tauri://localhost`, or
+ * `http://tauri.localhost` on Android/Windows) as the Origin header of every
+ * request unless the caller sets one. A native client has no business
+ * asserting a browser origin, and any Origin-checking middlebox in front of
+ * the catalog rejects the unrecognized value with 403 before authentication
+ * ever happens: in #5698 the nginx reverse proxy in front of Komga answered
+ * 403 and Komga itself logged no request at all. An explicit empty Origin
+ * instructs the plugin (built with the `unsafe-headers` feature, see
+ * `src-tauri/Cargo.toml`) to drop the header entirely, matching what native
+ * OPDS clients send.
+ *
+ * Applied to the assembled header set rather than spread ahead of it, because
+ * header names are case-insensitive on the wire but not in a JS object: a
+ * custom header spelled `origin` would survive alongside `Origin` as a second
+ * key, and the plugin's `new Headers()` merges the pair into `", https://..."`
+ * — which is neither empty (so the plugin keeps it) nor a valid Origin. The
+ * case-insensitive check keeps a user-defined Origin of any spelling intact.
+ */
+export const withOriginSuppressed = (headers: Record<string, string>): Record<string, string> =>
+  isTauriAppPlatform() && !Object.keys(headers).some((key) => key.toLowerCase() === 'origin')
+    ? { Origin: '', ...headers }
+    : headers;
+
 const PROXY_OVERRIDES: Record<string, () => string> = {
   standardebooks: getNodeOpdsProxyUrl,
 };
@@ -64,19 +101,15 @@ const getProxyBaseUrl = (url: string): string => {
  */
 export const getProxiedURL = (
   url: string,
-  auth: string = '',
   stream = false,
-  customHeaders: OPDSCustomHeaders = {},
+  customHeaders: CustomHeaders = {},
 ): string => {
   if (url.startsWith('http')) {
     const { url: cleanUrl } = extractCredentialsFromURL(url);
     const params = new URLSearchParams();
     params.append('url', cleanUrl);
     params.append('stream', `${stream}`);
-    if (auth) {
-      params.append('auth', auth);
-    }
-    const serializedHeaders = serializeOPDSCustomHeaders(customHeaders);
+    const serializedHeaders = serializeCustomHeaders(customHeaders);
     if (serializedHeaders) {
       params.append('headers', serializedHeaders);
     }
@@ -205,7 +238,8 @@ export const probeAuth = async (
   username?: string,
   password?: string,
   useProxy = false,
-  customHeaders: OPDSCustomHeaders = {},
+  customHeaders: CustomHeaders = {},
+  allowSelfSignedCert = false,
 ): Promise<string | null> => {
   const {
     url: cleanUrl,
@@ -215,29 +249,23 @@ export const probeAuth = async (
 
   const finalUsername = username || urlUsername;
   const finalPassword = password || urlPassword;
-  const normalizedCustomHeaders = normalizeOPDSCustomHeaders(customHeaders);
+  const normalizedCustomHeaders = normalizeCustomHeaders(customHeaders);
 
   // No credentials provided, can't generate auth header
   if (!finalUsername || !finalPassword) {
     return null;
   }
 
-  const fetchURL = useProxy
-    ? getProxiedURL(cleanUrl, '', false, normalizedCustomHeaders)
-    : cleanUrl;
-  const headers: Record<string, string> = {
+  const fetchURL = useProxy ? getProxiedURL(cleanUrl, false, normalizedCustomHeaders) : cleanUrl;
+  const headers: Record<string, string> = withOriginSuppressed({
     'User-Agent': READEST_OPDS_USER_AGENT,
     Accept: 'application/atom+xml, application/xml, text/xml, */*',
     ...(!useProxy ? normalizedCustomHeaders : {}),
-  };
+  });
 
   // Probe with HEAD request
   const fetch = isTauriAppPlatform() ? tauriFetch : window.fetch;
-  const res = await fetch(fetchURL, {
-    method: 'HEAD',
-    headers,
-    danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-  });
+  const res = await tlsFetch(fetch, fetchURL, { method: 'HEAD', headers }, allowSelfSignedCert);
 
   // Check if authentication is required
   if (res.status === 401 || res.status === 403) {
@@ -319,7 +347,8 @@ export const fetchWithAuth = async (
   password?: string,
   useProxy = false,
   options: RequestInit = {},
-  customHeaders: OPDSCustomHeaders = {},
+  customHeaders: CustomHeaders = {},
+  allowSelfSignedCert = false,
 ): Promise<Response> => {
   const {
     url: cleanUrl,
@@ -329,7 +358,7 @@ export const fetchWithAuth = async (
 
   const finalUsername = username || urlUsername;
   const finalPassword = password || urlPassword;
-  const normalizedCustomHeaders = normalizeOPDSCustomHeaders(customHeaders);
+  const normalizedCustomHeaders = normalizeCustomHeaders(customHeaders);
 
   // Send Basic auth preemptively when credentials are available. Servers that
   // allow anonymous access (e.g. Calibre-Web) return 200 without a challenge,
@@ -339,27 +368,25 @@ export const fetchWithAuth = async (
   const preemptiveAuth =
     finalUsername && finalPassword ? createBasicAuth(finalUsername, finalPassword) : null;
 
-  const fetchURL = useProxy
-    ? getProxiedURL(cleanUrl, preemptiveAuth || '', false, normalizedCustomHeaders)
-    : cleanUrl;
-  const baseHeaders: Record<string, string> = {
+  const fetchURL = useProxy ? getProxiedURL(cleanUrl, false, normalizedCustomHeaders) : cleanUrl;
+  const baseHeaders: Record<string, string> = withOriginSuppressed({
     'User-Agent': READEST_OPDS_USER_AGENT,
     Accept: 'application/atom+xml, application/xml, text/xml, */*',
     ...(!useProxy ? normalizedCustomHeaders : {}),
     ...(options.headers as Record<string, string>),
-  };
+  });
   const headers: Record<string, string> = {
     ...baseHeaders,
-    ...(preemptiveAuth && !useProxy ? { Authorization: preemptiveAuth } : {}),
+    ...(preemptiveAuth ? { Authorization: preemptiveAuth } : {}),
   };
 
   const fetch = isTauriAppPlatform() ? tauriFetch : window.fetch;
-  let res = await fetch(fetchURL, {
-    ...options,
-    method: options.method || 'GET',
-    headers,
-    danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-  });
+  let res = await tlsFetch(
+    fetch,
+    fetchURL,
+    { ...options, method: options.method || 'GET', headers },
+    allowSelfSignedCert,
+  );
 
   // Calibre in 'digest' (or 'auto' over http) mode rejects a Basic
   // Authorization header outright with 400 "Unsupported authentication
@@ -368,14 +395,11 @@ export const fetchWithAuth = async (
   // surface the WWW-Authenticate challenge and let the retry below negotiate
   // the scheme the server actually wants.
   if (res.status === 400 && preemptiveAuth) {
-    res = await fetch(
-      useProxy ? getProxiedURL(cleanUrl, '', false, normalizedCustomHeaders) : fetchURL,
-      {
-        ...options,
-        method: options.method || 'GET',
-        headers: baseHeaders,
-        danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-      },
+    res = await tlsFetch(
+      fetch,
+      fetchURL,
+      { ...options, method: options.method || 'GET', headers: baseHeaders },
+      allowSelfSignedCert,
     );
   }
 
@@ -401,15 +425,16 @@ export const fetchWithAuth = async (
       // Skip the retry when it would just repeat the preemptive Basic header
       // we already sent (the credentials are simply wrong in that case).
       if (authHeader && authHeader !== preemptiveAuth) {
-        const finalUrl = useProxy
-          ? getProxiedURL(cleanUrl, authHeader, false, normalizedCustomHeaders)
-          : fetchURL;
-        res = await fetch(finalUrl, {
-          ...options,
-          method: options.method || 'GET',
-          headers: useProxy ? headers : { ...headers, Authorization: authHeader },
-          danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-        });
+        res = await tlsFetch(
+          fetch,
+          fetchURL,
+          {
+            ...options,
+            method: options.method || 'GET',
+            headers: { ...headers, Authorization: authHeader },
+          },
+          allowSelfSignedCert,
+        );
       }
     }
   }

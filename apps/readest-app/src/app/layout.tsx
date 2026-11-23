@@ -1,7 +1,7 @@
 import * as React from 'react';
 import type { Metadata, Viewport } from 'next';
 import Script from 'next/script';
-import { ViewTransitions } from 'next-view-transitions';
+import { ViewTransitions } from '@/components/ViewTransitions';
 import { EnvProvider } from '@/context/EnvContext';
 import Providers from '@/components/Providers';
 
@@ -131,9 +131,11 @@ const devHmrPatchScript = `(${patchTauriHmrWebSocket.toString()})(${JSON.stringi
 const shouldInjectRuntimeConfig = process.env['NEXT_PUBLIC_APP_PLATFORM'] === 'web';
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // Browser extensions can inject attributes on <html> before React hydrates it.
   return (
     <html
       lang='en'
+      suppressHydrationWarning
       className={process.env['NEXT_PUBLIC_APP_PLATFORM'] === 'tauri' ? 'edge-to-edge' : ''}
     >
       <head>

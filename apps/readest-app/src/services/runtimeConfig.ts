@@ -7,6 +7,8 @@ export interface ReadestRuntimeConfig {
   objectStorageType?: string | undefined;
   storageFixedQuota?: number | undefined;
   translationFixedQuota?: number | undefined;
+  fontBaseUrl?: string | undefined;
+  selfHosted?: boolean | undefined;
 }
 
 declare global {
@@ -42,6 +44,11 @@ export const getServerRuntimeConfig = (): ReadestRuntimeConfig => ({
   // the published image can be configured without rebuilding.
   objectStorageType:
     process.env['OBJECT_STORAGE_TYPE'] ?? process.env['NEXT_PUBLIC_OBJECT_STORAGE_TYPE'],
+  // A self-hosted deployment unlocks every premium feature: there is no store
+  // to buy from, and the operator already runs the infrastructure the paywall
+  // funds.
+  selfHosted:
+    (process.env['SELF_HOSTED'] || process.env['NEXT_PUBLIC_SELF_HOSTED']) === 'true' || undefined,
   storageFixedQuota: (() => {
     const raw =
       process.env['STORAGE_FIXED_QUOTA'] ?? process.env['NEXT_PUBLIC_STORAGE_FIXED_QUOTA'];
@@ -52,4 +59,11 @@ export const getServerRuntimeConfig = (): ReadestRuntimeConfig => ({
       process.env['TRANSLATION_FIXED_QUOTA'] ?? process.env['NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA'];
     return raw ? parseInt(raw, 10) : undefined;
   })(),
+  // Base URL of the directory holding the self-hosted CJK webfont bundles.
+  // Readest's own CDN only answers CORS for readest.com origins, so a
+  // self-hosted deployment on a custom domain has to serve them itself (#5550).
+  // `||` not `??`: compose passes the variable through even when it is unset,
+  // and an empty string would build root-relative font URLs.
+  fontBaseUrl:
+    process.env['FONT_BASE_URL'] || process.env['NEXT_PUBLIC_FONT_BASE_URL'] || undefined,
 });

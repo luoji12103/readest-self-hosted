@@ -1,6 +1,26 @@
+import { MAX_PUSH_BATCH } from '@/types/replica';
 import { HlcGenerator, hlcCompare, hlcMax, mergeFields } from '@/libs/crdt';
+import { isSyncError } from '@/libs/errors';
 import type { Hlc, ReplicaRow } from '@/types/replica';
 import type { ReplicaSyncClient } from '@/libs/replicaSyncClient';
+
+/** "This backend's kind allowlist predates the client" — never a row/data problem. */
+const isUnknownKindError = (err: unknown): boolean =>
+  isSyncError(err) && err.code === 'UNKNOWN_KIND';
+
+/** The server refused specific rows, so the other rows may still land. */
+const isRowRejection = (err: unknown): boolean =>
+  isSyncError(err) && (err.code === 'VALIDATION' || err.code === 'CLOCK_SKEW');
+
+/**
+ * Worth retrying in smaller pieces: a row-scoped refusal, or a 5xx that may
+ * have been provoked by one row. A transport failure (no HTTP status) is not —
+ * nothing reached the server, so splitting the batch only multiplies the wait.
+ */
+const isIsolatableError = (err: unknown): boolean =>
+  isUnknownKindError(err) ||
+  isRowRejection(err) ||
+  (isSyncError(err) && err.code === 'SERVER' && err.context.status !== undefined);
 
 export interface CursorStore {
   get(kind: string): Hlc | null;
@@ -12,6 +32,11 @@ export interface ReplicaSyncManagerOpts {
   client: Pick<ReplicaSyncClient, 'push' | 'pull' | 'pullBatch'>;
   cursorStore: CursorStore;
   debounceMs?: number;
+  /** Called at push time: returns the row to actually send, or null to skip it. */
+  prepareRow?: (row: ReplicaRow) => Promise<ReplicaRow | null>;
+  onAcknowledged?: (row: ReplicaRow) => void;
+  /** Called once per push batch in which the server refused rows for the device clock. */
+  onClockSkew?: () => void;
 }
 
 interface DirtyKey {
@@ -19,11 +44,11 @@ interface DirtyKey {
   replicaId: string;
 }
 
-const dirtyKeyOf = (row: ReplicaRow): string => `${row.kind}::${row.replica_id}`;
-const splitKey = (k: string): DirtyKey => {
-  const idx = k.indexOf('::');
-  return { kind: k.slice(0, idx), replicaId: k.slice(idx + 2) };
-};
+// Durable bookshelf edits retain their account across sign-out/sign-in.
+const dirtyKeyOf = (row: ReplicaRow): string =>
+  row.kind === 'bookshelf'
+    ? JSON.stringify([row.user_id, row.kind, row.replica_id])
+    : `${row.kind}::${row.replica_id}`;
 
 const mergeDirtyRows = (a: ReplicaRow, b: ReplicaRow): ReplicaRow => {
   if (a.user_id !== b.user_id || a.kind !== b.kind || a.replica_id !== b.replica_id) {
@@ -71,6 +96,22 @@ const mergeDirtyRows = (a: ReplicaRow, b: ReplicaRow): ReplicaRow => {
 
 export class ReplicaSyncManager {
   private readonly dirty = new Map<string, ReplicaRow>();
+  /**
+   * Kinds this backend rejected with UNKNOWN_KIND — its allowlist predates
+   * this client (a new replica kind ships in the app before the deployed
+   * server learns it). One such kind fails the WHOLE batch, push or pull, so
+   * we route around it instead of letting it take every other kind's sync
+   * down. Session-scoped on purpose: a backend deploy heals it on the next
+   * app start, with no persisted state to invalidate.
+   */
+  private readonly unsupportedKinds = new Set<string>();
+  /**
+   * Queued rows the server refused on their own merits (VALIDATION /
+   * CLOCK_SKEW). Retrying them is a request storm that never succeeds, so they
+   * sit out every later flush. Keyed by object identity: `markDirty` always
+   * stores a fresh object, so the next edit is tried again.
+   */
+  private readonly rejectedRows = new WeakSet<ReplicaRow>();
   private readonly debounceMs: number;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private autoSyncInstalled = false;
@@ -108,19 +149,96 @@ export class ReplicaSyncManager {
       this.debounceTimer = null;
     }
     if (this.dirty.size === 0) return;
-    const snapshot = Array.from(this.dirty.values());
-    const snapshotKeys = Array.from(this.dirty.keys());
+    const entries = Array.from(this.dirty.entries()).filter(
+      ([, row]) => !this.unsupportedKinds.has(row.kind) && !this.rejectedRows.has(row),
+    );
+    if (entries.length === 0) return;
+    for (let offset = 0; offset < entries.length; offset += MAX_PUSH_BATCH) {
+      await this.flushBatch(entries.slice(offset, offset + MAX_PUSH_BATCH));
+    }
+  }
+
+  private async flushBatch(entries: [string, ReplicaRow][]): Promise<void> {
+    const queued: ReplicaRow[] = [];
+    const snapshot: ReplicaRow[] = [];
+    const snapshotKeys: string[] = [];
+    for (const [key, row] of entries) {
+      if (this.unsupportedKinds.has(row.kind) || this.rejectedRows.has(row)) continue;
+      const prepared = this.opts.prepareRow ? await this.opts.prepareRow(row) : row;
+      if (!prepared) continue;
+      queued.push(row);
+      snapshot.push(prepared);
+      snapshotKeys.push(key);
+    }
+    if (!snapshot.length) return;
+
+    const pushed: number[] = [];
+    let deferred: unknown = null;
+    let clockSkewed = false;
+    const reject = (err: unknown, row: ReplicaRow) => {
+      this.rejectedRows.add(row);
+      if (isSyncError(err) && err.code === 'CLOCK_SKEW') clockSkewed = true;
+    };
     try {
       await this.opts.client.push(snapshot);
-      for (const k of snapshotKeys) {
-        const stillSame = this.dirty.get(k);
-        if (stillSame === snapshot[snapshotKeys.indexOf(k)]) {
-          this.dirty.delete(k);
+      snapshot.forEach((_, i) => pushed.push(i));
+    } catch (err) {
+      if (!isIsolatableError(err)) throw err;
+      // One bad row fails the ENTIRE push, and the queue is only cleared on
+      // success — so without this fallback that row wedges every other kind's
+      // writes for the rest of the session (a kind the backend's allowlist
+      // predates 422s, a stale timestamp 409s, a 5xx one row provoked). Retry
+      // per kind, then row by row, so everything healthy lands.
+      const indexesByKind = new Map<string, number[]>();
+      snapshot.forEach((row, i) => {
+        const list = indexesByKind.get(row.kind);
+        if (list) list.push(i);
+        else indexesByKind.set(row.kind, [i]);
+      });
+      for (const [kind, indexes] of indexesByKind) {
+        try {
+          await this.opts.client.push(indexes.map((i) => snapshot[i]!));
+          pushed.push(...indexes);
+          continue;
+        } catch (kindErr) {
+          if (isUnknownKindError(kindErr)) {
+            // Remembered and skipped from here on so it can never poison
+            // another push. Its rows stay queued (harmless, bounded).
+            this.unsupportedKinds.add(kind);
+            continue;
+          }
+          if (!isIsolatableError(kindErr)) {
+            deferred ??= kindErr;
+            continue;
+          }
+          if (indexes.length === 1) {
+            if (isRowRejection(kindErr)) reject(kindErr, queued[indexes[0]!]!);
+            else deferred ??= kindErr;
+            continue;
+          }
+        }
+        for (const i of indexes) {
+          try {
+            await this.opts.client.push([snapshot[i]!]);
+            pushed.push(i);
+          } catch (rowErr) {
+            if (isUnknownKindError(rowErr)) this.unsupportedKinds.add(kind);
+            else if (isRowRejection(rowErr)) reject(rowErr, queued[i]!);
+            else deferred ??= rowErr;
+          }
         }
       }
-    } catch (err) {
-      throw err;
     }
+    for (const i of pushed) {
+      this.opts.onAcknowledged?.(snapshot[i]!);
+      // Only the exact object we snapshotted may be dropped: a concurrent
+      // `markDirty` replaces it with a merge that hasn't been pushed yet.
+      if (this.dirty.get(snapshotKeys[i]!) === queued[i]) {
+        this.dirty.delete(snapshotKeys[i]!);
+      }
+    }
+    if (clockSkewed) this.opts.onClockSkew?.();
+    if (deferred) throw deferred;
   }
 
   async pull(kind: string, opts?: { since?: Hlc | null }): Promise<ReplicaRow[]> {
@@ -144,24 +262,53 @@ export class ReplicaSyncManager {
    * recovery semantics of the per-kind `pull(kind, { since: null })`
    * boot call.
    *
-   * Returns a `Map<kind, rows>`. Kinds present in the input but missing
-   * from the response (because they had no rows past the cursor) are
-   * still mapped to an empty array, so callers can iterate over the
-   * input kinds without checking for `undefined`.
+   * Returns a `Map<kind, rows>` covering every kind the backend answered
+   * for, including those with no rows past the cursor (empty array). A kind
+   * the backend REFUSED to answer for (UNKNOWN_KIND) is absent from the map
+   * instead: that is "no information", and callers must not read it as "the
+   * server has no rows" — applying an empty result would look identical to
+   * the server having dropped every row of that kind.
    */
   async pullMany(
     kinds: string[],
     opts?: { since?: Hlc | null },
   ): Promise<Map<string, ReplicaRow[]>> {
     const out = new Map<string, ReplicaRow[]>();
-    if (kinds.length === 0) return out;
+    const wanted = kinds.filter((kind) => !this.unsupportedKinds.has(kind));
+    if (wanted.length === 0) return out;
     const overrideSince = opts && 'since' in opts;
-    const cursors = kinds.map((kind) => ({
+    const cursors = wanted.map((kind) => ({
       kind,
       since: overrideSince ? (opts.since ?? null) : this.opts.cursorStore.get(kind),
     }));
-    const results = await this.opts.client.pullBatch(cursors);
-    for (const kind of kinds) out.set(kind, []);
+    let results: { kind: string; rows: ReplicaRow[] }[];
+    try {
+      results = await this.opts.client.pullBatch(cursors);
+      for (const kind of wanted) out.set(kind, []);
+    } catch (err) {
+      if (!isUnknownKindError(err)) throw err;
+      // One unknown kind 422s the whole batch. Re-issue the cursors one at a
+      // time so the kinds this backend DOES know still sync, and remember
+      // the offender so it never poisons another batch this session.
+      results = [];
+      const settled = await Promise.allSettled(
+        cursors.map(async (cursor) => ({
+          kind: cursor.kind,
+          rows: await this.opts.client.pull(cursor.kind, cursor.since),
+        })),
+      );
+      settled.forEach((result, i) => {
+        const kind = cursors[i]!.kind;
+        if (result.status === 'fulfilled') {
+          out.set(kind, []);
+          results.push(result.value);
+          return;
+        }
+        if (isUnknownKindError(result.reason)) this.unsupportedKinds.add(kind);
+        // Any other per-kind failure stays absent from the map too — no
+        // information, retried on the next trigger.
+      });
+    }
     for (const { kind, rows } of results) {
       this.observeAndAdvanceCursor(kind, rows);
       out.set(kind, rows);
@@ -206,6 +353,9 @@ export class ReplicaSyncManager {
   }
 
   pendingKeys(): DirtyKey[] {
-    return Array.from(this.dirty.keys()).map(splitKey);
+    return Array.from(this.dirty.values(), (row) => ({
+      kind: row.kind,
+      replicaId: row.replica_id,
+    }));
   }
 }

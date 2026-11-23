@@ -25,7 +25,7 @@ vi.mock('@/store/atmosphereStore', () => ({
   }),
 }));
 
-import ThemeModeSelector from '@/components/settings/color/ThemeModeSelector';
+import ThemeModeSelector from '@/components/settings/theme/ThemeModeSelector';
 
 afterEach(() => cleanup());
 
@@ -36,6 +36,31 @@ describe('ThemeModeSelector segmented control', () => {
     expect(screen.getByRole('radiogroup')).not.toBeNull();
     const segments = screen.getAllByRole('radio');
     expect(segments).toHaveLength(3);
+  });
+
+  it('adds Ambient Mode when an ambient light sensor is available', () => {
+    render(
+      <ThemeModeSelector themeMode='ambient' onThemeModeChange={() => {}} hasAmbientLightSensor />,
+    );
+
+    expect(screen.getAllByRole('radio')).toHaveLength(4);
+    expect(screen.getByRole('radio', { name: 'Ambient Mode' }).getAttribute('aria-checked')).toBe(
+      'true',
+    );
+  });
+
+  it('switches to ambient when that segment is clicked', () => {
+    const onThemeModeChange = vi.fn();
+    render(
+      <ThemeModeSelector
+        themeMode='auto'
+        onThemeModeChange={onThemeModeChange}
+        hasAmbientLightSensor
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Ambient Mode' }));
+    expect(onThemeModeChange).toHaveBeenCalledWith('ambient');
   });
 
   it('marks the active segment via aria-checked', () => {

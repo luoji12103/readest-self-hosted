@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
+import type { Renderer } from '@/types/view';
 import { useSettingsStore } from '@/store/settingsStore';
+import { useThemeStore } from '@/store/themeStore';
 import { useDeviceControlStore } from '@/store/deviceStore';
 import { saveSysSettings } from '@/helpers/settings';
+import { setLayeredTurnTouchClaimed } from '@/app/reader/utils/iframeEventHandlers';
 import {
+  BRIGHTNESS_GESTURE_ACTIVATION_PX,
+  BRIGHTNESS_GESTURE_EDGE_RATIO,
   computeBrightness,
   isInLeftEdge,
   shouldActivate,
+  TURN_GESTURE_LEFT_INSET_ATTRIBUTE,
 } from '@/app/reader/utils/brightnessGesture';
 
 const OVERLAY_HIDE_DELAY_MS = 600;
@@ -16,6 +22,11 @@ const DEFAULT_BRIGHTNESS = 0.5;
 interface LatestState {
   enabled: boolean;
   scrolled: boolean;
+  autoBrightness: boolean;
+  renderer: Renderer | undefined;
+  // Left safe-area inset (px), iPhone Duo only: its status-bar strip is a large
+  // left/right inset (#6307), so the gesture zone must start past it.
+  edgeInset: number;
 }
 
 /**
@@ -32,21 +43,46 @@ interface LatestState {
 export const useBrightnessGesture = (bookKey: string) => {
   const { appService, envConfig } = useEnv();
   const { settings } = useSettingsStore();
-  const { getViewSettings } = useReaderStore();
+  const { getView, getViewSettings } = useReaderStore();
   const { getScreenBrightness, setScreenBrightness } = useDeviceControlStore();
+  const { safeAreaInsets, isIPhoneDuo } = useThemeStore();
 
   const hasScreenBrightness = !!appService?.hasScreenBrightness;
   const viewSettings = getViewSettings(bookKey);
+  const renderer = getView(bookKey)?.renderer;
+  const brightnessGestureEnabled = hasScreenBrightness && settings.swipeBrightnessGesture;
 
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [overlayLevel, setOverlayLevel] = useState(0);
 
   // Everything the once-attached listener must read at the latest value.
-  const latestRef = useRef<LatestState>({ enabled: false, scrolled: false });
+  const latestRef = useRef<LatestState>({
+    enabled: false,
+    scrolled: false,
+    autoBrightness: false,
+    renderer: undefined,
+    edgeInset: 0,
+  });
   latestRef.current = {
-    enabled: hasScreenBrightness && settings.swipeBrightnessGesture,
+    enabled: brightnessGestureEnabled,
     scrolled: !!viewSettings?.scrolled,
+    autoBrightness: settings.autoScreenBrightness,
+    renderer,
+    edgeInset: isIPhoneDuo ? safeAreaInsets?.left || 0 : 0,
   };
+
+  useEffect(() => {
+    if (!renderer) return;
+    if (brightnessGestureEnabled) {
+      renderer.setAttribute(
+        TURN_GESTURE_LEFT_INSET_ATTRIBUTE,
+        String(BRIGHTNESS_GESTURE_EDGE_RATIO),
+      );
+    } else {
+      renderer.removeAttribute(TURN_GESTURE_LEFT_INSET_ATTRIBUTE);
+    }
+    return () => renderer.removeAttribute(TURN_GESTURE_LEFT_INSET_ATTRIBUTE);
+  }, [renderer, brightnessGestureEnabled]);
 
   // Per-gesture state.
   const armedRef = useRef(false);
@@ -56,6 +92,8 @@ export const useBrightnessGesture = (bookKey: string) => {
   const viewHeightRef = useRef(0);
   const startValueRef = useRef(DEFAULT_BRIGHTNESS);
   const levelRef = useRef(DEFAULT_BRIGHTNESS);
+  const gestureIdRef = useRef(0);
+  const readPendingRef = useRef(false);
   const rafIdRef = useRef<number | null>(null);
   const pendingValueRef = useRef<number | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -67,7 +105,7 @@ export const useBrightnessGesture = (bookKey: string) => {
 
   useEffect(() => {
     if (!hasScreenBrightness) return;
-    if (settings.screenBrightness >= 0) {
+    if (!settings.autoScreenBrightness && settings.screenBrightness >= 0) {
       seedRef.current = Math.max(0, Math.min(1, settings.screenBrightness / 100));
       seededRef.current = true;
       return;
@@ -81,12 +119,17 @@ export const useBrightnessGesture = (bookKey: string) => {
     return () => {
       cancelled = true;
     };
-  }, [hasScreenBrightness, settings.screenBrightness, getScreenBrightness]);
+  }, [
+    hasScreenBrightness,
+    settings.screenBrightness,
+    settings.autoScreenBrightness,
+    getScreenBrightness,
+  ]);
 
   const flushBrightness = useCallback(() => {
     rafIdRef.current = null;
     if (pendingValueRef.current !== null) {
-      setScreenBrightness(pendingValueRef.current);
+      setScreenBrightness(pendingValueRef.current, latestRef.current.autoBrightness);
       pendingValueRef.current = null;
     }
   }, [setScreenBrightness]);
@@ -114,13 +157,27 @@ export const useBrightnessGesture = (bookKey: string) => {
     activeRef.current = false;
   }, []);
 
+  const abortGesture = useCallback(() => {
+    cancelRaf();
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+    resetGesture();
+    setOverlayVisible(false);
+  }, [cancelRaf, resetGesture]);
+
   const registerBrightnessListeners = useCallback(
     (doc: Document) => {
       const opts = { capture: true, passive: false } as const;
 
       const onTouchStart = (e: TouchEvent) => {
-        resetGesture();
+        abortGesture();
         if (!latestRef.current.enabled) return;
+        // A second finger permanently yields this sequence to pinch/zoom. In
+        // particular, do not let the first finger keep brightness armed and
+        // steal later moves from the paginator in capture phase.
+        if (e.touches.length !== 1) return;
         const selection = doc.getSelection?.();
         if (selection && !selection.isCollapsed) return; // don't hijack selection
         const t = e.touches[0];
@@ -134,16 +191,62 @@ export const useBrightnessGesture = (bookKey: string) => {
         viewHeightRef.current = window.innerHeight;
         startXRef.current = t.screenX;
         startYRef.current = t.screenY;
-        armedRef.current = isInLeftEdge(t.screenX, viewWidth);
-        startValueRef.current = seedRef.current;
+        armedRef.current = isInLeftEdge(
+          t.screenX,
+          viewWidth,
+          BRIGHTNESS_GESTURE_EDGE_RATIO,
+          latestRef.current.edgeInset,
+        );
+        const applied = useDeviceControlStore.getState().lastScreenBrightness;
+        startValueRef.current = applied ?? seedRef.current;
+        // In system mode the brightness can change outside the reader (Control
+        // Center, Home) without a visibilitychange, so re-read the device value
+        // and hold brightness writes until this gesture's reading lands (#6374).
+        const gestureId = ++gestureIdRef.current;
+        readPendingRef.current = armedRef.current && latestRef.current.autoBrightness;
+        if (readPendingRef.current) {
+          getScreenBrightness().then((b) => {
+            if (gestureIdRef.current !== gestureId) return;
+            readPendingRef.current = false;
+            if (b >= 0 && b <= 1) startValueRef.current = b;
+          });
+        }
       };
 
       const onTouchMove = (e: TouchEvent) => {
         if (!armedRef.current) return;
+        if (e.touches.length !== 1) {
+          abortGesture();
+          return;
+        }
         const t = e.touches[0];
         if (!t) return;
         const dx = t.screenX - startXRef.current;
         const dy = t.screenY - startYRef.current;
+        // A text gesture that only began after touchstart owns the sequence:
+        // the OS long-press selected a word and the finger is now extending it
+        // (#5939), or the instant-highlight quick action engaged and locked the
+        // renderer (that one selects nothing, it synthesizes its range). Yield
+        // permanently — one-way, as below — because iOS can transiently
+        // collapse the selection while a handle is being dragged.
+        if (!activeRef.current) {
+          const selection = doc.getSelection?.();
+          if ((selection && !selection.isCollapsed) || latestRef.current.renderer?.scrollLocked) {
+            resetGesture();
+            return;
+          }
+        }
+        // Gesture ownership is one-way. Once the same activation distance is
+        // clearly horizontal, brightness may not claim the sequence later if
+        // the trajectory bends vertically; Slide/Curl can safely own it.
+        if (
+          !activeRef.current &&
+          Math.abs(dx) >= BRIGHTNESS_GESTURE_ACTIVATION_PX &&
+          Math.abs(dx) > Math.abs(dy)
+        ) {
+          resetGesture();
+          return;
+        }
         // Reserve the strip in scrolled mode: stop native scroll from the first
         // move, so there is no scroll-then-freeze jump once brightness activates.
         if (latestRef.current.scrolled) e.preventDefault();
@@ -155,26 +258,38 @@ export const useBrightnessGesture = (bookKey: string) => {
         e.stopImmediatePropagation();
         const value = computeBrightness(startValueRef.current, dy, viewHeightRef.current);
         levelRef.current = value;
+        if (readPendingRef.current) return;
         scheduleBrightness(value);
         setOverlayVisible(true);
         setOverlayLevel(value);
       };
 
       const onTouchEnd = (e: TouchEvent) => {
+        if (e.touches.length > 0) {
+          abortGesture();
+          return;
+        }
         if (!activeRef.current) {
           resetGesture();
           return;
         }
         e.preventDefault();
         e.stopImmediatePropagation();
+        // This capture-phase owner prevents the normal iframe touchend
+        // forwarder from seeing the release, so clear its per-touch state here.
+        setLayeredTurnTouchClaimed(bookKey, false);
         cancelRaf();
         const value = levelRef.current;
-        setScreenBrightness(value);
+        setScreenBrightness(value, latestRef.current.autoBrightness);
         seedRef.current = value;
-        saveSysSettings(envConfig, 'screenBrightness', Math.round(value * 100));
-        saveSysSettings(envConfig, 'autoScreenBrightness', false);
+        if (!latestRef.current.autoBrightness) {
+          saveSysSettings(envConfig, 'screenBrightness', Math.round(value * 100));
+        }
         if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
-        hideTimerRef.current = setTimeout(() => setOverlayVisible(false), OVERLAY_HIDE_DELAY_MS);
+        hideTimerRef.current = setTimeout(() => {
+          hideTimerRef.current = null;
+          setOverlayVisible(false);
+        }, OVERLAY_HIDE_DELAY_MS);
         resetGesture();
       };
 
@@ -183,7 +298,15 @@ export const useBrightnessGesture = (bookKey: string) => {
       doc.addEventListener('touchend', onTouchEnd, opts);
       doc.addEventListener('touchcancel', onTouchEnd, opts);
     },
-    [resetGesture, scheduleBrightness, cancelRaf, setScreenBrightness, envConfig],
+    [
+      abortGesture,
+      resetGesture,
+      scheduleBrightness,
+      cancelRaf,
+      setScreenBrightness,
+      getScreenBrightness,
+      envConfig,
+    ],
   );
 
   useEffect(() => {

@@ -3,14 +3,17 @@ query GetUserId {
   me {
     id
     username
+    account_privacy_setting_id
   }
 }
 `;
 
-export const QUERY_SEARCH_BOOK = `
-query SearchBook($query: String!) {
-  search(query: $query, query_type: "Book", per_page: 1) {
-    results
+// Ranked book ids only; the rows are hydrated by QUERY_GET_BOOKS so the client
+// never depends on the shape of the search index's documents.
+export const QUERY_SEARCH_BOOKS = `
+query SearchBooks($query: String!) {
+  search(query: $query, query_type: "Book", per_page: 20, page: 1) {
+    ids
   }
 }
 `;
@@ -26,6 +29,7 @@ query GetEdition($isbn: [String!]!, $user_id: Int!) {
     reading_format_id
     book {
       id
+      title
       pages
       user_books(where: { user_id: { _eq: $user_id } }) {
         id
@@ -54,35 +58,51 @@ query GetEdition($isbn: [String!]!, $user_id: Int!) {
 }
 `;
 
-export const QUERY_GET_BOOK_USER_DATA = `
-query GetBookUserData($book_id: Int!, $user_id: Int!) {
-  editions(
-    where: { book_id: { _eq: $book_id } }
-    limit: 1
-  ) {
-    book {
+// Hydrates search hits (and a stored link) in one request. `_in` does not keep
+// the search ranking, so the client re-sorts by its id list. `editions` selects
+// the most-read non-audio edition; an empty list means the book has no
+// readable edition (audiobook-only, reading_format_id 2) and must not receive
+// text progress.
+export const QUERY_GET_BOOKS = `
+query GetBooks($ids: [Int!]!, $user_id: Int!) {
+  books(where: { id: { _in: $ids } }) {
+    id
+    title
+    pages
+    release_year
+    users_read_count
+    cached_image
+    cached_contributors
+    editions(
+      where: {
+        _or: [{ reading_format_id: { _is_null: true } }, { reading_format_id: { _neq: 2 } }]
+      }
+      order_by: { users_count: desc_nulls_last }
+      limit: 1
+    ) {
       id
       pages
-      user_books(where: { user_id: { _eq: $user_id } }) {
+      reading_format_id
+    }
+    user_books(where: { user_id: { _eq: $user_id } }) {
+      id
+      status_id
+      edition {
         id
-        status_id
+        pages
+        reading_format_id
+      }
+      user_book_reads(
+        where: { finished_at: { _is_null: true } }
+        order_by: { started_at: desc }
+        limit: 1
+      ) {
+        id
+        started_at
         edition {
           id
           pages
           reading_format_id
-        }
-        user_book_reads(
-          where: { finished_at: { _is_null: true } }
-          order_by: { started_at: desc }
-          limit: 1
-        ) {
-          id
-          started_at
-          edition {
-            id
-            pages
-            reading_format_id
-          }
         }
       }
     }
@@ -184,15 +204,13 @@ mutation UpdateReadingJournal(
   $action_at: date,
   $page: Int!,
   $possible: Int!,
-  $percent: Float!,
-  $privacy_setting_id: Int!
+  $percent: Float!
 ) {
   update_reading_journal(
     id: $id
     object: {
       event: $event
       entry: $entry
-      privacy_setting_id: $privacy_setting_id
       tags: { category: "", spoiler: false, tag: "" }
       action_at: $action_at
       metadata: {
@@ -200,5 +218,22 @@ mutation UpdateReadingJournal(
       }
     }
   ) { errors id }
+}
+`;
+
+// The reader's notes and quotes for a book, oldest first. Hardcover returns at
+// most 100 rows a query.
+export const QUERY_GET_JOURNAL_ENTRIES = `
+query GetJournalEntries($user_id: Int!, $book_id: Int!, $limit: Int!, $offset: Int!) {
+  reading_journals(
+    where: {
+      user_id: { _eq: $user_id }
+      book_id: { _eq: $book_id }
+      event: { _in: ["note", "quote"] }
+    }
+    order_by: { id: asc }
+    limit: $limit
+    offset: $offset
+  ) { id event entry metadata }
 }
 `;

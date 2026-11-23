@@ -5,23 +5,19 @@ const TRIGGER_THRESHOLD_STAGE1 = 120;
 const TRIGGER_THRESHOLD_STAGE2 = 400;
 const MAX_LOADING_POSITION = 80;
 const PARALLAX_EFFECT = 0.3;
-
-// Platform-specific damping parameters for pull resistance
-const getPlatformDamping = () => {
-  const platform = getOSPlatform();
-
-  if (platform === 'ios') {
-    // iOS - tighter resistance (lower k = more damping)
-    return { MAX: 120, k: 0.35 };
-  } else if (platform === 'android') {
-    // Android - looser resistance (higher k = less damping)
-    return { MAX: 140, k: 0.5 };
-  }
-  return { MAX: 128, k: 0.4 };
-};
+// Rubber-band resistance: the content follows the finger at k of its speed at
+// first and saturates at MAX px, so a pull feels like a stiff overscroll
+// rather than dragging the shelf (34px at the 120px trigger, 74px at 400px).
+const DAMPING_MAX = 96;
+const DAMPING_K = 0.35;
+const SNAP_BACK_TRANSITION = 'transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)';
 
 function createApprFunction(MAX: number, k: number) {
   return (x: number) => MAX * (1 - Math.exp((-k * x) / MAX));
+}
+
+function getWrappers(el: HTMLElement): HTMLElement[] {
+  return Array.from(el.querySelectorAll<HTMLElement>('.transform-wrapper'));
 }
 
 export const usePullToRefresh = (
@@ -33,13 +29,16 @@ export const usePullToRefresh = (
     const el = ref.current;
     if (!el) return;
 
-    const damping = getPlatformDamping();
-    const appr = createApprFunction(damping.MAX, damping.k);
+    const appr = createApprFunction(DAMPING_MAX, DAMPING_K);
     let isLoading = false;
 
-    // Disable native bounce on the scroll container so the JS-based
-    // pull-to-refresh resistance is visible (especially on iOS WKWebView).
-    el.style.overscrollBehavior = 'none';
+    // The scroller keeps its native overscroll (#5148). iOS WKWebView bounces
+    // a nested scroller natively, so there the rubber-band carries the content
+    // and the hook only drives the spinner and the trigger. Chromium never
+    // draws an overscroll effect for a nested scroller (and the Android
+    // WebView draws none for a document that does not scroll), so elsewhere
+    // the hook translates the content itself, at both edges.
+    const nativeBounce = getOSPlatform() === 'ios';
 
     el.addEventListener('touchstart', handleTouchStart, { passive: true });
 
@@ -47,13 +46,36 @@ export const usePullToRefresh = (
       const el = ref.current;
       if (!el) return;
 
-      if (el.scrollTop > 0) return;
+      const atTop = el.scrollTop <= 0;
+      const atBottom = el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+      if (!atTop && !atBottom) return;
+      const canBottomBounce = atBottom && !nativeBounce;
+      let bottomPull = false;
 
       const initialX = startEvent.touches[0]!.clientX;
       const initialY = startEvent.touches[0]!.clientY;
 
       el.addEventListener('touchmove', handleTouchMove, { passive: true });
       el.addEventListener('touchend', handleTouchEnd);
+      el.addEventListener('touchcancel', handleTouchCancel);
+
+      function detachGesture() {
+        el!.removeEventListener('touchmove', handleTouchMove);
+        el!.removeEventListener('touchend', handleTouchEnd);
+        el!.removeEventListener('touchcancel', handleTouchCancel);
+      }
+
+      // The browser can cancel a touch (a system gesture, a native scroll
+      // takeover), and touchend never fires then: snap back and let go of
+      // the gesture without refreshing.
+      function handleTouchCancel() {
+        detachGesture();
+        hideLoadingSpinner(el!.parentNode as HTMLDivElement);
+        for (const wrapper of nativeBounce ? [] : getWrappers(el!)) {
+          wrapper.style.transition = SNAP_BACK_TRANSITION;
+          wrapper.style.transform = 'translateY(0)';
+        }
+      }
 
       function handleTouchMove(moveEvent: TouchEvent) {
         const el = ref.current;
@@ -64,7 +86,29 @@ export const usePullToRefresh = (
         const currentY = moveEvent.touches[0]!.clientY;
         const dx = currentX - initialX;
         const dy = currentY - initialY;
-        if (dy < 0 || Math.abs(dx) * 2 > Math.abs(dy)) return;
+        if (Math.abs(dx) * 2 > Math.abs(dy)) return;
+
+        // Re-check the edge on every move: a virtualized list can grow under
+        // the finger (a programmatic jump lands before the rows below are
+        // measured), and once it can scroll again the drag must scroll it.
+        const stillAtBottom = el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+        if (dy < 0 && canBottomBounce && stillAtBottom) {
+          bottomPull = true;
+          for (const wrapper of getWrappers(el)) {
+            wrapper.style.transform = `translate3d(0, ${-appr(-dy)}px, 0)`;
+          }
+          return;
+        }
+        if (bottomPull) {
+          // Dragged back past the starting point, or the scroller can scroll
+          // again: hand the gesture back to native scrolling.
+          bottomPull = false;
+          for (const wrapper of getWrappers(el)) {
+            wrapper.style.transform = '';
+          }
+        }
+        if (dy < 0) return;
+        if (!atTop) return;
 
         const transformValue = appr(dy);
 
@@ -79,9 +123,13 @@ export const usePullToRefresh = (
         // Update loading spinner position and opacity with parallax if it exists
         updateLoadingSpinnerPosition(parentEl, transformValue, dy);
 
-        const wrapper = el.querySelector('.transform-wrapper') as HTMLElement;
-        if (wrapper) {
-          wrapper.style.transform = `translate3d(0, ${transformValue}px, 0)`;
+        // The scroller can hold several transform targets (e.g. the recently
+        // read shelf in the Virtuoso Header plus the book list) — drag them
+        // all in lockstep so the whole shelf follows the pull.
+        if (!nativeBounce) {
+          for (const wrapper of getWrappers(el)) {
+            wrapper.style.transform = `translate3d(0, ${transformValue}px, 0)`;
+          }
         }
       }
 
@@ -124,14 +172,14 @@ export const usePullToRefresh = (
         const el = ref.current;
         if (!el) return;
 
-        const wrapper = el.querySelector('.transform-wrapper') as HTMLElement;
+        const wrappers = nativeBounce ? [] : getWrappers(el);
         const parentEl = el.parentNode as HTMLDivElement;
 
         const y = endEvent.changedTouches[0]!.clientY;
         const dy = y - initialY;
 
-        el.removeEventListener('touchmove', handleTouchMove);
-        el.removeEventListener('touchend', handleTouchEnd);
+        detachGesture();
+        if (!atTop && !bottomPull) return;
 
         const isStage2 = onTriggerStage2 && dy > TRIGGER_THRESHOLD_STAGE2;
         const isStage1 = dy > TRIGGER_THRESHOLD_STAGE1;
@@ -143,7 +191,7 @@ export const usePullToRefresh = (
           const transformValue = appr(dy);
           const targetPosition = Math.min(transformValue, MAX_LOADING_POSITION);
 
-          if (wrapper) {
+          for (const wrapper of wrappers) {
             wrapper.style.transition = 'transform 0.2s ease-out';
             wrapper.style.transform = `translateY(${targetPosition}px)`;
           }
@@ -177,7 +225,7 @@ export const usePullToRefresh = (
             // Update both wrapper and spinner position to maintain parallax consistency
             const newTransform = targetPosition + pullDelta;
             if (newTransform > 0) {
-              if (wrapper) {
+              for (const wrapper of wrappers) {
                 wrapper.style.transform = `translateY(${newTransform}px)`;
               }
 
@@ -194,7 +242,7 @@ export const usePullToRefresh = (
 
             // User pulled up significantly, reset
             if (pullDelta < -30) {
-              if (wrapper) {
+              for (const wrapper of wrappers) {
                 wrapper.style.transition = 'transform 0.3s ease-out';
                 wrapper.style.transform = 'translateY(0)';
               }
@@ -215,20 +263,22 @@ export const usePullToRefresh = (
           } finally {
             isLoading = false;
             hideLoadingSpinner(parentEl);
-            if (wrapper) {
+            for (const wrapper of wrappers) {
               wrapper.style.transition = 'transform 0.3s ease-out';
               wrapper.style.transform = 'translateY(0)';
-              setTimeout(() => {
-                if (wrapper) wrapper.style.transition = '';
-              }, 300);
             }
+            setTimeout(() => {
+              for (const wrapper of wrappers) {
+                wrapper.style.transition = '';
+              }
+            }, 300);
             el.removeEventListener('touchstart', handleLoadingTouchStart);
             el.removeEventListener('touchmove', handleLoadingTouchMove);
           }
         } else {
           hideLoadingSpinner(parentEl);
-          if (wrapper) {
-            wrapper.style.transition = 'transform 0.2s';
+          for (const wrapper of wrappers) {
+            wrapper.style.transition = SNAP_BACK_TRANSITION;
             wrapper.style.transform = 'translateY(0)';
           }
 

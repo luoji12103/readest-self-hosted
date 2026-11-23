@@ -1,6 +1,11 @@
 import { v4 as uuidv4 } from 'uuid';
+import { formatSyncFailure } from './syncResult';
+
 import type { Book } from '@/types/book';
+import { recordFlow } from '@/services/sync/dataFlow/log';
+import type { FlowDirection, FlowKind } from '@/services/sync/dataFlow/types';
 import type { EnvConfigType } from '@/services/environment';
+import type { ProgressHandler } from '@/utils/transfer';
 import type { TranslationFunc } from '@/hooks/useTranslation';
 import type { SystemSettings } from '@/types/settings';
 import type { UserPlan } from '@/types/quota';
@@ -9,6 +14,7 @@ import { useLibraryStore } from '@/store/libraryStore';
 import { useFileSyncStore } from '@/store/fileSyncStore';
 import { isWebAppPlatform } from '@/services/environment';
 import { hasValidWebDriveToken } from '@/services/sync/providers/gdrive/auth/webTokenStore';
+import { isICloudSupportedPlatform } from '@/services/sync/providers/icloud/buildICloudProvider';
 import {
   getActiveFileSyncBackends,
   settingsKeyForBackend,
@@ -29,9 +35,16 @@ import { FileSyncEngine, type SyncLibraryResult } from '@/services/sync/file/eng
  *
  * This lives in the runner, not the hooks, so the manual "Sync now", the library
  * auto-sync, and the reader's per-book sync all honour it.
+ *
+ * iCloud is additionally platform-gated: its `enabled` flag can reach a
+ * Windows/Android/web device via a settings backup restore, and only the
+ * iOS/macOS Tauri apps can reach a ubiquity container.
  */
-export const canBackendRun = (kind: FileSyncBackendKind): boolean =>
-  !(kind === 'gdrive' && isWebAppPlatform() && !hasValidWebDriveToken());
+export const canBackendRun = (kind: FileSyncBackendKind): boolean => {
+  if (kind === 'gdrive' && isWebAppPlatform() && !hasValidWebDriveToken()) return false;
+  if (kind === 'icloud' && !isICloudSupportedPlatform()) return false;
+  return true;
+};
 
 /**
  * The enabled backends that can ACTUALLY sync right now — {@link
@@ -50,14 +63,40 @@ export const getReadyFileSyncBackends = (
 const buildEngine = async (
   envConfig: EnvConfigType,
   kind: FileSyncBackendKind,
+  parentTransferId?: string,
 ): Promise<FileSyncEngine | null> => {
   if (!canBackendRun(kind)) return null;
   const settings = useSettingsStore.getState().settings;
   const appService = await envConfig.getAppService();
-  const fileProvider = await createFileSyncProvider(kind, settings);
+  const fileProvider = await createFileSyncProvider(kind, settings, parentTransferId);
   if (!fileProvider) return null;
   const store = createAppLocalStore({ appService, settings, envConfig });
   return new FileSyncEngine(fileProvider, store);
+};
+
+const bookFile = (connector: FileSyncBackendKind, direction: FlowDirection) =>
+  ({ connector, direction, kind: 'books' }) as const;
+
+export const recordLibraryPass = (connector: FileSyncBackendKind, result: SyncLibraryResult) => {
+  const add = (direction: FlowDirection, kind: FlowKind, count: number) =>
+    recordFlow({ connector, direction, kind, count });
+  add('push', 'progress', result.configsUploaded ?? 0);
+  add('pull', 'progress', result.configsDownloaded ?? 0);
+  add('push', 'books', result.filesUploaded ?? 0);
+  // booksAdded are shelf rows: their files download on demand.
+  add('pull', 'books', 0);
+  for (const { title, hash, reason, phase } of result.failedBooks) {
+    const direction = phase === 'download' ? 'pull' : 'push';
+    recordFlow({ ...bookFile(connector, direction), bookTitle: title || hash, error: reason });
+  }
+  if (result.indexPushFailed)
+    recordFlow({ ...bookFile(connector, 'push'), error: 'Failed to upload the library index' });
+};
+
+/** A pass that stopped partway doesn't say which side broke, so both are flagged. */
+export const recordLibraryPassFailure = (connector: FileSyncBackendKind, error: string) => {
+  recordFlow({ ...bookFile(connector, 'pull'), error });
+  recordFlow({ ...bookFile(connector, 'push'), error });
 };
 
 /** One backend's library sync. Throws; the caller isolates the failure. */
@@ -99,10 +138,13 @@ const syncOneBackend = async (
     },
   });
 
-  const latest = useSettingsStore.getState().settings;
-  const next = { ...latest, [key]: { ...latest[key], lastSyncedAt: Date.now() } };
-  useSettingsStore.getState().setSettings(next);
-  await appService.saveSettings(next);
+  recordLibraryPass(kind, result);
+  if (!result.failures && !result.indexPushFailed) {
+    const latest = useSettingsStore.getState().settings;
+    const next = { ...latest, [key]: { ...latest[key], lastSyncedAt: Date.now() } };
+    useSettingsStore.getState().setSettings(next);
+    await appService.saveSettings(next);
+  }
   return result;
 };
 
@@ -147,15 +189,25 @@ export const runFileLibrarySyncPass = async (
       if (i > 0) useFileSyncStore.getState().switchSync(kind, _('Syncing…'));
       try {
         const result = await syncOneBackend(envConfig, kind, _);
-        useFileSyncStore.getState().setLastError(kind, null);
         if (result) {
+          useFileSyncStore.getState().setLastError(kind, formatSyncFailure(result, _));
+          // Spread the latest counters, but ACCUMULATE everything that reports
+          // trouble — a plain spread let a healthy second mirror erase the
+          // first one's failures and its unwritten index (#5900).
           merged = merged
-            ? { ...result, booksSynced: merged.booksSynced + result.booksSynced }
+            ? {
+                ...result,
+                booksSynced: merged.booksSynced + result.booksSynced,
+                failures: merged.failures + result.failures,
+                failedBooks: [...merged.failedBooks, ...result.failedBooks],
+                indexPushFailed: merged.indexPushFailed || result.indexPushFailed,
+              }
             : result;
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         useFileSyncStore.getState().setLastError(kind, message);
+        recordLibraryPassFailure(kind, message);
         console.warn('[cloudSync] library file sync failed', kind, e);
       }
     }
@@ -182,6 +234,7 @@ export const runFileBookUpload = async (envConfig: EnvConfigType, book: Book): P
       const engine = await buildEngine(envConfig, kind);
       if (!engine) continue;
       const result = await engine.pushBookFile(book);
+      if (result.uploaded) recordFlow({ ...bookFile(kind, 'push'), bookTitle: book.title });
       if (!result.uploaded && result.reason !== 'remote-matches') continue;
       anyUploaded = true;
       try {
@@ -191,6 +244,11 @@ export const runFileBookUpload = async (envConfig: EnvConfigType, book: Book): P
       }
     } catch (e) {
       console.warn('[cloudSync] book upload failed', kind, book.hash, e);
+      recordFlow({
+        ...bookFile(kind, 'push'),
+        bookTitle: book.title,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
   return anyUploaded;
@@ -206,18 +264,26 @@ export const runFileBookUpload = async (envConfig: EnvConfigType, book: Book): P
 export const runFileBookDownload = async (
   envConfig: EnvConfigType,
   book: Book,
+  onProgress?: ProgressHandler,
+  parentTransferId?: string,
 ): Promise<boolean> => {
   const backends = getActiveFileSyncBackends(useSettingsStore.getState().settings);
   for (const kind of backends) {
     try {
-      const engine = await buildEngine(envConfig, kind);
+      const engine = await buildEngine(envConfig, kind, parentTransferId);
       if (!engine) continue;
-      if (!(await engine.downloadBookFile(book))) continue;
+      if (!(await engine.downloadBookFile(book, onProgress))) continue;
+      recordFlow({ ...bookFile(kind, 'pull'), bookTitle: book.title });
       book.downloadedAt = Date.now();
       if (!book.coverDownloadedAt) book.coverDownloadedAt = Date.now();
       return true;
     } catch (e) {
       console.warn('[cloudSync] book download failed', kind, book.hash, e);
+      recordFlow({
+        ...bookFile(kind, 'pull'),
+        bookTitle: book.title,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
   return false;

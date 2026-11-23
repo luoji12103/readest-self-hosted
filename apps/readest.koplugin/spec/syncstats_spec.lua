@@ -3,17 +3,7 @@
 -- applyRemote upsert with max-duration conflict resolution.
 
 local spec_helper = require("spec_helper")
-
--- Minimal KOReader stubs the module pulls at require-time.
-package.preload["ui/widget/infomessage"] = function()
-    return { new = function() return {} end }
-end
-package.preload["ui/uimanager"] = function()
-    return { show = function() end }
-end
-package.preload["readest_i18n"] = function()
-    return function(s) return s end
-end
+local stubs = require("spec.koreader_stubs")
 
 local SQ3 = require("lua-ljsqlite3/init")
 local DataStorage = require("datastorage")
@@ -45,11 +35,38 @@ describe("readest_syncstats", function()
 
     before_each(function()
         spec_helper.reset()
+        stubs.reset()
         os.remove(statsDbPath())
         seedDb()
         package.loaded["readest_syncstats"] = nil
         SyncStats = require("readest_syncstats")
     end)
+
+    -- Chunked pushes chain via UIManager:nextTick; run them to completion.
+    local function drainScheduled()
+        while stubs.UIManager:drain() > 0 do end
+    end
+
+    -- Seed one book plus a page event per entry of `starts` (page = index).
+    local function seedPageEvents(starts)
+        local conn = SQ3.open(statsDbPath())
+        conn:exec("INSERT INTO book (title, authors, md5) VALUES ('T', 'A', 'md5-big');")
+        conn:exec("BEGIN;")
+        local stmt = conn:prepare(
+            "INSERT INTO page_stat_data (id_book, page, start_time, duration, total_pages) VALUES (1, ?, ?, 5, 9);")
+        for i, start in ipairs(starts) do
+            stmt:reset():bind(i, start):step()
+        end
+        stmt:close()
+        conn:exec("COMMIT;")
+        conn:close()
+    end
+
+    local function sequentialStarts(n)
+        local starts = {}
+        for i = 1, n do starts[i] = i end
+        return starts
+    end
 
     it("collects only events past the cursor, joined with md5", function()
         local conn = SQ3.open(statsDbPath())
@@ -256,7 +273,7 @@ describe("readest_syncstats", function()
         end }
         local ui = { statistics = { id_curr_book = 1 } }
 
-        SyncStats:pull({ stats_pull_cursor = 0 }, client, false, nil, ui)
+        SyncStats:pull({ stats_pull_cursor = 0 }, client, false, ui)
 
         local conn2 = SQ3.open(statsDbPath())
         local live = conn2:rowexec("SELECT COUNT(*) FROM book WHERE id = 1;")
@@ -341,6 +358,105 @@ describe("readest_syncstats", function()
         assert.are.equal(250, settings.stats_push_cursor) -- max start_time; only set on success
     end)
 
+    -- #5666: a device with a large backlog (fresh push cursor after pulling the
+    -- full multi-device history) must not send everything in one request — the
+    -- sync client's 10s total socket timeout kills it, the cursor never
+    -- advances, and every retry re-sends the same payload, wedging "Push stats
+    -- now" forever. Mirror the app's statsSync.ts: bounded chunks, cursor
+    -- advanced per successful chunk.
+    it("pushes a large backlog in bounded chunks, advancing the cursor per chunk (#5666)", function()
+        seedPageEvents(sequentialStarts(1001))
+        local settings = { stats_push_cursor = 0 }
+        local calls, cursor_at_call = {}, {}
+        local client = { pushChanges = function(_, payload, cb)
+            table.insert(calls, payload)
+            table.insert(cursor_at_call, settings.stats_push_cursor)
+            cb(true)
+        end }
+
+        SyncStats:push(settings, client, false)
+        drainScheduled()
+
+        assert.are.equal(3, #calls)
+        assert.are.equal(500, #calls[1].statPages)
+        assert.are.equal(500, #calls[2].statPages)
+        assert.are.equal(1, #calls[3].statPages)
+        -- each chunk resumes where the previous one ended
+        assert.are.equal(501, calls[2].statPages[1].start_time)
+        assert.are.equal(1001, calls[3].statPages[1].start_time)
+        -- the cursor advanced after every successful chunk, not once at the end
+        assert.are.same({ 0, 500, 1000 }, cursor_at_call)
+        assert.are.equal(1001, settings.stats_push_cursor)
+        -- every chunk redeclares the stat books its pages reference
+        for _, payload in ipairs(calls) do
+            assert.are.equal(1, #payload.statBooks)
+            assert.are.equal("md5-big", payload.statBooks[1].book_hash)
+        end
+    end)
+
+    it("keeps partial progress when a chunk fails, and a retry resumes from the cursor", function()
+        seedPageEvents(sequentialStarts(1000))
+        local settings = { stats_push_cursor = 0 }
+        local n = 0
+        local client = { pushChanges = function(_, _payload, cb)
+            n = n + 1
+            if n == 2 then cb(false, { error = "timeout" }) -- second chunk fails
+            else cb(true) end
+        end }
+
+        -- Patch show/new on the instances the module captured (whichever spec
+        -- file's stub won the package.loaded race — see koreader_stubs.lua).
+        local InfoMessage = require("ui/widget/infomessage")
+        local UIManager = require("ui/uimanager")
+        local orig_new, orig_show = InfoMessage.new, UIManager.show
+        local shown = {}
+        InfoMessage.new = function(_, o) return { text = o and o.text } end
+        UIManager.show = function(_, w) table.insert(shown, w and w.text) end
+
+        SyncStats:push(settings, client, true)
+        drainScheduled()
+
+        InfoMessage.new, UIManager.show = orig_new, orig_show
+        assert.are.equal(500, settings.stats_push_cursor) -- first chunk's progress kept
+        assert.are.same({ "Failed to push reading statistics\nThe connection timed out. Please try again." }, shown)
+
+        -- the retry picks up after the last successful chunk
+        local retry_calls = {}
+        local retry_client = { pushChanges = function(_, payload, cb)
+            table.insert(retry_calls, payload)
+            cb(true)
+        end }
+        SyncStats:push(settings, retry_client, false)
+        drainScheduled()
+
+        assert.are.equal(1, #retry_calls)
+        assert.are.equal(500, #retry_calls[1].statPages)
+        assert.are.equal(501, retry_calls[1].statPages[1].start_time)
+        assert.are.equal(1000, settings.stats_push_cursor)
+    end)
+
+    it("never splits page events sharing a start_time across chunks", function()
+        -- 499 distinct seconds, then 3 events in the same second (split view /
+        -- same-second turns). Cutting between them would advance the cursor
+        -- past the unsent ones and drop them on resume.
+        local starts = sequentialStarts(499)
+        for _ = 1, 3 do starts[#starts + 1] = 500 end
+        seedPageEvents(starts)
+        local settings = { stats_push_cursor = 0 }
+        local calls = {}
+        local client = { pushChanges = function(_, payload, cb)
+            table.insert(calls, payload)
+            cb(true)
+        end }
+
+        SyncStats:push(settings, client, false)
+        drainScheduled()
+
+        assert.are.equal(1, #calls)
+        assert.are.equal(502, #calls[1].statPages)
+        assert.are.equal(500, settings.stats_push_cursor)
+    end)
+
     -- The "Push stats now" / "Pull stats now" menu entries call push/pull with
     -- interactive=true; an interactive sync must confirm its result the way the
     -- sibling "now" menu items do (a silent success looks like a no-op).
@@ -357,6 +473,20 @@ describe("readest_syncstats", function()
 
         InfoMessage.new, UIManager.show = orig_new, orig_show
         assert.are.equal("Reading statistics are up to date", shown)
+    end)
+    it("leaves statistics pending and suppresses toasts when auth owns the login prompt", function()
+        seedPageEvents({100})
+        local settings = { stats_push_cursor = 0, stats_pull_cursor = 50 }
+        local rejected = { error = "authentication required", auth_required = true }
+        local client = {
+            pushChanges = function(_, _, cb) cb(false, rejected, 401) end,
+            pullChanges = function(_, _, cb) cb(false, rejected, 401) end,
+        }
+        SyncStats:push(settings, client, true)
+        SyncStats:pull(settings, client, true)
+        assert.are.equal(0, settings.stats_push_cursor)
+        assert.are.equal(50, settings.stats_pull_cursor)
+        assert.are.equal(0, #stubs.UIManager._shown)
     end)
 
     -- Spore's validate() (common/Spore/Request.lua) asserts every param passed
@@ -392,8 +522,98 @@ describe("readest_syncstats", function()
         }
         local client = { pullChanges = function(_, _params, cb) cb(true, response, 200) end }
 
-        SyncStats:pull(settings, client, false, function() end)
+        SyncStats:pull(settings, client, false)
 
         assert.are.equal(4242, settings.stats_pull_cursor) -- newest updated_at_ms
+    end)
+
+    -- Build a pull response of `n` page events with updated_at_ms running
+    -- from `from_ms` upwards (one per ms), all for one book.
+    local function pageResponse(from_ms, n)
+        local pages = {}
+        for i = 1, n do
+            pages[i] = { book_hash = "md5-pull", page = i, start_time = from_ms + i,
+                         duration = 5, total_pages = 10, updated_at_ms = from_ms + i }
+        end
+        return {
+            statBooks = { { book_hash = "md5-pull", title = "P", authors = "A" } },
+            statPages = pages,
+        }
+    end
+
+    it("pulls a large history in bounded pages, advancing the cursor per page", function()
+        local settings = { stats_pull_cursor = 0 }
+        local sinces, limits, cursor_at_call = {}, {}, {}
+        -- server pages: 1000, 1000, then a short page of 5
+        local sizes = { 1000, 1000, 5 }
+        local client = { pullChanges = function(_, params, cb)
+            table.insert(sinces, params.since)
+            table.insert(limits, params.limit)
+            table.insert(cursor_at_call, settings.stats_pull_cursor)
+            cb(true, pageResponse(params.since, sizes[#sinces] or 0), 200)
+        end }
+
+        SyncStats:pull(settings, client, false)
+        drainScheduled()
+
+        assert.are.equal(3, #sinces)
+        assert.are.same({ 1000, 1000, 1000 }, limits)
+        -- each page resumes from the previous page's newest updated_at_ms
+        assert.are.same({ 0, 1000, 2000 }, sinces)
+        -- the cursor advanced after every page, not once at the end
+        assert.are.same({ 0, 1000, 2000 }, cursor_at_call)
+        assert.are.equal(2005, settings.stats_pull_cursor)
+        assert.are.equal(settings, G_reader_settings:readSetting("readest_sync"))
+
+        local conn = SQ3.open(statsDbPath())
+        local n = conn:rowexec("SELECT COUNT(*) FROM page_stat_data;")
+        conn:close()
+        assert.are.equal(2005, tonumber(n))
+    end)
+
+    it("keeps partial progress when a page fails, and a retry resumes from the cursor", function()
+        local settings = { stats_pull_cursor = 0 }
+        local calls = 0
+        local client = { pullChanges = function(_, params, cb)
+            calls = calls + 1
+            if calls == 2 then
+                cb(false, nil, 500)
+            else
+                cb(true, pageResponse(params.since, 1000), 200)
+            end
+        end }
+
+        SyncStats:pull(settings, client, false)
+        drainScheduled()
+
+        assert.are.equal(2, calls)
+        assert.are.equal(1000, settings.stats_pull_cursor) -- first page kept
+
+        local sinces = {}
+        client.pullChanges = function(_, params, cb)
+            table.insert(sinces, params.since)
+            cb(true, pageResponse(params.since, #sinces == 1 and 1000 or 3), 200)
+        end
+        SyncStats:pull(settings, client, false)
+        drainScheduled()
+
+        assert.are.same({ 1000, 2000 }, sinces) -- resumed, not restarted
+        assert.are.equal(2003, settings.stats_pull_cursor)
+    end)
+
+    it("declares limit as an expected pullChanges param", function()
+        local json = require("json")
+        local f = assert(io.open("readest-sync-api.json", "r"))
+        local spec = json.decode(f:read("*a"))
+        f:close()
+
+        local method = spec.methods.pullChanges
+        local expected = {}
+        for _, k in ipairs(method.required_params or {}) do expected[k] = true end
+        for _, k in ipairs(method.optional_params or {}) do expected[k] = true end
+
+        for _, k in ipairs({ "since", "type", "book", "meta_hash", "limit" }) do
+            assert.is_true(expected[k] == true, k .. " must be an expected pullChanges param")
+        end
     end)
 end)

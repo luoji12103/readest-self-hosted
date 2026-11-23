@@ -24,24 +24,37 @@ export const EnvProvider = ({ children }: { children: ReactNode }) => {
   React.useEffect(() => {
     bootstrapReplicaAdapters();
     enableReplicaAutoPersist(envConfig);
-    envConfig.getAppService().then(async (service) => {
-      setAppService(service);
-      try {
-        const settings = await service.loadSettings();
-        if (settings.replicaDeviceId) {
-          const ctx = initReplicaSync({
-            deviceId: settings.replicaDeviceId,
-            cursorStore: createSettingsCursorStore(service),
-          });
-          ctx.manager.startAutoSync();
-          startReplicaTransferIntegration(service);
+    envConfig
+      .getAppService()
+      .then(async (service) => {
+        setAppService(service);
+        try {
+          const settings = await service.loadSettings();
+          if (settings.replicaDeviceId) {
+            const ctx = initReplicaSync({
+              deviceId: settings.replicaDeviceId,
+              cursorStore: createSettingsCursorStore(service),
+            });
+            ctx.manager.startAutoSync();
+            startReplicaTransferIntegration(service);
+          }
+        } catch (err) {
+          console.warn('replica sync init failed', err);
         }
-      } catch (err) {
-        console.warn('replica sync init failed', err);
-      }
-    });
+      })
+      // Every page gates its render on a non-null `appService`, so an
+      // unhandled rejection here is invisible: no error, no UI, just a blank
+      // window for the rest of the session. Surface it instead.
+      .catch((err) => {
+        console.error('Failed to initialize app service:', err);
+      });
+    // Swallow the benign resize notice so it never reaches an error reporter.
+    // Chromium renamed it — it was "ResizeObserver loop limit exceeded" and is
+    // now "ResizeObserver loop completed with undelivered notifications." — so
+    // the old exact match silently stopped catching anything. Both wordings
+    // mean the same thing: observations were deferred to the next frame.
     window.addEventListener('error', (e) => {
-      if (e.message === 'ResizeObserver loop limit exceeded') {
+      if (e.message?.startsWith('ResizeObserver loop')) {
         e.stopImmediatePropagation();
         e.preventDefault();
         return true;

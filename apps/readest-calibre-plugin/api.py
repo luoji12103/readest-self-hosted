@@ -16,9 +16,17 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+
+try:
+    load_translations()
+except NameError:
+    # Running outside calibre's plugin loader (unit tests): no translations.
+    def _(text):
+        return text
 
 DEFAULT_API_BASE = 'https://web.readest.com/api'
-DEFAULT_SUPABASE_URL = 'https://readest.supabase.co'
+DEFAULT_SUPABASE_URL = 'https://vbsyxfusjjqdxkjqlysc.supabase.co'
 # Public anon key, same one readest.koplugin ships (base64-encoded in main.lua).
 DEFAULT_ANON_KEY = (
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
@@ -29,6 +37,28 @@ DEFAULT_ANON_KEY = (
 
 TIMEOUT = 30
 UPLOAD_TIMEOUT = 600
+# Servers cap this (100 at the time of writing) and report the size they
+# actually served, so asking for more is free and pays off if the cap rises:
+# the listing costs about a second per request regardless of rows returned.
+LIST_PAGE_SIZE = 1000
+# Page size for the books pull. A 10k-book library cannot come back in one
+# response — serializing it exceeded the server's per-request resource limits
+# (Cloudflare error 1102) — so pull_books walks bounded pages instead.
+PULL_PAGE_SIZE = 1000
+
+
+def _synced_at_ms(row):
+    """Epoch ms of a row's synced_at (fallback updated_at); 0 when absent."""
+    value = row.get('synced_at') or row.get('updated_at')
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
 class ReadestAPIError(Exception):
@@ -210,7 +240,7 @@ class ReadestClient:
             body={'email': email, 'password': password},
         )
         if status != 200 or not isinstance(parsed, dict):
-            raise ReadestAPIError(self._error_message(parsed, payload, 'Login failed'), status)
+            raise ReadestAPIError(self._error_message(parsed, payload, _('Login failed')), status)
         self._store_tokens(parsed)
         return parsed.get('user') or {}
 
@@ -221,7 +251,7 @@ class ReadestClient:
     def refresh(self):
         refresh_token = self.tokens and self.tokens.get('refresh_token')
         if not refresh_token:
-            raise AuthRequiredError('Not logged in')
+            raise AuthRequiredError(_('Not logged in'))
         status, parsed, payload = self._request(
             'POST',
             self.supabase_url + '/auth/v1/token?grant_type=refresh_token',
@@ -230,7 +260,7 @@ class ReadestClient:
         )
         if status != 200 or not isinstance(parsed, dict):
             raise AuthRequiredError(
-                self._error_message(parsed, payload, 'Session expired, please log in again'),
+                self._error_message(parsed, payload, _('Session expired, please log in again')),
                 status,
             )
         self._store_tokens(parsed)
@@ -239,7 +269,7 @@ class ReadestClient:
         # Mirrors readest_syncauth.lua: refresh once less than half the TTL
         # remains; a token past its final minute is unusable without refresh.
         if not self.tokens or not self.tokens.get('access_token'):
-            raise AuthRequiredError('Not logged in')
+            raise AuthRequiredError(_('Not logged in'))
         expires_at = self.tokens.get('expires_at') or 0
         expires_in = self.tokens.get('expires_in') or 3600
         if expires_at < time.time() + max(60, expires_in / 2):
@@ -253,7 +283,7 @@ class ReadestClient:
             'GET', self.supabase_url + '/auth/v1/user', headers
         )
         if status != 200 or not isinstance(parsed, dict):
-            raise AuthRequiredError(self._error_message(parsed, payload, 'Not logged in'), status)
+            raise AuthRequiredError(self._error_message(parsed, payload, _('Not logged in')), status)
         return parsed
 
     def sign_out(self):
@@ -279,19 +309,42 @@ class ReadestClient:
         }
         status, parsed, payload = self._request(method, self.api_base + path, headers, body=body)
         if status in (401, 403):
-            message = self._error_message(parsed, payload, 'Not authenticated')
+            message = self._error_message(parsed, payload, _('Not authenticated'))
             if 'quota' in message.lower():
                 raise QuotaExceededError(message, status)
             raise AuthRequiredError(message, status)
         if status != 200:
             raise ReadestAPIError(
-                self._error_message(parsed, payload, 'Request failed (%s)' % status), status
+                self._error_message(parsed, payload, _('Request failed (%s)') % status), status
             )
         return parsed
 
     def pull_books(self, since=0):
-        result = self._api('GET', '/sync?type=books&since=%d' % since)
-        return (result or {}).get('books') or []
+        """All book rows changed since `since` (epoch ms), pulled in pages.
+
+        The server returns each page ordered by synced_at ascending and
+        completed to the trailing timestamp, so advancing the cursor to the
+        newest row seen and re-asking never skips rows; the millisecond-
+        truncated cursor can re-return boundary rows, deduped here with
+        last-wins. A page shorter than the limit — or a cursor that cannot
+        advance — means the delta is exhausted. A server that ignores `limit`
+        returns everything at once and the follow-up page comes back empty.
+        """
+        by_key = {}
+        cursor = since
+        while True:
+            result = self._api(
+                'GET', '/sync?type=books&since=%d&limit=%d' % (cursor, PULL_PAGE_SIZE)
+            )
+            rows = (result or {}).get('books') or []
+            max_ms = cursor
+            for row in rows:
+                by_key[row.get('book_hash') or row.get('id')] = row
+                max_ms = max(max_ms, _synced_at_ms(row))
+            if len(rows) < PULL_PAGE_SIZE or max_ms <= cursor:
+                break
+            cursor = max_ms
+        return list(by_key.values())
 
     def push_books(self, records):
         return self._api('POST', '/sync', body={'books': records, 'notes': [], 'configs': []})
@@ -306,6 +359,30 @@ class ReadestClient:
     def list_files(self, book_hash):
         result = self._api('GET', '/storage/list?bookHash=' + urllib.parse.quote(book_hash))
         return (result or {}).get('files') or []
+
+    def list_files_page(self, page):
+        """(files, total_pages) for one page of the whole-account listing.
+
+        `total_pages` reflects the page size the server actually served, so
+        paging stays correct whether or not it honoured LIST_PAGE_SIZE.
+        """
+        result = (
+            self._api('GET', '/storage/list?page=%d&pageSize=%d' % (page, LIST_PAGE_SIZE)) or {}
+        )
+        return (result.get('files') or []), (result.get('totalPages') or 0)
+
+    def list_all_files(self):
+        """Every stored file for the user, following the endpoint's paging.
+
+        Pagination is driven by `totalPages`, not by the batch length: the
+        endpoint pads each page with the other files of any book it touched,
+        so a batch can be larger than `pageSize`.
+        """
+        files, total_pages = self.list_files_page(1)
+        for page in range(2, total_pages + 1):
+            more, _ = self.list_files_page(page)
+            files.extend(more)
+        return files
 
     def delete_file(self, file_key):
         return self._api(
@@ -322,7 +399,7 @@ class ReadestClient:
         )
         status, payload = self.transport(request, UPLOAD_TIMEOUT)
         if status not in (200, 201, 204):
-            message = 'Upload failed (%s)' % status
+            message = _('Upload failed (%s)') % status
             if payload:
                 # S3/R2 error responses are XML; surface the <Code> tag.
                 text = payload.decode('utf-8', 'replace')

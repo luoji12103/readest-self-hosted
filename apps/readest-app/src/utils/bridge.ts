@@ -1,4 +1,9 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
+import { getOSPlatform } from '@/utils/misc';
+
+/** Android and iOS native paper renderer; only metadata crosses this command. */
+export const paperCurl = <T>(payload: object) =>
+  invoke<T>('plugin:native-bridge|paper_curl', { payload });
 
 export interface CopyURIRequest {
   uri: string;
@@ -27,7 +32,8 @@ export interface UseBackgroundAudioRequest {
   enabled: boolean;
 }
 
-export interface SetTextSelectionSuppressedRequest {
+export interface SetSelectionSuppressedRequest {
+  target: 'gesture' | 'menu';
   suppressed: boolean;
 }
 
@@ -83,7 +89,20 @@ export interface GetSafeAreaInsetsResponse {
   right: number;
   bottom: number;
   left: number;
+  bottomCornerRadius?: number;
+  isIPhoneDuo?: boolean;
+  /** iOS: whether the root view controller currently hides the status bar. */
+  statusBarHidden?: boolean;
+  /** iPhone Duo: hinge status and folding region (window points). */
+  fold?: DuoFoldState;
   error?: string;
+}
+
+export interface DuoFoldState {
+  status: 'closed' | 'partial' | 'open' | 'unknown';
+  /** Whether the folding region currently divides the display. */
+  regionActive?: boolean;
+  region?: { x: number; y: number; width: number; height: number };
 }
 
 interface GetScreenBrightnessResponse {
@@ -93,6 +112,7 @@ interface GetScreenBrightnessResponse {
 
 interface SetScreenBrightnessRequest {
   brightness: number; // 0.0 to 1.0
+  persist?: boolean; // iOS: keep the value as the system brightness, don't restore it
 }
 
 interface SetScreenBrightnessResponse {
@@ -122,6 +142,10 @@ export interface RefreshEinkScreenResponse {
   error?: string;
 }
 
+export interface EinkRefreshSupportedResponse {
+  supported: boolean;
+}
+
 export async function copyURIToPath(request: CopyURIRequest): Promise<CopyURIResponse> {
   const result = await invoke<CopyURIResponse>('plugin:native-bridge|copy_uri_to_path', {
     payload: request,
@@ -144,14 +168,32 @@ export async function invokeUseBackgroundAudio(request: UseBackgroundAudioReques
   });
 }
 
-// iOS-only: suppress the system long-press text selection for non-editable
-// web content while the instant-highlight quick action owns the hold gesture.
-// JS-level suppression cannot win that race — WebKit consults selectability
-// before any touch handler runs — so the gate lives in the native plugin.
-export async function setTextSelectionSuppressed(
-  request: SetTextSelectionSuppressedRequest,
+/**
+ * Acquire or release the Android WifiManager MulticastLock so LocalSend
+ * discovery announcements are delivered. Android only; a no-op elsewhere
+ * (callers gate on isAndroidApp).
+ */
+export async function setMulticastLock(acquire: boolean): Promise<void> {
+  await invoke('plugin:native-bridge|set_multicast_lock', {
+    payload: { acquire },
+  });
+}
+
+// Suppress a piece of the OS text-selection UI that would fight the reader's
+// own selection UX:
+//  - target 'gesture' (iOS): the system long-press selection for non-editable
+//    content, while the instant-highlight quick action owns the hold. WebKit
+//    consults selectability before any touch handler runs, so JS-level
+//    suppression cannot win that race.
+//  - target 'menu' (Android, #5427): the floating selection ActionMode
+//    (Copy / Share / Select all), so it can't cover Readest's annotation
+//    toolbar. Chromium shows it through paths that never fire a cancelable
+//    `contextmenu` event, so DOM-level preventDefault can't stop it;
+//    MainActivity refuses floating action modes while this flag is set.
+export async function setSelectionSuppressed(
+  request: SetSelectionSuppressedRequest,
 ): Promise<void> {
-  await invoke('plugin:native-bridge|set_text_selection_suppressed', {
+  await invoke('plugin:native-bridge|set_selection_suppressed', {
     payload: request,
   });
 }
@@ -223,6 +265,10 @@ export async function getSafeAreaInsets(): Promise<GetSafeAreaInsetsResponse> {
   return result;
 }
 
+export async function setScreenWakeLock(enabled: boolean): Promise<void> {
+  await invoke('plugin:native-bridge|set_screen_wake_lock', { payload: { enabled } });
+}
+
 export async function getScreenBrightness(): Promise<GetScreenBrightnessResponse> {
   const result = await invoke<GetScreenBrightnessResponse>(
     'plugin:native-bridge|get_screen_brightness',
@@ -242,6 +288,32 @@ export async function setScreenBrightness(
   return result;
 }
 
+export interface HasAmbientLightSensorResponse {
+  available: boolean;
+  error?: string;
+}
+
+export interface AmbientLightUpdatesResponse {
+  success: boolean;
+  error?: string;
+}
+
+export interface AmbientLightPayload {
+  lux: number;
+}
+
+export async function hasAmbientLightSensor(): Promise<HasAmbientLightSensorResponse> {
+  return invoke<HasAmbientLightSensorResponse>('plugin:native-bridge|has_ambient_light_sensor');
+}
+
+export async function startAmbientLightUpdates(): Promise<AmbientLightUpdatesResponse> {
+  return invoke<AmbientLightUpdatesResponse>('plugin:native-bridge|start_ambient_light_updates');
+}
+
+export async function stopAmbientLightUpdates(): Promise<AmbientLightUpdatesResponse> {
+  return invoke<AmbientLightUpdatesResponse>('plugin:native-bridge|stop_ambient_light_updates');
+}
+
 export async function getExternalSDCardPath(): Promise<GetExternalSDCardPathResponse> {
   const result = await invoke<GetExternalSDCardPathResponse>(
     'plugin:native-bridge|get_external_sdcard_path',
@@ -252,6 +324,14 @@ export async function getExternalSDCardPath(): Promise<GetExternalSDCardPathResp
 export async function selectDirectory(): Promise<SelectDirectoryResponse> {
   const result = await invoke<SelectDirectoryResponse>('plugin:native-bridge|select_directory');
   return result;
+}
+
+// Android only. Opens the system document picker fire-and-forget; the picked
+// URIs come back as a `file-picker-result` plugin event (see
+// useAndroidPickedBooks) so they survive the activity/process being torn down
+// while the picker is in the foreground (#1217).
+export async function showFilePicker(): Promise<void> {
+  await invoke('plugin:native-bridge|show_file_picker');
 }
 
 export async function getStorefrontRegionCode(): Promise<GetStorefrontRegionCodeResponse> {
@@ -271,6 +351,58 @@ export async function refreshEinkScreen(): Promise<RefreshEinkScreenResponse> {
   return await invoke<RefreshEinkScreenResponse>('plugin:native-bridge|refresh_eink_screen');
 }
 
+/**
+ * Whether this device exposes a deep e-ink full-refresh mechanism we can
+ * drive (Onyx / NTX / Rockchip / Hanvon vendor hooks). Android-only; the native
+ * side resolves the probe read-only (class reflection plus a system-service
+ * lookup) — it never flashes the panel — so it is safe to call once at startup
+ * to decide whether to offer the "Auto Full Refresh" / "Refresh Page" options.
+ * Non-e-ink devices and other platforms report `supported: false`.
+ */
+export async function isEinkRefreshSupported(): Promise<boolean> {
+  const response = await invoke<EinkRefreshSupportedResponse>(
+    'plugin:native-bridge|is_eink_refresh_supported',
+  );
+  return response.supported;
+}
+
+// Memoized so the capability probe — a one-shot, read-only query against the
+// vendor hooks — runs a single time per app session, no matter how many
+// settings surfaces read it. Only a successful probe is cached: a transient
+// rejection (e.g. the bridge not ready on first mount) clears the cache so a
+// later call can retry, instead of latching the option hidden for the session.
+let einkRefreshSupportedPromise: Promise<boolean> | null = null;
+let einkRefreshSupportedSettled: boolean | null = null;
+export function checkEinkRefreshSupported(): Promise<boolean> {
+  if (!einkRefreshSupportedPromise) {
+    einkRefreshSupportedPromise = isEinkRefreshSupported().then(
+      (supported) => {
+        einkRefreshSupportedSettled = supported;
+        return supported;
+      },
+      (error) => {
+        // A rejection is inconclusive (bridge not ready / native probe error),
+        // NOT a confirmed 'no hook': the command only rejects on a hard
+        // reflection failure. Drop the cache so a later call retries, and log
+        // why so the field case is distinguishable from a genuine negative.
+        console.error('eink refresh capability probe inconclusive, will retry:', error);
+        einkRefreshSupportedPromise = null;
+        return false;
+      },
+    );
+  }
+  return einkRefreshSupportedPromise;
+}
+
+// Synchronous view of a settled probe (`null` = not yet resolved). Lets the
+// auto-refresh loop skip the guaranteed no-op call on a device the probe
+// authoritatively ruled out, without awaiting. A false here only ever comes
+// from the probe itself, never from a refresh outcome — runtime misses on a
+// supported device are transient and must not disable the feature.
+export function getCachedEinkRefreshSupported(): boolean | null {
+  return einkRefreshSupportedSettled;
+}
+
 /** Webview region to snapshot, in CSS pixels of the viewport (origin top-left). */
 export interface CaptureWebviewRegionRequest {
   x: number;
@@ -280,19 +412,54 @@ export interface CaptureWebviewRegionRequest {
 }
 
 /**
- * Capture a region of the running webview as compressed image bytes for
- * the mesh page-curl texture (#555): PNG on macOS, JPEG on iOS/Android
- * (phone-CPU PNG encoding took ~1.5s per turn). The snapshot is taken at
- * screen scale, capped at 2x CSS pixels on mobile. Rejects on platforms
- * without a native capture implementation (web, Windows/Linux so far) —
- * callers fall back to the CSS curl.
+ * Capture a region of the running webview for the mesh page-curl texture
+ * (#555): PNG bytes on macOS, JPEG bytes on iOS/Android (phone-CPU PNG
+ * encoding took ~1.5s per turn), taken at screen scale and capped at 2x CSS
+ * pixels on mobile. Windows and the Linux CEF runtime capture the whole view
+ * as JPEG (DevTools `Page.captureScreenshot`; its clip flashes the live view)
+ * and the region is cropped out here while decoding, so they resolve to a
+ * bitmap. Rejects where there is no native capture (web, the Linux WebKitGTK
+ * test runtime), and callers fall back to the renderer's own turns.
  */
 export async function captureWebviewRegion(
   request: CaptureWebviewRegionRequest,
-): Promise<ArrayBuffer> {
-  return await invoke<ArrayBuffer>('plugin:native-bridge|capture_webview_region', {
+): Promise<ArrayBuffer | ImageBitmap> {
+  const image = await invoke<ArrayBuffer>('plugin:native-bridge|capture_webview_region', {
     payload: request,
   });
+  const os = getOSPlatform();
+  if (os !== 'windows' && os !== 'linux') return image;
+  const scale = window.devicePixelRatio;
+  return await createImageBitmap(
+    new Blob([image]),
+    Math.round(request.x * scale),
+    Math.round(request.y * scale),
+    Math.round(request.width * scale),
+    Math.round(request.height * scale),
+  );
+}
+
+export interface CoverWebviewRegionResponse {
+  token: number;
+}
+
+/**
+ * Freeze the on-screen pixels of a webview region behind a native snapshot
+ * view/window that `captureWebviewRegion` does not see (iOS and Android). The
+ * two-column page curl uses it to capture the incoming column under its
+ * overlay without ever showing it (#6106). Rejects where unimplemented.
+ */
+export async function coverWebviewRegion(
+  request: CaptureWebviewRegionRequest,
+): Promise<CoverWebviewRegionResponse> {
+  return await invoke<CoverWebviewRegionResponse>('plugin:native-bridge|cover_webview_region', {
+    payload: request,
+  });
+}
+
+/** Remove the cover put up by `coverWebviewRegion`; stale tokens are ignored. */
+export async function uncoverWebviewRegion(request: { token: number }): Promise<void> {
+  await invoke('plugin:native-bridge|uncover_webview_region', { payload: request });
 }
 
 // ── Sync passphrase keychain ────────────────────────────────────────────
@@ -381,30 +548,163 @@ export async function clearSecureItem(request: GetSecureItemRequest): Promise<Se
   return invoke<SecureItemResponse>('plugin:native-bridge|clear_secure_item', { payload: request });
 }
 
-// ── Reading widget ────────────────────────────────────────────────────────
+// ── Bookshelf widget ────────────────────────────────────────────────────────
 
-export interface ReadingWidgetBookPayload {
+export interface BookshelfWidgetBookPayload {
   hash: string;
   title: string;
   author: string;
   percent: number;
+  showProgress: boolean;
   coverPath: string;
 }
 
-export interface ReadingWidgetTts {
+export interface BookshelfWidgetTts {
   active: boolean;
   playing: boolean;
 }
 
-export interface UpdateReadingWidgetRequest {
-  books: ReadingWidgetBookPayload[];
-  sectionTitle: string;
-  emptyTitle: string;
-  tts?: ReadingWidgetTts;
+/** A group tile: a mosaic of up to 4 member covers (see
+ * buildBookshelfWidgetItems in services/widget/bookshelfWidget.ts). */
+export interface BookshelfWidgetGroupPayload {
+  id: string;
+  groupBy: string;
+  value: string;
+  coverPaths: string[];
 }
 
-export async function updateReadingWidget(request: UpdateReadingWidgetRequest): Promise<void> {
-  await invoke('plugin:native-bridge|update_reading_widget', { payload: request });
+/** One grid tile: a book or a group. */
+export type BookshelfWidgetItemPayload =
+  | ({ type: 'book' } & BookshelfWidgetBookPayload)
+  | ({ type: 'group' } & BookshelfWidgetGroupPayload);
+
+export interface UpdateBookshelfWidgetRequest {
+  appWidgetId: number;
+  /** The shelf the widget asked for; native shows a placeholder until they match. */
+  shelfId: string;
+  /** Grid tiles in display order. */
+  items: BookshelfWidgetItemPayload[];
+  sectionTitle: string;
+  emptyTitle: string;
+  tts?: BookshelfWidgetTts;
+}
+
+/** `failed` counts tiles whose cover was missing or unusable (0 on iOS/desktop). */
+export async function updateBookshelfWidget(
+  request: UpdateBookshelfWidgetRequest,
+): Promise<{ failed: number }> {
+  return invoke('plugin:native-bridge|update_bookshelf_widget', { payload: request });
+}
+
+/** A placed widget, as chosen in its native configure screen. */
+export interface BookshelfWidgetInstance {
+  appWidgetId: number;
+  shelfId: string;
+  gridRows: number;
+  gridColumns: number;
+}
+
+export interface GetBookshelfWidgetInstancesResponse {
+  instances: BookshelfWidgetInstance[];
+}
+
+export async function getBookshelfWidgetInstances(): Promise<GetBookshelfWidgetInstancesResponse> {
+  return invoke<GetBookshelfWidgetInstancesResponse>(
+    'plugin:native-bridge|get_bookshelf_widget_instances',
+  );
+}
+
+/** What the native configure screen offers, translated, since it can't read the app's settings. */
+export interface BookshelfWidgetCatalog {
+  shelves: { id: string; name: string }[];
+  labels: {
+    title: string;
+    rows: string;
+    columns: string;
+    showTitles: string;
+    showShelfName: string;
+    headerSize: string;
+    showTtsBar: string;
+    cancel: string;
+    save: string;
+    /** Opens the app to edit the selected shelf (readest://widget-edit-shelf/{id}). */
+    edit: string;
+    /** Shown on a widget whose shelf hasn't been loaded by the app yet. */
+    openApp: string;
+  };
+}
+
+export async function setBookshelfWidgetCatalog(catalog: BookshelfWidgetCatalog): Promise<void> {
+  await invoke('plugin:native-bridge|set_bookshelf_widget_catalog', { payload: catalog });
+}
+
+// ── Reading widget ──────────────────────────────────────────────────────────
+
+export interface UpdateReadingWidgetRequest {
+  appWidgetId: number;
+  /** Empty means "nothing currently reading". */
+  hash: string;
+  title: string;
+  author: string;
+  /** Numeric value for the progress bar. */
+  percent: number;
+  coverPath: string;
+  /** The text stats to show, in order (already localized); native lays them out in a row. */
+  stats: string[];
+  headerText: string;
+  emptyTitle: string;
+  /** Draws the text and progress bar in black. */
+  isEink: boolean;
+  tts?: BookshelfWidgetTts;
+}
+
+/** `failed` is 1 when the cover couldn't be written (0 on iOS/desktop). */
+export async function updateReadingWidget(
+  request: UpdateReadingWidgetRequest,
+): Promise<{ failed: number }> {
+  return invoke('plugin:native-bridge|update_reading_widget', { payload: request });
+}
+
+export interface ReadingWidgetInstance {
+  appWidgetId: number;
+  showTimeLeft: boolean;
+  showPageCount: boolean;
+  showPagesRemaining: boolean;
+  showHeader: boolean;
+  showPercent: boolean;
+  referencePages: boolean;
+}
+
+interface GetReadingWidgetInstancesResponse {
+  instances: ReadingWidgetInstance[];
+}
+
+export async function getReadingWidgetInstances(): Promise<GetReadingWidgetInstancesResponse> {
+  return invoke<GetReadingWidgetInstancesResponse>(
+    'plugin:native-bridge|get_reading_widget_instances',
+  );
+}
+
+/** Translated labels for the native configure screen, which can't read the app's settings. */
+export interface ReadingWidgetCatalog {
+  labels: {
+    title: string;
+    showHeader: string;
+    headerSize: string;
+    showTtsBar: string;
+    showPercent: string;
+    referencePages: string;
+    showTimeLeft: string;
+    showPageCount: string;
+    showPagesRemaining: string;
+    textSize: string;
+    cancel: string;
+    save: string;
+  };
+}
+
+export async function setReadingWidgetCatalog(catalog: ReadingWidgetCatalog): Promise<void> {
+  await invoke('plugin:native-bridge|set_reading_widget_catalog', { payload: catalog });
 }
 
 // ── Nightly updater (main-app commands, no native-bridge prefix) ─────────
@@ -433,4 +733,66 @@ export async function installNightlyUpdate(
   const channel = new Channel<NightlyProgress>();
   if (onProgress) channel.onmessage = onProgress;
   await invoke<void>('install_nightly_update', { endpoint, channel });
+}
+
+export interface ICloudContainerStatusResponse {
+  available: boolean;
+  documentsPath?: string;
+}
+
+export interface ICloudEnsureDownloadedRequest {
+  path: string;
+  timeoutMs?: number;
+}
+
+export interface ICloudEnsureDownloadedResponse {
+  status: 'ready' | 'notFound' | 'timeout';
+}
+
+export async function getICloudContainerStatus(): Promise<ICloudContainerStatusResponse> {
+  return invoke<ICloudContainerStatusResponse>('plugin:native-bridge|icloud_container_status');
+}
+
+export async function icloudEnsureDownloaded(
+  request: ICloudEnsureDownloadedRequest,
+): Promise<ICloudEnsureDownloadedResponse> {
+  return invoke<ICloudEnsureDownloadedResponse>('plugin:native-bridge|icloud_ensure_downloaded', {
+    payload: request,
+  });
+}
+
+// Handwriting (issue #3673): BOOX raw drawing. Go through
+// services/handwriting/booxBackend.ts rather than calling these directly.
+
+export interface QueryPenCapabilitiesResponse {
+  isBoox: boolean;
+  rawDrawing: boolean;
+}
+
+export async function queryPenCapabilities(): Promise<QueryPenCapabilitiesResponse> {
+  return invoke<QueryPenCapabilitiesResponse>('plugin:native-bridge|query_pen_capabilities');
+}
+
+export interface StartRawDrawingRequest {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  strokeWidth: number;
+  strokeColor: string;
+}
+
+export async function startRawDrawing(request: StartRawDrawingRequest): Promise<void> {
+  await invoke('plugin:native-bridge|start_raw_drawing', { payload: request });
+}
+
+export async function stopRawDrawing(): Promise<void> {
+  await invoke('plugin:native-bridge|stop_raw_drawing');
+}
+
+export type PenEventKind = 'DRAW_MOVE' | 'DRAW_END' | 'ERASE_MOVE' | 'ERASE_END';
+
+export interface PenStrokeBatch {
+  kind: PenEventKind;
+  points: { x: number; y: number; pressure: number }[];
 }

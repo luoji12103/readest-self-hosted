@@ -4,12 +4,26 @@
   <dict>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Readest uses the local network to discover nearby devices and transfer books with Nearby BookDrop.</string>
+    <key>NSUbiquitousContainers</key>
+    <dict>
+      <key>iCloud.com.bilingify.readest</key>
+      <dict>
+        <key>NSUbiquitousContainerIsDocumentScopePublic</key>
+        <true/>
+        <key>NSUbiquitousContainerName</key>
+        <string>Readest</string>
+        <key>NSUbiquitousContainerSupportedFolderLevels</key>
+        <string>Any</string>
+      </dict>
+    </dict>
     <key>NSFaceIDUsageDescription</key>
     <string>Readest uses Face ID to unlock the app.</string>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <false/>
     <key>UIViewControllerBasedStatusBarAppearance</key>
-    <false/>
+    <true/>
     <key>UIHomeIndicatorAutoHidden</key>
     <true/>
     <key>UIRequiresFullScreen</key>
@@ -190,6 +204,26 @@
           </array>
           <key>public.mime-type</key>
           <string>application/x-cbz</string>
+        </dict>
+      </dict>
+
+      <dict>
+        <key>UTTypeIdentifier</key>
+        <string>com.readest.books</string>
+        <key>UTTypeDescription</key>
+        <string>Readest Book Package</string>
+        <key>UTTypeConformsTo</key>
+        <array>
+          <string>public.zip-archive</string>
+        </array>
+        <key>UTTypeTagSpecification</key>
+        <dict>
+          <key>public.filename-extension</key>
+          <array>
+            <string>rbooks</string>
+          </array>
+          <key>public.mime-type</key>
+          <string>application/x-readest-books</string>
         </dict>
       </dict>
 

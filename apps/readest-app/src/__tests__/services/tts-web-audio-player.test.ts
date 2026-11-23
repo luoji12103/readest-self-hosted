@@ -49,6 +49,23 @@ describe('WebAudioPlayer scheduling', () => {
     ]);
   });
 
+  test('a chunk scheduled after its predecessor ended fires its chunk-start then', async () => {
+    // Its audio arrived late (synthesis still pending when the previous
+    // sentence finished): nothing announces it at the prior onended, so the
+    // schedule must, or the sentence plays with no mark and no word highlight.
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0.2 });
+    await ctx.advanceTo(SAFETY + 3);
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.2 });
+    expect(events).toEqual([
+      { type: 'chunk-start', chunkIndex: 0 },
+      { type: 'chunk-start', chunkIndex: 1 },
+    ]);
+  });
+
   test('stale-generation scheduleChunk is a no-op', async () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
@@ -160,6 +177,80 @@ describe('WebAudioPlayer session end', () => {
   });
 });
 
+describe('WebAudioPlayer paragraph handover', () => {
+  // One paragraph per session: the pause between them is silence on the audio
+  // clock, not a JS sleep, so synthesis and decode of the next paragraph hide
+  // inside it instead of adding to it (#5750).
+  const endParagraph = async (
+    ctx: FakeAudioContext,
+    player: WebAudioPlayer,
+    onEvent: (e: WebAudioPlayerEvent) => void,
+    seconds: number,
+  ) => {
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(seconds), {
+      trimStartSec: 0,
+      mediaScale: 1,
+      gapSec: 0.15,
+    });
+    player.endSession(gen);
+    await ctx.advanceTo(SAFETY + seconds);
+    // The controller's handover stop, after the session ended on its own.
+    player.abortSession();
+  };
+
+  test('the next paragraph is scheduled a gap after the previous one ended', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    await endParagraph(ctx, player, onEvent, 2);
+
+    const next = player.startSession(onEvent, { startAfterPreviousSec: 0.3 });
+    player.scheduleChunk(next, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2 + 0.3, 5);
+  });
+
+  test('a pipeline that missed the deadline starts as soon as it can', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    await endParagraph(ctx, player, onEvent, 2);
+    await ctx.advanceTo(SAFETY + 2 + 1); // synthesis took a second
+
+    const next = player.startSession(onEvent, { startAfterPreviousSec: 0.3 });
+    player.scheduleChunk(next, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2 + 1 + SAFETY, 5);
+  });
+
+  test('a session aborted mid-playback carries nothing over', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+    await ctx.advanceTo(1);
+    player.abortSession(); // a stop or a skip, not the end of a paragraph
+
+    const next = player.startSession(onEvent, { startAfterPreviousSec: 0.3 });
+    player.scheduleChunk(next, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(1 + SAFETY, 5);
+  });
+
+  test('the carry-over is consumed once, not by every later session', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    await endParagraph(ctx, player, onEvent, 2);
+    const next = player.startSession(onEvent, { startAfterPreviousSec: 0.3 });
+    player.scheduleChunk(next, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+    player.abortSession(); // stopped before it ever ended
+
+    const third = player.startSession(onEvent, { startAfterPreviousSec: 0.3 });
+    player.scheduleChunk(third, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0.15 });
+
+    expect(ctx.sources[2]!.startedAt).toBeCloseTo(ctx.currentTime + SAFETY, 5);
+  });
+});
+
 describe('WebAudioPlayer abort', () => {
   test('abort stops pending sources, resolves waiters false, silences events', async () => {
     const { ctx, player, events, onEvent } = setup();
@@ -267,19 +358,31 @@ describe('WebAudioPlayer playback position', () => {
     expect(pos?.mediaTimeSec).toBeCloseTo(0.3 + 1 * 1.5, 3);
   });
 
-  test('clamps before the first chunk and in the inter-chunk gap', async () => {
+  test('runs before the first chunk starts and clamps in the inter-chunk gap', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
     player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0.2, mediaScale: 1, gapSec: 1 });
     player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0.1, mediaScale: 1, gapSec: 1 });
-    // Before the first chunk starts.
-    expect(player.getPlaybackPosition(gen)?.mediaTimeSec).toBeCloseTo(0.2, 5);
+    // Before the first chunk starts: still short of its first word, which
+    // must not light during the pause before the audio.
+    expect(player.getPlaybackPosition(gen)?.mediaTimeSec).toBeCloseTo(0.2 - SAFETY, 5);
     // Inside the gap after chunk 0 (ends at SAFETY+1; next starts SAFETY+2).
     ctx.currentTime = SAFETY + 1.5;
     const pos = player.getPlaybackPosition(gen);
     expect(pos?.chunkIndex).toBe(0);
     expect(pos?.mediaTimeSec).toBeCloseTo(0.2 + 1, 5);
+  });
+
+  test('trails the context clock by the output latency', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    // The speakers play what the clock rendered 50 ms ago.
+    Object.assign(ctx, { outputLatency: 0.05 });
+    await ctx.advanceTo(SAFETY + 1);
+    expect(player.getPlaybackPosition(gen)?.mediaTimeSec).toBeCloseTo(0.95, 5);
   });
 
   test('returns null for a stale generation or empty session', async () => {

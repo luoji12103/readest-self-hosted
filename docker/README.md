@@ -9,8 +9,8 @@
 | **kong**        | `kong:2.8.1`                | api gateway routing requests to supabase services |
 | **auth**        | `supabase/gotrue:v2.185.0`  | auth service (email, JWT)                         |
 | **rest**        | `postgrest/postgrest:v14.3` | psql rest api                                     |
-| **minio**       | `minio/minio`               | s3 storage                                        |
-| **minio-setup** | `minio/mc`                  | helper container to create s3 buckets             |
+| **minio**       | `quay.io/minio/minio`       | s3 storage                                        |
+| **minio-setup** | `quay.io/minio/mc`          | helper container to create s3 buckets             |
 
 ### Exposed ports
 
@@ -50,8 +50,15 @@ docker compose up -d
 ```
 
 this pulls `${READEST_IMAGE}` (default: `ghcr.io/readest/readest:latest`) instead of building the client locally.
-the web client now reads `SUPABASE_PUBLIC_URL`, `SUPABASE_ANON_KEY`, `API_BASE_URL`, `OBJECT_STORAGE_TYPE`, `STORAGE_FIXED_QUOTA`, and `TRANSLATION_FIXED_QUOTA` from runtime
+the web client now reads `SUPABASE_PUBLIC_URL`, `SUPABASE_ANON_KEY`, `API_BASE_URL`, `OBJECT_STORAGE_TYPE`, `SELF_HOSTED`, `STORAGE_FIXED_QUOTA`, and `TRANSLATION_FIXED_QUOTA` from runtime
 container env, so custom self-hosted values work with pulled images.
+
+`SELF_HOSTED` unlocks every premium feature — third-party cloud sync (WebDAV,
+Google Drive, S3, OneDrive), offline Read Aloud downloads, Send to Readest —
+with or without a signed-in user. the image defaults it to `true`, so a pulled
+image is unlocked even if your `compose.yaml` predates the variable. set
+`SELF_HOSTED=false` in `docker/.env` only if you run a hosted service that sells
+the plans.
 
 if you prefer Docker Hub, set `READEST_IMAGE` in `docker/.env`, for example:
 
@@ -67,6 +74,36 @@ published tags:
 - `<release-tag>` (for example `v1.2.3`): published from release events
 - `main`: rolling image from the default branch
 - `sha-<commit>`: immutable commit tag
+
+### OPDS catalogs on a private network
+
+The web OPDS proxy blocks private, loopback and link-local addresses by default,
+including public hostnames that resolve to them. To reach trusted LAN catalogs,
+set an exact, comma-separated allowlist in `docker/.env`:
+
+```env
+READEST_TRUSTED_PRIVATE_HOSTS=books.home.arpa,calibre.lan,192.168.1.20
+```
+
+Recreate the client with `docker compose up -d client` after changing it. With
+`docker run`, pass `-e READEST_TRUSTED_PRIVATE_HOSTS=books.home.arpa` instead.
+This setting is read by the server at request time and works with prebuilt
+images; no rebuild or `NODE_ENV` change is needed.
+
+Entries are hostnames or IP addresses only, without schemes, ports, paths,
+wildcards or CIDR ranges. Matching ignores case and trailing DNS dots. An entry
+allows any port on that host, so only list hosts whose services you trust.
+For IPv6 literals, include brackets, for example `[fd00::20]`.
+
+Each redirect destination must pass the same checks. List any additional private
+hosts used for feeds, covers or downloads. Unlisted hosts keep the private-address
+and DNS checks, and credentials are still removed on cross-origin redirects.
+The allowlist applies only to OPDS, not KOSync or Send to Readest.
+
+Anyone who can reach your Readest instance can use its OPDS proxy to reach the
+listed hosts. Keep the instance behind your LAN/VPN or access controls when
+allowing private services. `SELF_HOSTED=true` lets the catalog form submit LAN
+URLs, but does not grant server access by itself.
 
 ### Build locally instead of pulling
 
@@ -85,6 +122,30 @@ docker compose -f compose.yaml -f compose.build.yaml up --build -d
 
 - Readest app: `http://localhost:3000`
 - MinIO console: `http://localhost:9001` (login with `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`)
+
+### Upgrading an existing deployment
+
+pulling a newer client image does not touch the database volume, and the first-boot
+hook only runs when that volume is empty. so after an upgrade, apply any new
+migrations yourself:
+
+```bash
+cd docker
+docker compose pull
+docker compose up -d
+docker compose exec db /docker-entrypoint-initdb.d/zz-readest-migrations.sh
+```
+
+the script records what it applied in `readest_meta.migrations` and skips those
+next time, so it is safe to repeat after every upgrade.
+
+if you had previously patched your database by hand, the script may stop on an
+`already exists` error. record that file as applied and run it again:
+
+```bash
+docker compose exec db psql -U supabase_admin -c \
+  "INSERT INTO readest_meta.migrations (name) VALUES ('002_add_book_shares.sql') ON CONFLICT DO NOTHING"
+```
 
 ### Hot Reload (development)
 
@@ -112,6 +173,69 @@ to also remove volumes (database and storage data):
 cd docker
 docker compose down -v
 ```
+
+---
+
+## Database schema
+
+| path                          | role                                                                       |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `volumes/db/init/schema.sql`  | base schema (books, book_configs, book_notes, files)                         |
+| `volumes/db/migrations/*.sql` | every schema change since, applied in filename order                         |
+| `volumes/db/apply-migrations.sh` | applies the migrations and records them in `readest_meta.migrations`      |
+
+on an empty database volume the supabase image runs everything under
+`/docker-entrypoint-initdb.d` in glob order: its own `migrate.sh` (supabase core
+schema plus `init-scripts/100-schema.sql`, which is `schema.sql`), then
+`zz-readest-migrations.sh`, which is `apply-migrations.sh`. it globs the mounted
+migrations directory, so adding a migration file needs no compose change.
+
+---
+
+## Serving from a custom domain
+
+the browser talks to three of these services directly, so each needs a URL that
+resolves from outside the docker network:
+
+| variable              | what the browser uses it for                                   |
+| --------------------- | -------------------------------------------------------------- |
+| `SITE_URL`            | the readest client itself                                        |
+| `SUPABASE_PUBLIC_URL` | kong, which routes `/auth/v1/…` and `/rest/v1/…`                 |
+| `S3_PUBLIC_ENDPOINT`  | minio, reached through path-style presigned URLs                 |
+
+`SUPABASE_PUBLIC_URL` and `S3_PUBLIC_ENDPOINT` default to `http://${HOST_IP}:<port>`,
+which suits a plain IP/port deployment; set them in `docker/.env` to override that.
+putting everything on one origin also means no cross-origin requests at all:
+
+```env
+HOST_IP=your-domain.com
+SITE_URL=https://your-domain.com
+API_EXTERNAL_URL=https://your-domain.com
+ADDITIONAL_REDIRECT_URLS=https://your-domain.com/**
+SUPABASE_PUBLIC_URL=https://your-domain.com
+S3_PUBLIC_ENDPOINT=https://your-domain.com
+```
+
+`nginx.conf.example` is a working starting point for terminating TLS in front of
+the stack. two things it gets right that are easy to miss: the `Host` header has
+to reach minio unchanged or the presigned signatures will not verify, and the
+request body limit has to be lifted on the bucket location or large book uploads
+are truncated.
+
+### CJK fonts on a custom domain
+
+the reader loads a few CJK webfont bundles from Readest's CDN, which only sends
+`Access-Control-Allow-Origin` for readest.com origins, so the browser blocks them
+on a self-hosted domain. mirror
+`https://storage.readest.com/public/font/dist/<Family>/` (and the `.woff2` files it
+references) onto a path your proxy serves, then point the client at it:
+
+```env
+FONT_BASE_URL=https://your-domain.com/fonts
+```
+
+leaving `FONT_BASE_URL` empty keeps the default CDN. system and Google fonts are
+unaffected either way.
 
 ---
 

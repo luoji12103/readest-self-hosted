@@ -1,3 +1,6 @@
+/** Shared protocol limit for replica uploads. */
+export const MAX_PUSH_BATCH = 100;
+
 /**
  * Branded HLC string. Lexicographic comparison matches temporal order.
  * Format: `${physicalMs:13-hex}-${counter:8-hex}-${deviceId}`
@@ -16,6 +19,8 @@ export interface ManifestFile {
   filename: string;
   byteSize: number;
   partialMd5: string;
+  /** Full source integrity hash for plugin-backed archives. */
+  sha256?: string;
   mtime?: number;
 }
 

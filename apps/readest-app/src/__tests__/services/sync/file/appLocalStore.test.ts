@@ -12,7 +12,7 @@ import { createAppLocalStore } from '@/services/sync/file/appLocalStore';
  * runs while the library store hasn't loaded yet (the app launched straight
  * into the reader / settings, never mounting the Library view), the engine's
  * addBookToLibrary / updateBookMetadata used to merge against the EMPTY
- * in-memory library and persist a downloaded book (or a metadata update) as
+ * in-memory library and persist a synced book (or a metadata update) as
  * the *entire* library, wiping everything already on disk. The store bridge
  * now hydrates from disk first.
  */
@@ -63,8 +63,20 @@ describe('createAppLocalStore — library hydration (data-loss guard)', () => {
     expect(appService.loadLibraryBooks).toHaveBeenCalledTimes(1);
     expect(savedLibrary).not.toBeNull();
     const hashes = savedLibrary!.map((b) => b.hash).sort();
-    // The downloaded book is appended; a, b must survive (no clobber to [c]).
+    // The synced book is appended; a, b must survive (no clobber to [c]).
     expect(hashes).toEqual(['a', 'b', 'c']);
+  });
+
+  test('addBookToLibrary preserves a metadata-only cloud-shelf row (#5009)', async () => {
+    await makeStore().addBookToLibrary(
+      makeBook('c', { uploadedAt: 900, downloadedAt: null, coverDownloadedAt: 800 }),
+    );
+
+    expect(savedLibrary!.find((book) => book.hash === 'c')).toMatchObject({
+      uploadedAt: 900,
+      downloadedAt: null,
+      coverDownloadedAt: 800,
+    });
   });
 
   test('updateBookMetadata does not wipe the library when the store is unloaded', async () => {
@@ -84,6 +96,67 @@ describe('createAppLocalStore — library hydration (data-loss guard)', () => {
 
     expect(appService.loadLibraryBooks).not.toHaveBeenCalled();
     expect(savedLibrary!.map((b) => b.hash).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  test('serializes concurrent cloud-shelf additions so neither row is overwritten', async () => {
+    useLibraryStore.getState().setLibrary([makeBook('a'), makeBook('b')]);
+    const originalSave = appService.saveLibraryBooks;
+    vi.mocked(appService.saveLibraryBooks).mockImplementation(async (books: Book[]) => {
+      // Force the first add to finish last. Without a serialized commit, both
+      // calls snapshot [a, b] and the delayed [a, b, c] write drops d.
+      if (books.some((book) => book.hash === 'c') && !books.some((book) => book.hash === 'd')) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      savedLibrary = books;
+    });
+
+    const store = makeStore();
+    await Promise.all([
+      store.addBookToLibrary(makeBook('c')),
+      store.addBookToLibrary(makeBook('d')),
+    ]);
+
+    expect(savedLibrary!.map((book) => book.hash).sort()).toEqual(['a', 'b', 'c', 'd']);
+    expect(
+      useLibraryStore
+        .getState()
+        .library.map((book) => book.hash)
+        .sort(),
+    ).toEqual(['a', 'b', 'c', 'd']);
+    appService.saveLibraryBooks = originalSave;
+  });
+
+  test('replaces an older tombstone when a newer live cloud row is discovered', async () => {
+    useLibraryStore.getState().setLibrary([
+      makeBook('a', {
+        deletedAt: 100,
+        fileSyncDeletionRequestedAt: 100,
+      }),
+      makeBook('b'),
+    ]);
+
+    await makeStore().addBookToLibrary(
+      makeBook('a', {
+        updatedAt: 200,
+        deletedAt: null,
+        fileSyncDeletionRequestedAt: null,
+        downloadedAt: null,
+        uploadedAt: 200,
+      }),
+    );
+
+    expect(savedLibrary!.find((book) => book.hash === 'a')).toMatchObject({
+      deletedAt: null,
+      fileSyncDeletionRequestedAt: null,
+      downloadedAt: null,
+      uploadedAt: 200,
+    });
+    expect(
+      useLibraryStore
+        .getState()
+        .visibleLibrary.map((book) => book.hash)
+        .sort(),
+    ).toEqual(['a', 'b']);
   });
 
   test('deleteBookLocally removes the managed copy and persists the tombstone (#4860)', async () => {
@@ -123,5 +196,100 @@ describe('createAppLocalStore — library hydration (data-loss guard)', () => {
     expect(appService.loadLibraryBooks).toHaveBeenCalled();
     expect(savedLibrary!.map((b) => b.hash).sort()).toEqual(['a', 'b']);
     expect(savedLibrary!.find((b) => b.hash === 'a')!.uploadedAt).toBe(900);
+  });
+});
+
+/**
+ * #5265 — the residue of #5084. Devices that synced on a pre-#5087 build hold
+ * library rows carrying a PEER's absolute `filePath`, adopted from the shared
+ * library.json. The upload source resolvers preferred that path blindly, so a
+ * book whose managed copy `Books/<hash>/…` was sitting right there resolved to
+ * 'no-source': the engine never confirmed the file, never stamped
+ * `uploadedAt`, and the row stayed classified as a purely-local book — which is
+ * what lets "Remove from Device Only" end in a cloud-and-device delete that GCs
+ * the book off Google Drive.
+ *
+ * `resolveBookContentSource` already documents the right precedence ("prefer the
+ * managed copy when it exists; book.filePath is device-local and can outlive a
+ * prior in-place/import mode"); these resolvers must follow it.
+ */
+describe('createAppLocalStore — a stale filePath must not mask the managed copy (#5265)', () => {
+  const STALE = 'C:\\Users\\other-device\\Books\\Book h1.epub';
+
+  beforeEach(() => {
+    appService.exists = vi.fn(async (path: string) => path !== STALE);
+    appService.openFile = vi.fn(async () => new File([new Uint8Array(4)], 'h1.epub'));
+    appService.resolveFilePath = vi.fn(async (path: string) => `/root/Books/${path}`);
+  });
+
+  test('loadBookFile reads the managed copy when filePath points nowhere', async () => {
+    const bytes = await makeStore().loadBookFile(makeBook('h1', { filePath: STALE }));
+
+    expect(bytes).not.toBeNull();
+    expect(bytes!.size).toBe(4);
+    expect(appService.openFile).toHaveBeenCalledWith('h1/Book h1.epub', 'Books');
+  });
+
+  test('resolveLocalBookPath resolves the managed copy when filePath points nowhere', async () => {
+    const src = await makeStore().resolveLocalBookPath(makeBook('h1', { filePath: STALE }));
+
+    expect(src).not.toBeNull();
+    expect(src!.path).toBe('/root/Books/h1/Book h1.epub');
+    expect(appService.resolveFilePath).toHaveBeenCalledWith('h1/Book h1.epub', 'Books');
+  });
+
+  test('an in-place book still uploads from its external source', async () => {
+    const inPlace = '/home/reader/Calibre/Book h1.epub';
+    // No managed copy — only the user's own file at an external location.
+    appService.exists = vi.fn(async (path: string) => path === inPlace);
+
+    const src = await makeStore().resolveLocalBookPath(makeBook('h1', { filePath: inPlace }));
+
+    expect(src!.path).toBe('/root/Books/' + inPlace);
+    expect(appService.resolveFilePath).toHaveBeenCalledWith(inPlace, 'None');
+  });
+
+  test('a book on no device at all is still reported as having no source', async () => {
+    appService.exists = vi.fn(async () => false);
+
+    expect(await makeStore().loadBookFile(makeBook('h1', { filePath: STALE }))).toBeNull();
+    expect(await makeStore().resolveLocalBookPath(makeBook('h1', { filePath: STALE }))).toBeNull();
+  });
+});
+
+describe('sync file handles (#6137)', () => {
+  test.each([
+    'loadBookFile',
+    'loadBookCover',
+  ] as const)('%s closes after reading', async (method) => {
+    const close = vi.fn(async () => {});
+    const bytes = new ArrayBuffer(4);
+    appService.exists = vi.fn(async () => true);
+    appService.openFile = vi.fn(async () =>
+      Object.assign(new File([], 'book'), {
+        arrayBuffer: async () => bytes,
+        close,
+      }),
+    );
+    expect(await makeStore()[method](makeBook('a'))).toEqual({ bytes, size: 4 });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    'loadBookFile',
+    'loadBookCover',
+  ] as const)('%s closes when reading fails', async (method) => {
+    const close = vi.fn(async () => {});
+    appService.exists = vi.fn(async () => true);
+    appService.openFile = vi.fn(async () =>
+      Object.assign(new File([], 'book'), {
+        arrayBuffer: async () => {
+          throw new Error('read failed');
+        },
+        close,
+      }),
+    );
+    await expect(makeStore()[method](makeBook('a'))).rejects.toThrow('read failed');
+    expect(close).toHaveBeenCalledOnce();
   });
 });

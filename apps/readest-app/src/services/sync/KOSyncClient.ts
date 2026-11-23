@@ -4,7 +4,36 @@ import { KOSyncSettings } from '@/types/settings';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { KoSyncProxyPayload } from '@/types/kosync';
 import { isLanAddress } from '@/utils/network';
+import { getUserLang, makeSafeFilename } from '@/utils/misc';
+import { normalizeCustomHeaders } from '@/utils/customHeaders';
+import { allowsSelfSignedCert, tlsFetch } from '@/utils/tls';
 import { getAPIBaseUrl, isTauriAppPlatform } from '../environment';
+
+const getContributorName = (contributor: unknown): string => {
+  if (typeof contributor === 'string') return contributor.trim();
+  if (!contributor || typeof contributor !== 'object') return '';
+
+  const name = (contributor as { name?: unknown }).name;
+  if (typeof name === 'string') return name.trim();
+  if (!name || typeof name !== 'object') return '';
+
+  const names = name as Record<string, unknown>;
+  const preferredName = names[getUserLang()];
+  if (typeof preferredName === 'string' && preferredName.trim()) return preferredName.trim();
+
+  const fallbackName = Object.values(names).find(
+    (value): value is string => typeof value === 'string' && !!value.trim(),
+  );
+  return fallbackName?.trim() ?? '';
+};
+
+const getMetadataAuthors = (book: Book): string => {
+  const contributors = book.metadata?.author as unknown;
+  if (!Array.isArray(contributors)) return book.author;
+
+  const authors = contributors.map(getContributorName).filter(Boolean);
+  return authors.length > 0 ? authors.join('\n') : book.author;
+};
 
 /**
  * Interface for KOSync progress response from the server
@@ -22,6 +51,8 @@ export class KOSyncClient {
   private config: KOSyncSettings;
   private isLanServer: boolean;
   private usesHttpAuth: boolean = false;
+  /** Why the last progress read or write failed, or null when it didn't. */
+  lastError: string | null = null;
 
   constructor(config: KOSyncSettings) {
     this.config = config;
@@ -41,7 +72,8 @@ export class KOSyncClient {
     const { method = 'GET', body, headers: additionalHeaders, useAuth = true } = options;
 
     const buildHeaders = (): Headers => {
-      const headers = new Headers(additionalHeaders || {});
+      const headers = new Headers(normalizeCustomHeaders(this.config.customHeaders));
+      new Headers(additionalHeaders || {}).forEach((value, key) => headers.set(key, value));
       if (useAuth) {
         if (this.usesHttpAuth && this.config.password) {
           const credentials = btoa(`${this.config.username}:${this.config.password}`);
@@ -61,19 +93,20 @@ export class KOSyncClient {
         const fetch = isTauriAppPlatform() ? tauriFetch : window.fetch;
         const directUrl = `${this.config.serverUrl}${endpoint}`;
 
-        return await fetch(directUrl, {
-          method,
-          headers: {
-            accept: 'application/vnd.koreader.v1+json',
-            ...(method === 'GET' ? {} : { 'Content-Type': 'application/json' }),
-            ...Object.fromEntries(headers.entries()),
+        return await tlsFetch(
+          fetch,
+          directUrl,
+          {
+            method,
+            headers: {
+              accept: 'application/vnd.koreader.v1+json',
+              ...(method === 'GET' ? {} : { 'Content-Type': 'application/json' }),
+              ...Object.fromEntries(headers.entries()),
+            },
+            body,
           },
-          body,
-          danger: {
-            acceptInvalidCerts: true,
-            acceptInvalidHostnames: true,
-          },
-        });
+          allowsSelfSignedCert(this.config),
+        );
       }
 
       const proxyUrl = `${getAPIBaseUrl()}/kosync`;
@@ -108,6 +141,21 @@ export class KOSyncClient {
     }
 
     return response;
+  }
+
+  /** Read-only login check. Unlike {@link connect}, it never registers an account. */
+  async checkConnection(): Promise<{ success: boolean; message?: string }> {
+    try {
+      const response = await this.request('/users/auth');
+      if (response.status === 401) return { success: false, message: 'Invalid credentials.' };
+      if (!response.ok) return { success: false, message: `HTTP ${response.status}` };
+      if (!(await this.isKoSyncJsonResponse(response))) {
+        return { success: false, message: 'Not a KOReader Sync server. Check the Server URL.' };
+      }
+      return { success: true };
+    } catch (e) {
+      return { success: false, message: (e as Error).message || 'Connection error.' };
+    }
   }
 
   /**
@@ -177,6 +225,7 @@ export class KOSyncClient {
    * @returns Promise with the progress data or null if not found
    */
   async getProgress(book: Book): Promise<KoSyncProgress | null> {
+    this.lastError = null;
     if (!this.config.userkey) return null;
 
     const documentHash = this.getDocumentDigest(book);
@@ -189,6 +238,8 @@ export class KOSyncClient {
         console.error(
           `KOSync: Failed to get progress for ${book.title}. Status: ${response.status}`,
         );
+        // 404 is a book the server has no position for, not a failed sync.
+        if (response.status !== 404) this.lastError = `HTTP ${response.status}`;
         return null;
       }
 
@@ -206,6 +257,7 @@ export class KOSyncClient {
       return { ...data, document: data.document || documentHash };
     } catch (e) {
       console.error('KOSync getProgress failed', e);
+      this.lastError = (e as Error).message || 'Connection error.';
       return null;
     }
   }
@@ -218,6 +270,7 @@ export class KOSyncClient {
    * @returns Promise with boolean indicating success
    */
   async updateProgress(book: Book, progress: string, percentage: number): Promise<boolean> {
+    this.lastError = null;
     if (!this.config.userkey) return false;
 
     const documentHash = this.getDocumentDigest(book);
@@ -229,6 +282,23 @@ export class KOSyncClient {
       percentage,
       device: this.config.deviceName,
       device_id: this.config.deviceId,
+      // The optional metadata field KOReader 2026.05+ sends when "Send
+      // document metadata" is enabled (koreader/koreader#15306), also
+      // implemented by CrossPoint 1.5.0+. The official server ignores it;
+      // custom servers may use it to identify the book behind the hash.
+      // `authors` is a single string in KOReader's format, newline-joined
+      // when there are several. Book.author uses locale-specific display
+      // punctuation, so recover the individual names from structured metadata.
+      // The extension is the lowercased format, the same value as EXTS in
+      // libs/document, not imported here so this client stays off the document
+      // lib's foliate-js dependency chain.
+      ...(this.config.sendMetadata && {
+        metadata: {
+          filename: `${makeSafeFilename(book.sourceTitle || book.title)}.${book.format.toLowerCase()}`,
+          title: book.title,
+          authors: getMetadataAuthors(book),
+        },
+      }),
     };
 
     try {
@@ -241,11 +311,13 @@ export class KOSyncClient {
         console.error(
           `KOSync: Failed to update progress for ${book.title}. Status: ${response.status}`,
         );
+        this.lastError = `HTTP ${response.status}`;
         return false;
       }
       return true;
     } catch (e) {
       console.error('KOSync updateProgress failed', e);
+      this.lastError = (e as Error).message || 'Connection error.';
       return false;
     }
   }
@@ -263,8 +335,8 @@ export class KOSyncClient {
 
   getDocumentDigest(book: Book): string {
     if (this.config.checksumMethod === 'filename') {
-      console.warn('This is not possible anymore, using md5 instead.');
+      return md5(book.originalFilename || `${book.title}.${book.format.toLowerCase()}`);
     }
-    return book.hash;
+    return book.metadata?.absFileHash ?? book.hash;
   }
 }

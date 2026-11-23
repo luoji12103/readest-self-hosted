@@ -1,3 +1,4 @@
+import type { TTSPacks } from '@/utils/ttsPacks';
 import { Book, BookConfig, BookNote } from '@/types/book';
 
 /**
@@ -26,6 +27,25 @@ export interface RemoteBookConfig {
   config: Partial<BookConfig>;
   /** Booknotes carry their own per-note updatedAt/deletedAt for merging. */
   booknotes: BookNote[];
+  /**
+   * The user-entered reference page count (issue #5716). It stands in for a
+   * page list the book doesn't ship, so it is a fact about the book's print
+   * edition rather than a device preference — the one viewSettings key that
+   * crosses devices.
+   *
+   * It rides its own envelope key instead of `config.viewSettings` on purpose:
+   * `mergeBookConfig` spreads `config` wholesale, so a nested viewSettings
+   * would replace a peer's entire view settings object. Optional + additive —
+   * a client that predates it simply drops the key, and the merge policy in
+   * `resolveReferencePageCount` treats an absent count as "no opinion".
+   */
+  referencePageCount?: number;
+  /**
+   * The downloaded read-aloud packs each sync destination holds. Its own key
+   * like referencePageCount: it merges as a union, not by updatedAt, which the
+   * scalar spread over `config` would do. Optional + additive.
+   */
+  ttsPacks?: TTSPacks;
   writerDeviceId: string;
   writerVersion: 'readest-webdav-1';
   /** When the writer last touched the row (client wall clock, millis). */
@@ -35,9 +55,11 @@ export interface RemoteBookConfig {
 /**
  * Convert the live local BookConfig into the wire envelope. We deliberately
  * drop transient view state (search config, RSVP position, viewSettings,
- * etc.) — those are device-local UI preferences, not progress.
+ * etc.) — those are device-local UI preferences, not progress. The lone
+ * exception is `referencePageCount`, which is book data wearing a view-setting
+ * costume; it travels as its own envelope key (see RemoteBookConfig).
  *
- * Why viewSettings stays local even though it lives in BookConfig:
+ * Why the rest of viewSettings stays local even though it lives in BookConfig:
  *   - Different devices have different screen sizes / DPI / typography
  *     preferences. Pushing a phone's 14pt setting onto a desktop would
  *     surprise users in a bad way.
@@ -64,12 +86,15 @@ export const buildRemotePayload = (
     xpointer: config.xpointer,
     updatedAt: config.updatedAt,
   };
+  const referencePageCount = config.viewSettings?.referencePageCount;
   return {
     schemaVersion: 1,
     bookHash: book.hash,
     metaHash: book.metaHash,
     config: trimmed,
     booknotes: config.booknotes ?? [],
+    ...(referencePageCount ? { referencePageCount } : {}),
+    ...(config.ttsPacks ? { ttsPacks: config.ttsPacks } : {}),
     writerDeviceId: deviceId,
     writerVersion: 'readest-webdav-1',
     updatedAt: Date.now(),
@@ -133,7 +158,7 @@ export const parseRemoteLibraryIndex = (raw: string | null): RemoteLibraryIndex 
 /**
  * Fields that describe THIS device's copy of a book rather than the book
  * itself: an absolute path from an in-place / transient import, the blob URL of
- * the rendered cover, and the two "this device holds the bytes" stamps.
+ * the rendered cover, and the "this device holds the bytes" stamps.
  *
  * They must never cross devices. A peer that adopts a foreign `filePath` reads
  * the row as a purely-local book (that is what `book.filePath` means to the
@@ -146,9 +171,11 @@ export const parseRemoteLibraryIndex = (raw: string | null): RemoteLibraryIndex 
  */
 const DEVICE_LOCAL_BOOK_FIELDS = [
   'filePath',
+  'altFilePaths',
   'coverImageUrl',
   'downloadedAt',
   'coverDownloadedAt',
+  'absDownloadedAt',
 ] as const satisfies readonly (keyof Book)[];
 
 /** A copy of `book` safe to publish to — or adopt from — the shared index. */
@@ -157,5 +184,8 @@ export const stripDeviceLocalFields = (book: Book): Book => {
   for (const field of DEVICE_LOCAL_BOOK_FIELDS) {
     delete copy[field];
   }
+  // Delete authorization belongs to one tombstone only. Never publish or
+  // adopt it on a live row after a re-import/revival.
+  if (!copy.deletedAt) delete copy.fileSyncDeletionRequestedAt;
   return copy;
 };

@@ -1,6 +1,6 @@
 /// Cover image extraction for various eBook formats
 ///
-/// Supports: EPUB, MOBI/AZW3/KF8, FB2, CBZ/CBR, TXT
+/// Supports: EPUB, MOBI/AZW3/KF8, FB2, CBZ/CBR, TXT, PDF
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose;
 use base64::Engine as _;
@@ -11,6 +11,8 @@ use once_cell::sync::Lazy;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use zip::ZipArchive;
+
+use crate::pdf::{open_pdf, render_pdf_page};
 
 /// Thumbnail cache directory (per-user)
 static CACHE_DIR: Lazy<Option<std::path::PathBuf>> = Lazy::new(|| {
@@ -33,7 +35,7 @@ pub fn extract_epub_cover_bytes<R: Read + Seek>(reader: R) -> Result<Vec<u8>> {
     let mut candidates: Vec<(usize, String, u64)> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
-        let name = file.name().to_lowercase();
+        let name = file.name()?.to_lowercase();
         let size = file.size();
         drop(file);
 
@@ -91,7 +93,7 @@ pub fn extract_epub_cover_bytes<R: Read + Seek>(reader: R) -> Result<Vec<u8>> {
     let mut largest: Option<(usize, u64)> = None;
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
-        let name = file.name().to_lowercase();
+        let name = file.name()?.to_lowercase();
         let size = file.size();
         drop(file);
 
@@ -251,7 +253,7 @@ pub fn extract_cbz_cover_bytes<R: Read + Seek>(reader: R) -> Result<Vec<u8>> {
     let mut images: Vec<(usize, String)> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
         drop(file);
 
         if is_image_extension(&name.to_lowercase()) {
@@ -372,6 +374,7 @@ pub fn extract_cover_bytes_by_ext(path: &Path, ext: &str) -> Result<Vec<u8>> {
         "cbz" | "cbr" => extract_cbz_cover_bytes(file),
         "fb2" => extract_fb2_cover_bytes(file),
         "txt" => extract_txt_cover_bytes(file, 256),
+        "pdf" => render_pdf_page(&open_pdf(path)?, 0, 1024, 1024),
         _ => Err(anyhow!("Unsupported format: {}", ext)),
     }
 }

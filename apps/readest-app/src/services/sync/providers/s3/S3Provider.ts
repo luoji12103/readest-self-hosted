@@ -37,6 +37,7 @@ import { AwsClient } from 'aws4fetch';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { isTauriAppPlatform } from '@/services/environment';
 import { tauriDownload, tauriUpload } from '@/utils/transfer';
+import type { ProgressHandler } from '@/utils/transfer';
 import {
   FileEntry,
   FileHead,
@@ -156,8 +157,22 @@ const keyFor = (path: string): string =>
     .filter((s) => s.length > 0)
     .join('/');
 
+/**
+ * Percent-encode a path segment or query value in SigV4 canonical (RFC 3986)
+ * form: like `encodeURIComponent`, plus the sub-delims `!'()*` it leaves raw.
+ * The signer canonicalizes both the path and the query this way. AWS and R2
+ * re-canonicalize whatever arrives, but some gateways (Qiniu Kodo, #5839) do
+ * not re-canonicalize a path that already contains percent-encoding, so the
+ * wire form must already match. Same escaping as the AWS SDK's `escapeUri`.
+ */
+const encodeSegment = (segment: string): string =>
+  encodeURIComponent(segment).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+
 /** Percent-encode a key for the URL path, keeping `/` separators. */
-const encodeKey = (key: string): string => key.split('/').map(encodeURIComponent).join('/');
+const encodeKey = (key: string): string => key.split('/').map(encodeSegment).join('/');
 
 /** Parse a `Retry-After` header (delta-seconds) into ms, or undefined. */
 const parseRetryAfterMs = (header: string | null): number | undefined => {
@@ -188,7 +203,7 @@ class S3ProviderImpl {
       accessKeyId: config.accessKeyId,
       secretAccessKey: config.secretAccessKey,
     });
-    this.baseUrl = `${config.endpoint.replace(/\/+$/, '')}/${encodeURIComponent(config.bucket)}`;
+    this.baseUrl = `${config.endpoint.replace(/\/+$/, '')}/${encodeSegment(config.bucket)}`;
   }
 
   private urlFor(key: string): string {
@@ -230,9 +245,15 @@ class S3ProviderImpl {
     const entries: FileEntry[] = [];
     let token: string | undefined;
     do {
+      // Bucket-root listing: the request path is `/<bucket>/` with a
+      // trailing slash. MinIO canonicalizes a bucket-only path with the
+      // slash appended when it verifies SigV4, so a listing signed over
+      // `/<bucket>` fails with SignatureDoesNotMatch (object paths such
+      // as `/<bucket>/<key>` are canonicalized verbatim and unaffected).
+      // AWS S3 and R2 accept the trailing-slash form as well.
       const url =
-        `${this.baseUrl}?list-type=2&prefix=${encodeURIComponent(prefix)}&delimiter=%2F` +
-        (token ? `&continuation-token=${encodeURIComponent(token)}` : '');
+        `${this.baseUrl}/?list-type=2&prefix=${encodeSegment(prefix)}&delimiter=%2F` +
+        (token ? `&continuation-token=${encodeSegment(token)}` : '');
       const res = await this.request(HTTP_GET, url);
       await this.ensureOk(res, 'list', path);
       const doc = new DOMParser().parseFromString(await res.text(), 'application/xml');
@@ -298,12 +319,15 @@ class S3ProviderImpl {
   async ensureDir(_paths: string[]): Promise<void> {}
 
   async deleteDir(path: string): Promise<void> {
-    const prefix = `${keyFor(path)}/`;
+    const key = keyFor(path);
+    const prefix = key ? `${key}/` : '';
     let token: string | undefined;
     do {
+      // Prefix scan at the bucket root — same trailing-slash rule as
+      // list() above (MinIO canonicalizes `/<bucket>` as `/<bucket>/`).
       const url =
-        `${this.baseUrl}?list-type=2&prefix=${encodeURIComponent(prefix)}` +
-        (token ? `&continuation-token=${encodeURIComponent(token)}` : '');
+        `${this.baseUrl}/?list-type=2&prefix=${encodeSegment(prefix)}` +
+        (token ? `&continuation-token=${encodeSegment(token)}` : '');
       const res = await this.request(HTTP_GET, url);
       await this.ensureOk(res, 'list', path);
       const doc = new DOMParser().parseFromString(await res.text(), 'application/xml');
@@ -338,10 +362,14 @@ class S3ProviderImpl {
   }
 
   /** Streaming download via a presigned GET URL; same contract as upload. */
-  async downloadStream(remotePath: string, localPath: string): Promise<boolean> {
+  async downloadStream(
+    remotePath: string,
+    localPath: string,
+    onProgress?: ProgressHandler,
+  ): Promise<boolean> {
     try {
       const url = await this.presign(HTTP_GET, remotePath);
-      await tauriDownload(url, localPath);
+      await tauriDownload(url, localPath, onProgress);
       return true;
     } catch (e) {
       console.warn('S3Provider.downloadStream failed', remotePath, e);
@@ -435,7 +463,8 @@ export const createS3Provider = (
 
   if (isTauriAppPlatform()) {
     provider.uploadStream = (remotePath, localPath) => impl.uploadStream(remotePath, localPath);
-    provider.downloadStream = (remotePath, localPath) => impl.downloadStream(remotePath, localPath);
+    provider.downloadStream = (remotePath, localPath, onProgress) =>
+      impl.downloadStream(remotePath, localPath, onProgress);
   }
 
   return provider;

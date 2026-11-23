@@ -1,9 +1,19 @@
 import type { AnnotationToolType } from '@/types/annotator';
+import { BookFormat, FIXED_LAYOUT_FORMATS } from '@/types/book';
+
+// Proofread rewrites the rendered text through the content transformers, which
+// every reflowable format runs (Markdown wires the same pipeline in utils/md.ts
+// without an EPUB conversion). Only the fixed-layout formats are out: they
+// render pages, not text. The toolbar button used to require EPUB, the sole
+// format the feature shipped for (#2725).
+export const supportsProofread = (format: BookFormat | undefined): boolean =>
+  !!format && !FIXED_LAYOUT_FORMATS.has(format);
 
 // Canonical order of every annotation tool. Kept in sync with
 // `annotationToolButtons` in AnnotationTools.tsx (asserted by a unit test).
 export const ALL_ANNOTATION_TOOL_TYPES: AnnotationToolType[] = [
   'copy',
+  'copylink',
   'highlight',
   'annotate',
   'search',
@@ -12,10 +22,13 @@ export const ALL_ANNOTATION_TOOL_TYPES: AnnotationToolType[] = [
   'tts',
   'proofread',
   'share',
+  'quotecard',
 ];
 
 // Default toolbar: the eight pre-existing tools in their original order.
-// 'share' starts hidden in the Available tray per the #4014 design.
+// 'share' starts hidden in the Available tray per the #4014 design, and
+// 'copylink' is opt-in the same way (#5452) — a niche action most readers
+// never need, reachable by adding it in Customize Toolbar.
 export const DEFAULT_ANNOTATION_TOOLBAR_ITEMS: AnnotationToolType[] = [
   'copy',
   'highlight',
@@ -47,6 +60,20 @@ export const getToolbarToolTypes = (
   items: AnnotationToolType[] | undefined,
   canShare: boolean,
 ): AnnotationToolType[] => sanitize(items).filter((type) => canShare || type !== 'share');
+
+// One-tap highlighting (#5983): whenever the highlight tool is on the toolbar,
+// the style/color strip shows as soon as text is selected, so picking a color
+// needs no prior tap on Highlight. A popup-window selection without a CFI
+// (synthesized footnote text) can't anchor a highlight and keeps the plain
+// bar; an already-annotated selection always gets the strip, as before.
+export const shouldShowHighlightOptions = (
+  toolTypes: AnnotationToolType[],
+  selection: { annotated?: boolean; popup?: boolean; cfi?: string } | null,
+): boolean => {
+  if (!selection) return false;
+  if (selection.annotated) return true;
+  return toolTypes.includes('highlight') && !(selection.popup && !selection.cfi);
+};
 
 // Hidden tools (the "Available" tray), in canonical order.
 export const getAvailableToolTypes = (

@@ -24,9 +24,34 @@ vi.mock('@/store/bookDataStore', () => ({
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: { getState: () => ({ settings: { fake: true } }) },
 }));
-vi.mock('@/services/environment', () => ({ default: { env: 'test' } }));
+// getAPIBaseUrl is reached through TtsStatsRecorder -> @/libs/sync.
+vi.mock('@/services/environment', () => ({
+  default: { env: 'test' },
+  getAPIBaseUrl: () => 'https://example.invalid',
+}));
 vi.mock('@/utils/bridge', () => ({
   invokeUseBackgroundAudio: vi.fn().mockResolvedValue(undefined),
+}));
+
+const statsMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    session: { bookKey: string };
+    onPlaybackState: ReturnType<typeof vi.fn>;
+    onMark: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+  }>,
+}));
+vi.mock('@/services/statistics/ttsStatsRecorder', () => ({
+  TtsStatsRecorder: class {
+    session: { bookKey: string };
+    onPlaybackState = vi.fn();
+    onMark = vi.fn();
+    stop = vi.fn(async () => {});
+    constructor(session: { bookKey: string }) {
+      this.session = session;
+      statsMocks.instances.push(this);
+    }
+  },
 }));
 
 import { TTSSessionManager, getBookHashFromKey } from '@/services/tts/TTSSessionManager';
@@ -34,9 +59,13 @@ import type { TTSController } from '@/services/tts/TTSController';
 import { eventDispatcher } from '@/utils/event';
 
 class FakeController extends EventTarget {
+  // Stands in for a TTSController: the manager gates the stats recorder on
+  // this PlaybackSource tag.
+  readonly kind = 'tts' as const;
   state = 'playing';
   terminated = false;
   isViewAttached = true;
+  stopAtChapterEnd = false;
   shutdown = vi.fn().mockResolvedValue(undefined);
   detachView = vi.fn().mockImplementation(() => {
     this.isViewAttached = false;
@@ -85,6 +114,7 @@ describe('TTSSessionManager', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    statsMocks.instances.length = 0;
     manager = new TTSSessionManager();
     controller = new FakeController();
     playbackStates = [];
@@ -176,6 +206,65 @@ describe('TTSSessionManager', () => {
     expect(manager.getSleepTimer()).toBeNull();
   });
 
+  test('the chosen sleep timer re-arms on the next session after a stop (#7047)', async () => {
+    vi.useFakeTimers();
+    claim();
+    manager.setSleepTimer(600);
+    await manager.stopActive('user');
+    expect(manager.getSleepTimer()).toBeNull();
+
+    claim('hashA-r2', new FakeController());
+    expect(manager.getSleepTimer()?.timeoutSec).toBe(600);
+    expect(manager.getSleepTimer()?.firesAt).toBe(Date.now() + 600_000);
+
+    // Still chosen after it fired and stopped playback.
+    vi.advanceTimersByTime(601_000);
+    vi.useRealTimers();
+    await flush();
+    expect(manager.getActiveSession()).toBeNull();
+    claim('hashB-r1', new FakeController());
+    expect(manager.getSleepTimer()?.timeoutSec).toBe(600);
+  });
+
+  test('choosing no timer or chapter end stops the timer from re-arming', async () => {
+    claim();
+    manager.setSleepTimer(600);
+    manager.setSleepTimer(0);
+    await manager.stopActive('user');
+    claim('hashA-r2', new FakeController());
+    expect(manager.getSleepTimer()).toBeNull();
+
+    manager.setSleepTimer(600);
+    manager.setStopAtChapterEnd(true);
+    await manager.stopActive('user');
+    claim('hashA-r3', new FakeController());
+    expect(manager.getSleepTimer()).toBeNull();
+    expect(manager.getStopAtChapterEnd()).toBe(true);
+  });
+
+  test('chapter-end mode reaches the live controller and every controller claimed after', () => {
+    claim();
+    manager.setStopAtChapterEnd(true);
+    expect(controller.stopAtChapterEnd).toBe(true);
+    // Each restart after a stop builds a fresh controller; the mode is a
+    // standing preference, so the new one must inherit it on claim.
+    const restarted = new FakeController();
+    claim('hashA-r2', restarted);
+    expect(restarted.stopAtChapterEnd).toBe(true);
+  });
+
+  test('chapter-end mode and the numeric sleep timer are mutually exclusive', () => {
+    claim();
+    manager.setStopAtChapterEnd(true);
+    manager.setSleepTimer(60);
+    expect(manager.getStopAtChapterEnd()).toBe(false);
+    expect(controller.stopAtChapterEnd).toBe(false);
+
+    manager.setStopAtChapterEnd(true);
+    expect(manager.getSleepTimer()).toBeNull();
+    expect(manager.getStopAtChapterEnd()).toBe(true);
+  });
+
   test('headless persistence writes through setConfig and flushes to disk on stop', async () => {
     vi.useFakeTimers();
     claim();
@@ -204,5 +293,137 @@ describe('TTSSessionManager', () => {
     expect(controller.shutdown).not.toHaveBeenCalled();
     expect(manager.getActiveSession()).toBeNull();
     expect(sessionEvents.at(-1)?.reason).toBe('released');
+  });
+
+  test('feeds playback transitions and position marks to the stats recorder', () => {
+    claim();
+    const recorder = statsMocks.instances[0]!;
+    expect(recorder.session.bookKey).toBe('hashA-r1');
+
+    controller.emitState('playing');
+    controller.emitMark('epubcfi(/6/8!/4/4)');
+    controller.emitState('paused');
+
+    expect(recorder.onPlaybackState.mock.calls.flat()).toEqual(['playing', 'paused']);
+    expect(recorder.onMark).toHaveBeenCalledWith('epubcfi(/6/8!/4/4)');
+  });
+
+  test('exposes the relayed playback state for listeners that mount mid-session', () => {
+    claim();
+    expect(manager.getPlaybackState()).toBeNull();
+    controller.emitState('playing');
+    expect(manager.getPlaybackState()).toBe('playing');
+  });
+
+  test('the stats recorder holds the live session, so adopt rebinds its bookKey', () => {
+    claim();
+    // Identity, not a copy: adopt() rewrites bookKey IN PLACE when the reader
+    // reattaches to a background session, and the recorder resolves progress
+    // and config by that key. A snapshot would keep writing to the closed
+    // pane's entry for the rest of the session.
+    expect(statsMocks.instances[0]!.session).toBe(manager.getActiveSession());
+    manager.adopt('hashA-r2', meta('hashA-r2'));
+    expect(statsMocks.instances[0]!.session.bookKey).toBe('hashA-r2');
+  });
+
+  test('flushes the stats recorder when the session stops', async () => {
+    claim();
+    controller.emitState('playing');
+    await manager.stopActive('user');
+    expect(statsMocks.instances[0]!.stop).toHaveBeenCalled();
+  });
+
+  test('stopBook joins teardown after the live slot has already been cleared', async () => {
+    let finishShutdown: () => void = () => {};
+    controller.shutdown.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishShutdown = resolve;
+      }),
+    );
+    claim();
+
+    const stopping = manager.stopActive('user');
+    expect(manager.getActiveSession()).toBeNull();
+    let joined = false;
+    const joining = manager.stopBook('hashA', 'deleted').then(() => {
+      joined = true;
+    });
+    await Promise.resolve();
+    expect(joined).toBe(false);
+
+    finishShutdown();
+    await Promise.all([stopping, joining]);
+    expect(joined).toBe(true);
+  });
+
+  test('a concurrent generic stop does not tear down a replacement session', async () => {
+    let finishShutdown: () => void = () => {};
+    controller.shutdown.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishShutdown = resolve;
+      }),
+    );
+    claim();
+
+    const firstStop = manager.stopActive('user');
+    const joinedStop = manager.stopActive('user');
+    const replacement = new FakeController();
+    claim('hashB-r1', replacement);
+
+    finishShutdown();
+    await Promise.all([firstStop, joinedStop]);
+    expect(manager.getActiveSession()?.controller).toBe(replacement as unknown as TTSController);
+    expect(replacement.shutdown).not.toHaveBeenCalled();
+  });
+
+  test('a user stop requested for a replacement waits and then stops it', async () => {
+    let finishShutdown: () => void = () => {};
+    controller.shutdown.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishShutdown = resolve;
+      }),
+    );
+    claim();
+
+    const firstStop = manager.stopActive('user');
+    const replacement = new FakeController();
+    claim('hashB-r1', replacement);
+    const replacementStop = manager.stopActive('user');
+
+    finishShutdown();
+    await Promise.all([firstStop, replacementStop]);
+    expect(manager.getActiveSession()).toBeNull();
+    expect(replacement.shutdown).toHaveBeenCalledTimes(1);
+  });
+
+  test('stopBook waits for a replaced controller of the same book to close', async () => {
+    let finishOldShutdown: () => void = () => {};
+    controller.shutdown.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishOldShutdown = resolve;
+      }),
+    );
+    claim();
+    const replacement = new FakeController();
+    claim('hashA-r2', replacement);
+
+    let finished = false;
+    const stopping = manager.stopBook('hashA', 'deleted').then(() => {
+      finished = true;
+    });
+    await vi.waitFor(() => expect(replacement.shutdown).toHaveBeenCalledTimes(1));
+    expect(finished).toBe(false);
+
+    finishOldShutdown();
+    await stopping;
+    expect(finished).toBe(true);
+  });
+
+  test('never orphans a stats recorder when the same session is re-claimed', () => {
+    claim();
+    // The recorder owns a heartbeat interval; an orphan would keep writing.
+    claim();
+    expect(statsMocks.instances).toHaveLength(2);
+    expect(statsMocks.instances[0]!.stop).toHaveBeenCalled();
   });
 });

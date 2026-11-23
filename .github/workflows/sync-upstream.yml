@@ -1,4 +1,4 @@
-name: Sync Stable Upstream Selfhost
+name: Check Stable Upstream Candidate
 
 on:
   workflow_dispatch:
@@ -6,8 +6,7 @@ on:
     - cron: '37 3 * * *'
 
 permissions:
-  actions: write
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-stable-upstream-selfhost
@@ -22,104 +21,34 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: selfhost-main
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
           submodules: false
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Resolve stable upstream candidate
-        id: stable
-        run: |
-          set -euo pipefail
-
-          git remote add upstream https://github.com/readest/readest.git
-          git fetch --no-tags upstream main:refs/remotes/upstream/main
-          git fetch --no-recurse-submodules upstream '+refs/tags/v*:refs/tags/upstream/v*'
-          git fetch --no-tags origin main selfhost-main
-          git fetch --no-recurse-submodules origin '+refs/tags/selfhost-v*:refs/tags/origin/selfhost-v*'
-
-          expected_main="$(git rev-parse refs/remotes/origin/main)"
-          expected_selfhost="$(git rev-parse refs/remotes/origin/selfhost-main)"
-          latest_tag="$(
-            git for-each-ref --format='%(refname:strip=3)' refs/tags/upstream |
-              bash scripts/select-latest-stable-tag.sh
-          )"
-          target_ref="refs/tags/upstream/${latest_tag}"
-          target_commit="$(git rev-parse "${target_ref}^{commit}")"
-
-          if ! git merge-base --is-ancestor "$target_commit" refs/remotes/upstream/main; then
-            echo "::error::${latest_tag} is not reachable from upstream/main"
-            exit 1
-          fi
-
-          git checkout -B sync-candidate refs/remotes/origin/selfhost-main
-          branch_required=false
-          if ! git merge-base --is-ancestor "$target_commit" HEAD; then
-            current_tag="$(
-              while IFS= read -r tag; do
-                if git merge-base --is-ancestor "refs/tags/upstream/${tag}^{commit}" HEAD; then
-                  printf '%s\n' "$tag"
-                fi
-              done < <(git for-each-ref --format='%(refname:strip=3)' refs/tags/upstream) |
-                bash scripts/select-latest-stable-tag.sh
-            )"
-            current_commit="$(git rev-parse "refs/tags/upstream/${current_tag}^{commit}")"
-            echo "Rebasing selfhost commits from ${current_tag} onto ${latest_tag}."
-            git rebase --onto "$target_commit" "$current_commit"
-            branch_required=true
-          fi
-
-          selfhost_ref="refs/tags/origin/selfhost-${latest_tag}"
-          tag_required=true
-          if git show-ref --verify --quiet "$selfhost_ref"; then
-            existing_tag_commit="$(git rev-parse "${selfhost_ref}^{commit}")"
-            if ! git merge-base --is-ancestor "$target_commit" "$existing_tag_commit"; then
-              echo "::error::selfhost-${latest_tag} does not contain the matching upstream stable commit"
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "$existing_tag_commit" HEAD; then
-              echo "::error::selfhost-${latest_tag} is not in the current selfhost branch history"
-              exit 1
-            fi
-            tag_required=false
-          fi
-
-          {
-            echo "latest_tag=$latest_tag"
-            echo "release_version=${latest_tag#v}"
-            echo "expected_main=$expected_main"
-            echo "expected_selfhost=$expected_selfhost"
-            echo "branch_required=$branch_required"
-            echo "tag_required=$tag_required"
-          } >> "$GITHUB_OUTPUT"
-
-          if [ "$branch_required" = false ] && [ "$tag_required" = false ]; then
-            echo "${latest_tag} is already synchronized and released."
-          fi
+      - name: Prepare stable upstream candidate
+        id: candidate
+        run: bash scripts/prepare-upstream-candidate.sh https://github.com/readest/readest.git
 
       - name: Update submodules
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive
 
       - name: Setup pnpm
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
 
       - name: Setup Node
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: 24
           cache: pnpm
 
       - name: Install Rust checks
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
@@ -127,10 +56,11 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install system dependencies
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ripgrep \
             luajit \
             luarocks \
             libsqlite3-dev \
@@ -144,21 +74,32 @@ jobs:
             libsoup-3.0-dev
 
       - name: Install KOReader test dependencies
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           sudo luarocks --lua-version=5.1 install busted
           sudo luarocks --lua-version=5.1 install lsqlite3complete
 
       - name: Install dependencies
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Setup app vendors
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: pnpm --filter @readest/readest-app setup-vendors
 
+      - name: Run selfhost policy checks
+        if: steps.candidate.outputs.status == 'ready'
+        run: |
+          bash scripts/test-select-latest-stable-tag.sh
+          bash scripts/test-sync-upstream-workflow.sh
+          bash scripts/test-prepare-selfhost-release.sh
+          bash scripts/test-selfhost-release-workflow.sh
+          bash scripts/test-selfhost-android-arm64-workflow.sh
+          bash scripts/scan-public-fork-safety.sh
+          node --test scripts/test-selfhost-legacy-updater.mjs
+
       - name: Test selfhost configuration
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           pnpm --filter @readest/readest-app test --run \
             src/__tests__/services/customServerConfig.test.ts \
@@ -168,74 +109,67 @@ jobs:
             src/__tests__/helpers/updater.test.ts \
             src/__tests__/services/command-registry-extended.test.ts
 
-      - name: Run selfhost policy checks
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
-        run: |
-          bash scripts/test-select-latest-stable-tag.sh
-          bash scripts/test-sync-upstream-workflow.sh
-          bash scripts/scan-public-fork-safety.sh
-
       - name: Test KOReader plugin
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: pnpm --filter @readest/readest-app test:lua
 
       - name: Run TypeScript and formatting checks
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           pnpm format:check
           pnpm lint
 
       - name: Run full unit suite
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: pnpm --filter @readest/readest-app test --run
 
       - name: Run Rust checks
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: |
           pnpm fmt:check
           pnpm clippy:check
 
       - name: Build production Web app
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+        if: steps.candidate.outputs.status == 'ready'
         run: pnpm --filter @readest/readest-app build-web
 
-      - name: Publish synchronized stable release
-        if: steps.stable.outputs.branch_required == 'true' || steps.stable.outputs.tag_required == 'true'
+      - name: Summarize upstream candidate
+        if: always()
         env:
-          latest_tag: ${{ steps.stable.outputs.latest_tag }}
-          expected_main: ${{ steps.stable.outputs.expected_main }}
-          expected_selfhost: ${{ steps.stable.outputs.expected_selfhost }}
-          branch_required: ${{ steps.stable.outputs.branch_required }}
-          tag_required: ${{ steps.stable.outputs.tag_required }}
+          CANDIDATE_STATUS: ${{ steps.candidate.outputs.status }}
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
+          CANDIDATE_TREE: ${{ steps.candidate.outputs.tree }}
+          FORK_BASE: ${{ steps.candidate.outputs.fork_base }}
+          UPSTREAM_TAG: ${{ steps.candidate.outputs.upstream_tag }}
+          UPSTREAM_COMMIT: ${{ steps.candidate.outputs.upstream_commit }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
-          if [ "$branch_required" = true ]; then
-            refspecs=(
-              HEAD:refs/heads/main
-              HEAD:refs/heads/selfhost-main
-            )
-            if [ "$tag_required" = true ]; then
-              refspecs+=("HEAD:refs/tags/selfhost-$latest_tag")
+          {
+            printf '## Stable upstream candidate\n\n'
+            if [[ -n "$FORK_BASE" ]]; then
+              printf -- "- Fork base (\`origin/main\`): \`%s\`\n" "$FORK_BASE"
             fi
-            git push --atomic origin \
-              "--force-with-lease=refs/heads/main:${expected_main}" \
-              "--force-with-lease=refs/heads/selfhost-main:${expected_selfhost}" \
-              "${refspecs[@]}"
-          elif [ "$tag_required" = true ]; then
-            git push origin "HEAD:refs/tags/selfhost-$latest_tag"
-          fi
-
-      # GitHub suppresses push-triggered workflows for refs created with
-      # GITHUB_TOKEN. Explicit workflow_dispatch is the supported exception.
-      - name: Dispatch selfhost release
-        if: steps.stable.outputs.tag_required == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          latest_tag: ${{ steps.stable.outputs.latest_tag }}
-          release_version: ${{ steps.stable.outputs.release_version }}
-        run: |
-          gh workflow run release-selfhost.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref "selfhost-$latest_tag" \
-            -f "tag=selfhost-$latest_tag" \
-            -f "release_version=$release_version"
+            if [[ -n "$UPSTREAM_TAG" ]]; then
+              printf -- "- Upstream tag: \`%s\` (\`%s\`)\n" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT"
+            fi
+            if [[ -n "$CANDIDATE_COMMIT" ]]; then
+              printf -- "- Temporary merge commit: \`%s\`\n- Tree: \`%s\`\n" "$CANDIDATE_COMMIT" "$CANDIDATE_TREE"
+            fi
+            printf '\n'
+            case "$CANDIDATE_STATUS:$JOB_STATUS" in
+              ready:success)
+                echo '**Passed:** the candidate passed validation. Recreate the merge from the recorded commits for review.' ;;
+              already-contained:success)
+                echo "**Already contained:** the upstream commit is already in \`origin/main\`; no merge or candidate checks were needed." ;;
+              conflict:failure)
+                echo '**Merge conflict:** no candidate was produced. See the preparation step log for the conflicting paths.' ;;
+              ready:failure)
+                echo '**Validation failed:** see the failed step before using this candidate.' ;;
+              *:cancelled)
+                echo '**Cancelled:** the candidate did not complete validation.' ;;
+              *)
+                echo '**Preparation failed:** see the job log for details.' ;;
+            esac
+            printf '\nNo remote branch, tag, or release was changed.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

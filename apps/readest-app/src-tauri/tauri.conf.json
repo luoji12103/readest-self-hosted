@@ -16,8 +16,9 @@
       "capabilities": ["default", "desktop-capability"],
       "csp": {
         "default-src": "'self' 'unsafe-inline' blob: data: customprotocol: asset: http://asset.localhost http://rangefile.localhost ipc: http://ipc.localhost",
-        "connect-src": "'self' blob: data: asset: http://asset.localhost http://rangefile.localhost ipc: http://ipc.localhost http://*:* https://*:* https://*.sentry.io https://*.posthog.com https://*.deepl.com https://*.wikipedia.org https://*.wiktionary.org https://*.supabase.co https://*.readest.com wss://speech.platform.bing.com https://*.cloudflarestorage.com https://translate.googleapis.com https://translate.toil.cc https://*.microsofttranslator.com https://edge.microsoft.com https://*.googleusercontent.com https://graph.microsoft.com https://login.microsoftonline.com",
+        "connect-src": "'self' blob: data: asset: http://asset.localhost http://rangefile.localhost ipc: http://ipc.localhost http://*:* https://*:* https://*.sentry.io https://*.posthog.com https://*.deepl.com https://*.wikipedia.org https://*.wiktionary.org https://*.supabase.co https://*.readest.com wss://api.msedgeservices.com https://*.cloudflarestorage.com https://translate.googleapis.com https://translate.toil.cc https://*.microsofttranslator.com https://edge.microsoft.com https://*.googleusercontent.com https://graph.microsoft.com https://login.microsoftonline.com",
         "img-src": "'self' blob: data: asset: http://asset.localhost https://* https://*:* http://* http://*:*",
+        "media-src": "'self' blob: data: asset: http://asset.localhost https://* https://*:* http://* http://*:*",
         "style-src": "'self' 'unsafe-inline' blob: asset: http://asset.localhost https://cdn.jsdelivr.net https://fonts.googleapis.com https://cdnjs.cloudflare.com https://storage.readest.com",
         "font-src": "'self' blob: data: asset: http://asset.localhost tauri: https://db.onlinewebfonts.com https://cdn.jsdelivr.net https://fonts.gstatic.com https://cdnjs.cloudflare.com  https://storage.readest.com",
         "frame-src": "'self' blob: asset: http://asset.localhost https://*.stripe.com",
@@ -65,7 +66,30 @@
     },
     "linux": {
       "deb": {
-        "section": "text"
+        "section": "text",
+        "depends": [
+          "libgtk-3-0",
+          "libnss3",
+          "libgbm1",
+          "libasound2",
+          "libudev1",
+          "libxkbcommon-x11-0"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "libgtk-3.so.0()(64bit)",
+          "libnss3.so()(64bit)",
+          "libgbm.so.1()(64bit)",
+          "libasound.so.2()(64bit)",
+          "libudev.so.1()(64bit)",
+          "libxkbcommon-x11.so.0()(64bit)"
+        ]
+      },
+      "appimage": {
+        "files": {
+          "bin/00-no-userns-prompt.hook": "appimage/00-no-userns-prompt.hook"
+        }
       }
     },
     "android": {
@@ -74,57 +98,98 @@
     "iOS": {
       "developmentTeam": "J5W48D69VR",
       "infoPlist": "./Info-ios.plist",
-      "minimumSystemVersion": "15.0"
+      "minimumSystemVersion": "16.4"
     },
     "fileAssociations": [
       {
-        "name": "epub",
+        "name": "EPUB Document",
         "ext": ["epub"],
+        "contentTypes": ["org.idpf.epub-container"],
         "description": "EPUB file",
         "mimeType": "application/epub+zip",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "mobi",
+        "name": "MOBI Document",
         "ext": ["mobi"],
+        "contentTypes": ["org.mobipocket.mobi"],
         "description": "MOBI file",
         "mimeType": "application/x-mobipocket-ebook",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "azw",
+        "name": "AZW Document",
         "ext": ["azw"],
+        "contentTypes": ["com.amazon.azw", "com.amazon.azw3"],
         "description": "AZW file",
         "mimeType": "application/vnd.amazon.ebook",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "azw3",
+        "name": "AZW Document",
         "ext": ["azw3"],
+        "contentTypes": ["com.amazon.azw", "com.amazon.azw3"],
         "description": "AZW3 file",
         "mimeType": "application/vnd.amazon.mobi8-ebook",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "fb2",
+        "name": "FB2 Document",
         "ext": ["fb2"],
+        "contentTypes": ["com.readest.fb2"],
         "description": "FB2 file",
         "mimeType": "application/x-fictionbook+xml",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "cbz",
+        "name": "CBZ Archive",
         "ext": ["cbz"],
+        "contentTypes": ["com.readest.cbz"],
         "description": "CBZ file",
         "mimeType": "application/vnd.comicbook+zip",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       },
       {
-        "name": "pdf",
+        "name": "PDF Document",
         "ext": ["pdf"],
+        "contentTypes": ["com.adobe.pdf"],
         "description": "PDF file",
         "mimeType": "application/pdf",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Text File",
+        "ext": ["txt"],
+        "contentTypes": ["public.plain-text"],
+        "description": "TXT file",
+        "mimeType": "text/plain",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Markdown Document",
+        "ext": ["md"],
+        "contentTypes": ["net.daringfireball.markdown"],
+        "description": "Markdown file",
+        "mimeType": "text/markdown",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Readest Book Package",
+        "ext": ["rbooks"],
+        "contentTypes": ["com.readest.books"],
+        "description": "Readest Book Package",
+        "mimeType": "application/x-readest-books",
+        "role": "Viewer",
+        "rank": "Owner"
       }
     ],
     "createUpdaterArtifacts": true
@@ -194,7 +259,7 @@
     },
     "webview-upgrade": {
       "minUpgradeMajor": 121,
-      "minSupportedMajor": 92
+      "minSupportedMajor": 111
     }
   }
 }

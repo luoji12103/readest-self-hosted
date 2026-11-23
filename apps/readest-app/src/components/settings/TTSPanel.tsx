@@ -1,10 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { useEnv } from '@/context/EnvContext';
+import { useAuth } from '@/context/AuthContext';
+import { useAppRouter } from '@/hooks/useAppRouter';
+import { useKeyDownActions } from '@/hooks/useKeyDownActions';
+import { isCustomTTSAllowed } from '@/utils/access';
+import { navigateToLogin, navigateToProfile } from '@/utils/nav';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useResetViewSettings } from '@/hooks/useResetSettings';
 import { useTranslation } from '@/hooks/useTranslation';
 import { saveViewSettings } from '@/helpers/settings';
+import { getLocale } from '@/utils/misc';
 import { SettingsPanelPanelProp } from './SettingsDialog';
 import {
   TTSHighlightGranularity,
@@ -12,15 +18,40 @@ import {
   TTSPlayerStyle,
 } from '@/services/tts/types';
 import { getTTSCacheConfig, setTTSCacheConfig } from '@/services/tts/providers/bookCacheStore';
-import { BoxedList, SettingsRow, SettingsSelect, SettingsSwitchRow } from './primitives';
-import TTSHighlightStyleEditor, { TTSHighlightStyle } from './color/TTSHighlightStyleEditor';
+import { TTSUtils } from '@/services/tts/TTSUtils';
+import { loadVoiceLibrary, type VoiceLibrary } from '@/services/tts/voiceLibrary';
+import { getEnabledCustomTTSServices } from '@/store/customTTSStore';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { getVoiceLanguageName } from '@/components/tts/VoiceList';
+import {
+  BoxedList,
+  NavigationRow,
+  SettingsRow,
+  SettingsSelect,
+  SettingsSwitchRow,
+} from './primitives';
+import CustomTTSServices from './CustomTTSServices';
+import TTSVoicesPage from './TTSVoicesPage';
+import TTSHighlightStyleEditor, { TTSHighlightStyle } from './theme/TTSHighlightStyleEditor';
 
 const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }) => {
   const _ = useTranslation();
-  const { envConfig } = useEnv();
+  const { envConfig, appService } = useEnv();
+  const router = useAppRouter();
+  const { token, user } = useAuth();
+  const hasPremium = isCustomTTSAllowed(token);
+  const [showCustomServices, setShowCustomServices] = useState(false);
+  const [showVoices, setShowVoices] = useState(false);
+  const [voiceLibrary, setVoiceLibrary] = useState<VoiceLibrary | null>(null);
+  const [defaultVoiceName, setDefaultVoiceName] = useState<string | null>(null);
+  const { getBookData } = useBookDataStore();
+  // With a book open, its language; else the UI language.
+  const voiceLang =
+    (bookKey && getBookData(bookKey)?.book?.primaryLanguage) || getLocale().split('-')[0]!;
   const { getViewSettings } = useReaderStore();
   const { settings, setSettings, saveSettings } = useSettingsStore();
   const viewSettings = getViewSettings(bookKey) || settings.globalViewSettings;
+  const showInlineReadings = ['ja', 'ko'].includes(getLocale().toLowerCase().split('-')[0]!);
 
   const [ttsMediaMetadata, setTtsMediaMetadata] = useState<TTSMediaMetadataMode>(
     viewSettings.ttsMediaMetadata ?? 'sentence',
@@ -30,6 +61,9 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
   );
   const [ttsHighlightGranularity, setTtsHighlightGranularity] = useState<TTSHighlightGranularity>(
     viewSettings.ttsHighlightGranularity ?? 'word',
+  );
+  const [ttsSkipInlineAnnotations, setTtsSkipInlineAnnotations] = useState(
+    viewSettings.ttsSkipInlineAnnotations ?? false,
   );
   const [ttsHighlightStyle, setTtsHighlightStyle] = useState(
     viewSettings.ttsHighlightOptions.style,
@@ -57,6 +91,7 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
       ttsHighlightGranularity: setTtsHighlightGranularity as React.Dispatch<
         React.SetStateAction<string>
       >,
+      ttsSkipInlineAnnotations: setTtsSkipInlineAnnotations,
     });
   };
 
@@ -89,6 +124,61 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsHighlightGranularity]);
+
+  useEffect(() => {
+    if (ttsSkipInlineAnnotations === viewSettings.ttsSkipInlineAnnotations) return;
+    saveViewSettings(
+      envConfig,
+      bookKey,
+      'ttsSkipInlineAnnotations',
+      ttsSkipInlineAnnotations,
+      false,
+      false,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsSkipInlineAnnotations]);
+
+  // Android Back / Esc steps back to this panel instead of closing Settings.
+  useKeyDownActions({
+    enabled: showCustomServices,
+    onCancel: () => setShowCustomServices(false),
+  });
+
+  // Every engine's voices, for the Voices page and to name the default here.
+  useEffect(() => {
+    let current = true;
+    loadVoiceLibrary({
+      appService,
+      customServices: getEnabledCustomTTSServices,
+      customAllowed: hasPremium,
+    }).then((library) => current && setVoiceLibrary(library));
+    return () => {
+      current = false;
+    };
+  }, [appService, hasPremium]);
+
+  const refreshDefaultVoiceName = async () => {
+    const chosen = TTSUtils.getDefaultVoice(voiceLang);
+    if (!voiceLibrary || !chosen) return setDefaultVoiceName(null);
+    const voice = (await voiceLibrary.getVoices(voiceLang))
+      .filter((group) => group.engine === chosen.engine)
+      .flatMap((group) => group.voices)
+      .find((v) => v.id === chosen.voiceId);
+    setDefaultVoiceName(voice ? (voice.literalName ? voice.name : _(voice.name)) : null);
+  };
+
+  useEffect(() => {
+    void refreshDefaultVoiceName();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceLibrary, voiceLang]);
+
+  // Custom TTS services are premium: everyone else is routed to the plans page
+  // (or sign-in) instead of the sub-page.
+  const handleOpenCustomServices = () => {
+    if (hasPremium) setShowCustomServices(true);
+    else if (user) navigateToProfile(router);
+    else navigateToLogin(router);
+  };
 
   const handleTTSStyleChange = (style: TTSHighlightStyle) => {
     setTtsHighlightStyle(style);
@@ -125,8 +215,46 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     setTtsHighlightGranularity(granularity);
   };
 
+  if (showVoices) {
+    return (
+      <div className='w-full'>
+        <TTSVoicesPage
+          library={voiceLibrary}
+          lang={voiceLang}
+          bookKey={bookKey || null}
+          onBack={() => setShowVoices(false)}
+          onDefaultChange={refreshDefaultVoiceName}
+        />
+      </div>
+    );
+  }
+
+  if (showCustomServices) {
+    return (
+      <div className='w-full'>
+        <CustomTTSServices onBack={() => setShowCustomServices(false)} />
+      </div>
+    );
+  }
+
   return (
     <div className='my-4 w-full space-y-6'>
+      <BoxedList title={_('Voices')} cardClassName='overflow-hidden'>
+        <NavigationRow
+          title={_('Voice Library')}
+          status={`${getVoiceLanguageName(voiceLang)} · ${defaultVoiceName ?? _('Automatic')}`}
+          onClick={() => setShowVoices(true)}
+          data-setting-id='settings.tts.voices'
+        />
+        <NavigationRow
+          title={_('Custom TTS Services')}
+          status={_('Use your own OpenAI-compatible speech service')}
+          badge={hasPremium ? undefined : _('Premium')}
+          onClick={handleOpenCustomServices}
+          data-setting-id='settings.tts.customServices'
+        />
+      </BoxedList>
+
       <TTSHighlightStyleEditor
         granularity={ttsHighlightGranularity}
         style={ttsHighlightStyle}
@@ -138,6 +266,18 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
         onCustomColorsChange={handleCustomTtsColorsChange}
         data-setting-id='settings.tts.ttsHighlightStyle'
       />
+
+      {showInlineReadings && (
+        <BoxedList title={_('Speech')} data-setting-id='settings.tts.speech'>
+          <SettingsSwitchRow
+            label={_('Skip Parenthetical Readings')}
+            description={_('Do not speak readings or Hanja glosses in parentheses after a word')}
+            checked={ttsSkipInlineAnnotations}
+            onChange={() => setTtsSkipInlineAnnotations(!ttsSkipInlineAnnotations)}
+            data-setting-id='settings.tts.skipInlineAnnotations'
+          />
+        </BoxedList>
+      )}
 
       <BoxedList title={_('Media Info')} data-setting-id='settings.tts.mediaMetadata'>
         <SettingsRow label={_('Player Style')} data-setting-id='settings.tts.playerStyle'>
@@ -174,16 +314,6 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
             updateTTSCacheConfig({ ...ttsCacheConfig, enabled: !ttsCacheConfig.enabled })
           }
           data-setting-id='settings.tts.audioCacheEnabled'
-        />
-        <SettingsSwitchRow
-          label={_('Sync Audio Cache')}
-          description={_('Share section audio between your devices through your file sync service')}
-          checked={ttsCacheConfig.syncEnabled}
-          disabled={!ttsCacheConfig.enabled}
-          onChange={() =>
-            updateTTSCacheConfig({ ...ttsCacheConfig, syncEnabled: !ttsCacheConfig.syncEnabled })
-          }
-          data-setting-id='settings.tts.audioCacheSync'
         />
         <SettingsRow label={_('Storage Limit')}>
           <SettingsSelect

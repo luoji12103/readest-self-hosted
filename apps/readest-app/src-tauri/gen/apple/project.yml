@@ -2,7 +2,7 @@ name: Readest
 options:
   bundleIdPrefix: com.bilingify.readest
   deploymentTarget:
-    iOS: 15.0
+    iOS: 16.4
 fileGroups: [../../src]
 packages:
   Sentry:
@@ -126,8 +126,8 @@ targets:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
 
-  # Share-sheet extension that lets users send article URLs from Safari /
-  # Chrome / etc. directly to Readest. The extension grabs the URL via
+  # Share-sheet extension that lets users send article URLs (or plain
+  # text) from Safari / Chrome / etc. directly to Readest. The extension grabs the URL via
   # NSExtensionContext, encodes it into `readest://share?url=...`, and
   # opens the main app — which catches the deep-link via
   # `tauri-plugin-deep-link` and runs the clip-and-import pipeline.
@@ -141,6 +141,12 @@ targets:
     # to wire up.
     sources:
       - path: ShareExtension
+        excludes:
+          - GetPageContent.js
+      # The JS preprocessor must ship as a bundle resource — never let it
+      # land in Compile Sources.
+      - path: ShareExtension/GetPageContent.js
+        buildPhase: resources
     info:
       path: ShareExtension/Info.plist
       properties:
@@ -149,13 +155,28 @@ targets:
           NSExtensionPointIdentifier: com.apple.share-services
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
           NSExtensionAttributes:
-            # Web URLs only. Do NOT add NSExtensionActivationSupportsText: a
-            # .txt file is public.plain-text (conforms to public.text), so that
-            # key makes this article-URL clipper activate for plain-text FILES
-            # it can't handle (the share sheet hangs). Book files must fall
-            # through to the main app's CFBundleDocumentTypes import path.
-            NSExtensionActivationRule:
-              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+            # Web URLs, Safari web pages (the JS preprocessing result is a
+            # property list) and shared plain text (#6747). Do NOT use
+            # NSExtensionActivationSupportsText: a .txt file is
+            # public.plain-text too, so that key makes the extension
+            # activate for plain-text FILES (the share sheet hangs). A file
+            # shared from Files also carries public.file-url, while text
+            # shared from an app carries public.plain-text alone, so the
+            # NOT file-url clauses keep book files on the main app's
+            # CFBundleDocumentTypes import path.
+            NSExtensionActivationRule: >-
+                SUBQUERY(extensionItems, $item, SUBQUERY($item.attachments, $att,
+                (ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url"
+                AND NOT ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url")
+                OR ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "com.apple.property-list"
+                OR (ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text"
+                AND NOT ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url")
+                ).@count == $item.attachments.@count).@count >= 1
+            # Runs GetPageContent.js inside the shared Safari page (with
+            # the user's session) and hands the rendered DOM to
+            # ShareViewController — the only way to capture login-walled
+            # articles on iOS (#5262).
+            NSExtensionJavaScriptPreprocessingFile: GetPageContent
     # Entitlements referenced via CODE_SIGN_ENTITLEMENTS build setting
     # rather than xcodegen's `entitlements:` block — otherwise xcodegen
     # may overwrite the file (even with no properties declared) during
@@ -178,7 +199,7 @@ targets:
         # file was modified during the build", fix it by adding the
         # auto-derived keys to the source file, not by re-enabling this flag.
         SWIFT_VERSION: "5.0"
-        IPHONEOS_DEPLOYMENT_TARGET: 15.0
+        IPHONEOS_DEPLOYMENT_TARGET: 16.4
         ARCHS: [arm64]
         VALID_ARCHS: arm64
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
@@ -211,7 +232,7 @@ targets:
         # com.apple.security.application-groups, so the widget reads an empty
         # snapshot from the App Group and shows only the placeholder book icon.
         SWIFT_VERSION: "5.0"
-        IPHONEOS_DEPLOYMENT_TARGET: 15.0
+        IPHONEOS_DEPLOYMENT_TARGET: 16.4
         ARCHS: [arm64]
         VALID_ARCHS: arm64
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64

@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideAnnotationDraw,
+  drawAnnotationOverlay,
+  filterBooknotes,
   filterExportGroups,
   findAnnotationAtCfi,
+  getAnnotationOverlayColor,
   mergeRestyledAnnotation,
+  resolveAnnotationClick,
+  summarizeAnnotationHub,
 } from '@/app/reader/utils/annotatorUtil';
+import { SystemSettings } from '@/types/settings';
+import { ViewSettings } from '@/types/book';
 import { BookNote, BooknoteGroup } from '@/types/book';
 import { NOTE_PREFIX } from '@/types/view';
 
@@ -33,6 +40,107 @@ describe('decideAnnotationDraw', () => {
   it('returns none when there is no style and it is not a note overlay', () => {
     expect(decideAnnotationDraw('epubcfi(/6/4!/4)', undefined)).toBe('none');
     expect(decideAnnotationDraw(undefined, undefined)).toBe('none');
+  });
+
+  it('returns global for a copy of a global annotation, whatever its style', () => {
+    expect(decideAnnotationDraw('epubcfi(/6/4!/4)#g3-0', 'highlight')).toBe('global');
+    expect(decideAnnotationDraw('epubcfi(/6/4!/4)#g3-0', undefined)).toBe('global');
+  });
+});
+
+describe('drawAnnotationOverlay for a global copy', () => {
+  const draw = (eink = false) => {
+    const calls: Array<{ func: unknown; opts?: Record<string, unknown> }> = [];
+    const range = document.createRange();
+    range.selectNodeContents(document.body);
+    drawAnnotationOverlay(
+      {
+        draw: (func, opts) => calls.push({ func, opts }),
+        annotation: { ...makeNote({ style: 'highlight', color: 'yellow' }), value: 'cfi#g0-0' },
+        doc: document,
+        range,
+      },
+      {
+        settings: {
+          globalReadSettings: { customHighlightColors: {} },
+        } as unknown as SystemSettings,
+        viewSettings: {
+          isEink: eink,
+          isColorEink: false,
+          vertical: false,
+          defaultFontSize: 16,
+          lineHeight: 1.5,
+        } as ViewSettings,
+        isDarkMode: false,
+        isMobile: false,
+      },
+    );
+    return calls;
+  };
+
+  const render = (eink = false) => {
+    const calls = draw(eink);
+    expect(calls).toHaveLength(1);
+    const { func, opts } = calls[0]!;
+    const rects = [{ left: 10, top: 0, right: 50, bottom: 20, width: 40, height: 20 }];
+    return (func as (r: unknown, o: unknown) => SVGGElement)(rects, opts);
+  };
+
+  it('draws a dashed underline in the tinted text color, not the highlight', () => {
+    const g = render();
+    // The theme variable, not a resolved color: overlays aren't redrawn on a
+    // theme switch, so a baked-in dark-mode color stayed on a light page.
+    expect(g.style.getPropertyValue('stroke')).toBe('var(--color-base-content)');
+    expect(g.getAttribute('stroke-opacity')).toBe('0.5');
+    // A fine dotted rule: 1px, with dashes as long as the gaps.
+    expect(g.getAttribute('stroke-width')).toBe('1');
+    expect(g.getAttribute('stroke-dasharray')).toBe('2 2');
+    const line = g.querySelector('line')!;
+    expect(line.getAttribute('x1')).toBe('10');
+    expect(line.getAttribute('x2')).toBe('50');
+    expect(line.getAttribute('y1')).toBe(line.getAttribute('y2'));
+  });
+
+  it('draws at full opacity, still dashed, on black-and-white e-ink', () => {
+    const g = render(true);
+    expect(g.style.getPropertyValue('stroke')).toBe('var(--color-base-content)');
+    expect(g.getAttribute('stroke-opacity')).toBe('1');
+    expect(g.getAttribute('stroke-dasharray')).toBe('2 2');
+  });
+});
+
+describe('resolveAnnotationClick', () => {
+  const global = makeNote({
+    id: 'g',
+    cfi: 'epubcfi(/6/4!/4)',
+    style: 'highlight',
+    color: 'yellow',
+    note: 'Dwarf king',
+    global: true,
+  });
+
+  it('opens the note when a copy of a global annotation with a note is clicked', () => {
+    expect(resolveAnnotationClick('epubcfi(/6/4!/4)#g2-0', [global])).toEqual({
+      annotation: global,
+      cfi: 'epubcfi(/6/4!/4)',
+      isNote: true,
+      isCopy: true,
+    });
+  });
+
+  it('opens the highlight when a copy of a global annotation without a note is clicked', () => {
+    const plain = { ...global, note: '' };
+    expect(resolveAnnotationClick('epubcfi(/6/4!/4)#g2-0', [plain])).toEqual({
+      annotation: plain,
+      cfi: 'epubcfi(/6/4!/4)',
+      isNote: false,
+      isCopy: true,
+    });
+  });
+
+  it('keeps the highlight and the bubble apart at the home anchor', () => {
+    expect(resolveAnnotationClick('epubcfi(/6/4!/4)', [global])?.isNote).toBe(false);
+    expect(resolveAnnotationClick(`${NOTE_PREFIX}epubcfi(/6/4!/4)`, [global])?.isNote).toBe(true);
   });
 });
 
@@ -79,6 +187,27 @@ describe('mergeRestyledAnnotation', () => {
     expect(merged.global).toBe(true);
     expect(merged.createdAt).toBe(100);
     expect(merged.updatedAt).toBe(200);
+  });
+
+  // A restyle keeps the cfi, so the sync anchors already on the record stay
+  // valid; dropping them made the next push treat the note as never synced.
+  it('keeps fields of the existing record that the restyle does not set', () => {
+    const existing = makeNote({
+      id: 'a',
+      xpointer0: '/body/DocFragment[3]/body/p[2]/text().0',
+      xpointer1: '/body/DocFragment[3]/body/p[2]/text().4',
+      bookHash: 'hash',
+      metaHash: 'meta',
+    });
+    const restyled = makeNote({ id: 'tmp', style: 'underline' });
+    const merged = mergeRestyledAnnotation(existing, restyled);
+    expect(merged).toMatchObject({
+      xpointer0: existing.xpointer0,
+      xpointer1: existing.xpointer1,
+      bookHash: 'hash',
+      metaHash: 'meta',
+      style: 'underline',
+    });
   });
 });
 
@@ -181,5 +310,101 @@ describe('filterExportGroups', () => {
     const result = filterExportGroups(groups, { excludedColors: [], excludedStyles: [] });
     expect(result.distinctColors).toEqual(['red', 'blue', '#abcdef']);
     expect(result.distinctStyles).toEqual(['highlight', 'underline', 'squiggly']);
+  });
+});
+
+describe('summarizeAnnotationHub', () => {
+  it('counts live annotations without double-counting noted annotations', () => {
+    const counts = summarizeAnnotationHub([
+      makeNote({ id: 'a' }),
+      makeNote({ id: 'b', note: 'thought' }),
+      makeNote({ id: 'c' }),
+    ]);
+    expect(counts).toEqual({ annotations: 3 });
+  });
+
+  it('ignores tombstoned source material', () => {
+    const counts = summarizeAnnotationHub([
+      makeNote({ id: 'a' }),
+      makeNote({ id: 'b', deletedAt: 2 }),
+      makeNote({ id: 'c', type: 'excerpt' }),
+      makeNote({ id: 'd', type: 'excerpt', deletedAt: 3 }),
+    ]);
+    expect(counts).toEqual({ annotations: 1 });
+  });
+
+  it('keeps the With notes filter as a subset of the annotation total', () => {
+    const notes = [makeNote({ note: '   ' })];
+    expect(summarizeAnnotationHub(notes)).toEqual({ annotations: 1 });
+    expect(filterBooknotes(notes, { kind: 'notes', query: '' }).length).toBe(1);
+  });
+
+  it('returns zeroes for an empty list', () => {
+    expect(summarizeAnnotationHub([])).toEqual({ annotations: 0 });
+  });
+
+  it('excludes the notebook document', () => {
+    expect(
+      summarizeAnnotationHub([makeNote({ id: 'notebook', type: 'notebook', note: '# Notes' })]),
+    ).toEqual({ annotations: 0 });
+  });
+});
+
+/**
+ * B&W e-ink composites highlight overlays with `mix-blend-mode: difference` at
+ * full opacity (useTheme.ts), so the fill is an inversion mask, not a paint
+ * color. Difference is `|backdrop - source|`, which makes black its identity
+ * element: a black mask leaves the page pixel-for-pixel unchanged and the
+ * highlight simply does not exist. Masking with the theme background therefore
+ * erased every highlight in dark mode, and because overlays keep the fill they
+ * were drawn with, switching back to light stayed broken until reload (#5667).
+ *
+ * Underline and squiggly are stroked without a blend mode, so they still take
+ * the theme ink.
+ */
+describe('getAnnotationOverlayColor', () => {
+  const LIGHT_EINK = { isBwEink: true, isDarkMode: false };
+  const DARK_EINK = { isBwEink: true, isDarkMode: true };
+  const PAGE = [255, 255, 255];
+  const INK = [0, 0, 0];
+
+  const toRgb = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  // How the compositor resolves `mix-blend-mode: difference` per channel.
+  const difference = (backdrop: number[], source: number[]) =>
+    backdrop.map((channel, i) => Math.abs(channel - source[i]!));
+
+  it('masks the highlight with one theme-independent color', () => {
+    expect(getAnnotationOverlayColor('highlight', '#fef08a', DARK_EINK)).toBe(
+      getAnnotationOverlayColor('highlight', '#fef08a', LIGHT_EINK),
+    );
+  });
+
+  it('swaps page and ink on a light e-ink page', () => {
+    const mask = toRgb(getAnnotationOverlayColor('highlight', '#fef08a', LIGHT_EINK));
+
+    expect(difference(PAGE, mask)).toEqual(INK);
+    expect(difference(INK, mask)).toEqual(PAGE);
+  });
+
+  it('swaps page and ink on a dark e-ink page', () => {
+    const mask = toRgb(getAnnotationOverlayColor('highlight', '#fef08a', DARK_EINK));
+
+    // The dark page paints ink where light paints page, so the same mask has
+    // to invert both. A mask of `#000000` returned the backdrop untouched.
+    expect(difference(INK, mask)).toEqual(PAGE);
+    expect(difference(PAGE, mask)).toEqual(INK);
+  });
+
+  it('strokes the unblended styles in the theme ink', () => {
+    expect(getAnnotationOverlayColor('underline', '#fef08a', LIGHT_EINK)).toBe('#000000');
+    expect(getAnnotationOverlayColor('squiggly', '#fef08a', DARK_EINK)).toBe('#ffffff');
+  });
+
+  it('passes the annotation color through off B&W e-ink', () => {
+    for (const style of ['highlight', 'underline', 'squiggly'] as const) {
+      expect(
+        getAnnotationOverlayColor(style, '#fef08a', { isBwEink: false, isDarkMode: true }),
+      ).toBe('#fef08a');
+    }
   });
 });

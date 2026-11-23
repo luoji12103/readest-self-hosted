@@ -261,9 +261,10 @@ export function expandGlobalAnnotation(
       continue;
     }
 
+    // Each copy is drawn as a dashed underline with no note bubble; a click on
+    // it opens the note (#6186), see `resolveAnnotationClick`.
     const value = makeSyntheticValue(note, index, occ);
     occ += 1;
-
     try {
       // Drive the same draw pipeline foliate uses internally, but
       // without going through `resolveNavigation(value)` (which would
@@ -334,8 +335,7 @@ function rangeNodePathHash(node: Node): string {
 
 /**
  * Remove every synthetic overlay this note may have laid down across
- * currently-rendered sections. We hit the overlayer directly (same
- * reason as `expandGlobalAnnotation` — a synthetic `value` cannot
+ * currently-rendered sections. We hit the overlayer directly (same reason as `expandGlobalAnnotation` — a synthetic `value` cannot
  * survive `resolveNavigation`). `overlayer.remove()` is a no-op for
  * unknown keys, so over-iterating up to `maxOccurrencesPerSection` is
  * cheap and avoids us having to track the exact occurrence count.

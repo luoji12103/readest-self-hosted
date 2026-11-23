@@ -5,6 +5,8 @@ import {
   mergeBookMetadata,
   isRemoteBookMetadataNewer,
   shouldApplyRemoteBookMetadata,
+  isRemoteBookMissingLocally,
+  resolvePublishedBook,
 } from '@/services/sync/file/merge';
 import type { Book, BookConfig, BookNote } from '@/types/book';
 import type { RemoteBookConfig } from '@/services/sync/file/wire';
@@ -57,6 +59,26 @@ describe('mergeNotes (element-set CRDT)', () => {
     expect(out.find((n) => n.id === 'a')!.deletedAt).toBe(9);
   });
 
+  // Latest change wins, the rule native sync's useNotesSync applies (#6762).
+  test('a live note changed after the remote deletion survives it', () => {
+    const remote = note('a', 5, 10);
+    const { deletedAt: _omit, ...live } = note('a', 20);
+    const out = mergeNotes([live], [remote]).find((n) => n.id === 'a')!;
+    expect(out.deletedAt).toBeFalsy();
+    expect(out.updatedAt).toBe(20);
+  });
+
+  test('a remote note changed after the local deletion brings it back', () => {
+    const { deletedAt: _omit, ...live } = note('a', 20);
+    const out = mergeNotes([note('a', 5, 10)], [live]).find((n) => n.id === 'a')!;
+    expect(out.deletedAt).toBeFalsy();
+  });
+
+  test('a deletion made after the other side changed the note sticks', () => {
+    expect(mergeNotes([note('a', 5, 30)], [note('a', 20)])[0]!.deletedAt).toBe(30);
+    expect(mergeNotes([note('a', 20)], [note('a', 5, 30)])[0]!.deletedAt).toBe(30);
+  });
+
   test('idempotent on identical input (id set + field values stable)', () => {
     const a = [note('a', 1), note('b', 2)];
     const once = mergeNotes(a, a);
@@ -73,6 +95,17 @@ describe('mergeNotes (element-set CRDT)', () => {
     // Whichever order, the strictly-newer side (updatedAt 9) supplies `note`.
     expect(lr.note).toBe('remote');
     expect(rl.note).toBe('remote');
+  });
+
+  test('merges the singleton Notebook by stable id without changing its type', () => {
+    const local = { ...note('notebook', 5), type: 'notebook' as const, note: 'local' };
+    const remote = { ...local, note: 'remote', updatedAt: 9 };
+
+    const out = mergeNotes([local], [remote]);
+
+    expect(out).toEqual([
+      expect.objectContaining({ id: 'notebook', type: 'notebook', note: 'remote' }),
+    ]);
   });
 });
 
@@ -107,6 +140,97 @@ describe('mergeBookConfig (LWW scalars + CRDT notes)', () => {
     });
     const { config } = mergeBookConfig(local, r);
     expect(config.location).toBe('keepme');
+  });
+});
+
+describe('mergeBookConfig read-aloud packs', () => {
+  test('unions both sides even when the remote config is older', () => {
+    // Recording audio never bumps updatedAt (it must not move progress), so
+    // the side that wins the scalar race may lack the other side's packs.
+    const local = {
+      updatedAt: 200,
+      booknotes: [],
+      ttsPacks: { webdav: ['1-a.mp3'] },
+    } as BookConfig;
+    const r = envelope({ config: { updatedAt: 100 }, ttsPacks: { webdav: ['2-b.mp3'], s3: [] } });
+    expect(mergeBookConfig(local, r).config.ttsPacks).toEqual({
+      webdav: ['1-a.mp3', '2-b.mp3'],
+      s3: [],
+    });
+  });
+
+  test('a newer remote without packs keeps the local ones', () => {
+    const local = {
+      updatedAt: 100,
+      booknotes: [],
+      ttsPacks: { webdav: ['1-a.mp3'] },
+    } as BookConfig;
+    const r = envelope({ config: { updatedAt: 200 } });
+    expect(mergeBookConfig(local, r).config.ttsPacks).toEqual({ webdav: ['1-a.mp3'] });
+  });
+});
+
+// Issue #5716: the count is the only viewSettings key that crosses devices.
+describe('mergeBookConfig reference page count (issue #5716)', () => {
+  test('adopts a peer count into viewSettings when this device has none', () => {
+    const local = {
+      updatedAt: 200,
+      booknotes: [],
+      viewSettings: { defaultFontSize: 14 },
+    } as unknown as BookConfig;
+    // Local is the NEWER config here: a device that read the book after the
+    // peer typed the count still has to receive it.
+    const r = envelope({ config: { updatedAt: 100 }, referencePageCount: 350 });
+    const { config } = mergeBookConfig(local, r);
+    expect(config.viewSettings!.referencePageCount).toBe(350);
+    // The rest of the local view settings survive untouched.
+    expect(config.viewSettings!.defaultFontSize).toBe(14);
+  });
+
+  test('a peer without a count never clears the local one', () => {
+    const local = {
+      updatedAt: 50,
+      booknotes: [],
+      viewSettings: { referencePageCount: 350 },
+    } as unknown as BookConfig;
+    const r = envelope({ config: { updatedAt: 100 } });
+    const { config } = mergeBookConfig(local, r);
+    expect(config.viewSettings!.referencePageCount).toBe(350);
+  });
+
+  test('the newer config wins when both sides carry a count', () => {
+    const local = {
+      updatedAt: 50,
+      booknotes: [],
+      viewSettings: { referencePageCount: 350 },
+    } as unknown as BookConfig;
+    const r = envelope({ config: { updatedAt: 100 }, referencePageCount: 400 });
+    expect(mergeBookConfig(local, r).config.viewSettings!.referencePageCount).toBe(400);
+
+    const localNewer = { ...local, updatedAt: 500 } as unknown as BookConfig;
+    expect(mergeBookConfig(localNewer, r).config.viewSettings!.referencePageCount).toBe(350);
+  });
+
+  test('an equal config timestamp keeps the local count, as the cloud path does', () => {
+    // Both backends hand resolveReferencePageCount the SAME predicate so they
+    // cannot pick different winners for the same pair of configs. The scalar
+    // spread above still resolves ties toward the remote; only the count is
+    // conservative, matching useProgressSync. A tie is the ordinary steady
+    // state here, because a remote-wins merge copies remote.updatedAt onto the
+    // local config, so every later pull of an unchanged remote ties.
+    const local = {
+      updatedAt: 100,
+      booknotes: [],
+      viewSettings: { referencePageCount: 350 },
+    } as unknown as BookConfig;
+    const r = envelope({ config: { updatedAt: 100 }, referencePageCount: 400 });
+    expect(mergeBookConfig(local, r).config.viewSettings!.referencePageCount).toBe(350);
+  });
+
+  test('leaves viewSettings absent when neither side has a count', () => {
+    const local: BookConfig = { updatedAt: 50, booknotes: [] };
+    const { config } = mergeBookConfig(local, envelope({ config: { updatedAt: 100 } }));
+    expect(config.viewSettings).toBeUndefined();
   });
 });
 
@@ -172,7 +296,27 @@ describe('mergeBookMetadata (LWW field subset)', () => {
     expect(m.groupName).toBe('Sci-Fi');
   });
 
-  test('propagates group removal when remote cleared membership (#4942)', () => {
+  test('propagates a STAMPED group removal (#4942, now on the group clock)', () => {
+    const local = {
+      hash: 'h',
+      title: 'T',
+      author: 'A',
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      updatedAt: 1,
+      groupUpdatedAt: 1,
+    } as Book;
+    const remote = { hash: 'h', title: 'T', author: 'A', updatedAt: 9, groupUpdatedAt: 9 } as Book;
+    const m = mergeBookMetadata(local, remote);
+    expect(m.groupId).toBeUndefined();
+    expect(m.groupName).toBeUndefined();
+  });
+
+  test('an UNSTAMPED ungrouped remote row never clears the group (#5911)', () => {
+    // The data loss: `updatedAt` is bumped by an upload as well as by an edit,
+    // so a peer that never learned about the group could win the row and erase
+    // it for the whole fleet. With both sides unstamped (every legacy row) the
+    // group is preserved instead.
     const local = {
       hash: 'h',
       title: 'T',
@@ -181,10 +325,36 @@ describe('mergeBookMetadata (LWW field subset)', () => {
       groupName: 'Sci-Fi',
       updatedAt: 1,
     } as Book;
-    const remote = { hash: 'h', title: 'T', author: 'A', updatedAt: 9 } as Book;
+    const remote = { hash: 'h', title: 'T', author: 'A', updatedAt: 9_000 } as Book;
     const m = mergeBookMetadata(local, remote);
-    expect(m.groupId).toBeUndefined();
-    expect(m.groupName).toBeUndefined();
+    expect(m.groupId).toBe('g1');
+    expect(m.groupName).toBe('Sci-Fi');
+  });
+
+  test('a group edit that lost the row clock still wins (#5911)', () => {
+    const local = {
+      hash: 'h',
+      title: 'T',
+      author: 'A',
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      updatedAt: 1,
+      groupUpdatedAt: 300,
+    } as Book;
+    const remote = { hash: 'h', title: 'T', author: 'A', updatedAt: 9_000 } as Book;
+    expect(mergeBookMetadata(local, remote).groupId).toBe('g1');
+  });
+
+  test('an absent remote metadata blob never clears the local description (#5912)', () => {
+    const local = {
+      hash: 'h',
+      title: 'T',
+      author: 'A',
+      updatedAt: 1,
+      metadata: { title: 'T', author: 'A', description: 'A long blurb' },
+    } as Book;
+    const remote = { hash: 'h', title: 'T', author: 'A', updatedAt: 9_000 } as Book;
+    expect(mergeBookMetadata(local, remote).metadata?.description).toBe('A long blurb');
   });
 
   test('carries remote tags when remote is newer; tag removal propagates', () => {
@@ -340,5 +510,133 @@ describe('isRemoteBookMetadataNewer', () => {
     expect(
       isRemoteBookMetadataNewer({ updatedAt: 1, deletedAt: 1 } as Book, { updatedAt: 9 } as Book),
     ).toBe(false);
+  });
+});
+
+describe('mergeBookMetadata metadataUpdatedAt clock (issue #5438)', () => {
+  test('adopts remote metadata group when its stamp is fresher even though local row is newer', () => {
+    // This device read the book (page turns bump updatedAt) after a peer
+    // edited the metadata. Whole-row LWW keeps the local row, but the edit
+    // must still land.
+    const local = {
+      hash: 'h',
+      title: 'Stale',
+      author: 'A',
+      tags: ['old'],
+      metadata: { title: 'Stale', author: 'A', language: '' },
+      updatedAt: 50,
+    } as Book;
+    const remote = {
+      hash: 'h',
+      title: 'Edited',
+      author: 'B',
+      tags: ['news'],
+      metadata: { title: 'Edited', author: 'B', language: 'sv' },
+      primaryLanguage: 'sv',
+      metadataUpdatedAt: 40,
+      updatedAt: 40,
+    } as Book;
+    const m = mergeBookMetadata(local, remote);
+    expect(m.title).toBe('Edited');
+    expect(m.author).toBe('B');
+    expect(m.tags).toEqual(['news']);
+    expect(m.metadata?.language).toBe('sv');
+    expect(m.primaryLanguage).toBe('sv');
+    expect(m.metadataUpdatedAt).toBe(40);
+    expect(m.updatedAt).toBe(50);
+  });
+
+  test('keeps the local metadata group when its stamp is fresher and remote row is newer', () => {
+    // Reverse race: this device edited after the peer's last page turn.
+    const local = {
+      hash: 'h',
+      title: 'Edited here',
+      author: 'B',
+      metadata: { title: 'Edited here', author: 'B', language: 'sv' },
+      primaryLanguage: 'sv',
+      metadataUpdatedAt: 60,
+      updatedAt: 60,
+    } as Book;
+    const remote = {
+      hash: 'h',
+      title: 'Stale',
+      author: 'A',
+      metadata: { title: 'Stale', author: 'A', language: '' },
+      updatedAt: 90,
+    } as Book;
+    const m = mergeBookMetadata(local, remote);
+    expect(m.title).toBe('Edited here');
+    expect(m.metadata?.language).toBe('sv');
+    expect(m.primaryLanguage).toBe('sv');
+    expect(m.metadataUpdatedAt).toBe(60);
+    expect(m.updatedAt).toBe(90);
+  });
+
+  test('unstamped sides keep whole-row semantics (legacy rows)', () => {
+    const local = { hash: 'h', title: 'L', author: 'A', updatedAt: 9 } as Book;
+    const remote = { hash: 'h', title: 'R', author: 'A', updatedAt: 1 } as Book;
+    expect(mergeBookMetadata(local, remote).title).toBe('L');
+  });
+});
+
+describe('original filename reconciliation', () => {
+  const local: Book = {
+    hash: 'pdf-hash',
+    format: 'PDF',
+    title: 'PowerPoint Presentation',
+    sourceTitle: 'Local managed title',
+    author: 'Author',
+    createdAt: 1,
+    updatedAt: 200,
+    metadataUpdatedAt: 100,
+  };
+  const remote: Book = {
+    ...local,
+    title: 'Device Manual',
+    sourceTitle: 'Remote managed title',
+    originalFilename: 'Device Manual.PDF',
+  };
+
+  test.each([
+    ['mergeBookMetadata', mergeBookMetadata],
+    ['resolvePublishedBook', resolvePublishedBook],
+  ] as const)('%s fills missing provenance without changing title, managed path, or clocks', (_name, merge) => {
+    expect(merge(local, remote)).toEqual({ ...local, originalFilename: 'Device Manual.PDF' });
+    expect(local.originalFilename).toBeUndefined();
+  });
+
+  test.each([
+    ['mergeBookMetadata', mergeBookMetadata],
+    ['resolvePublishedBook', resolvePublishedBook],
+  ] as const)('%s preserves an existing filename and does not invent absent provenance', (_name, merge) => {
+    const named = { ...local, originalFilename: 'Original.pdf' };
+    expect(merge(named, remote)).toEqual(named);
+    expect(merge(local, { ...remote, originalFilename: undefined })).toEqual(local);
+  });
+
+  test('Full Sync repairs missing provenance once, without requiring newer clocks', () => {
+    expect(isRemoteBookMissingLocally(local, remote)).toBe(true);
+    const repaired = mergeBookMetadata(local, remote);
+    expect(isRemoteBookMissingLocally(repaired, remote)).toBe(false);
+    expect(shouldApplyRemoteBookMetadata(local, remote)).toBe(false);
+    expect(isRemoteBookMissingLocally(local, { ...remote, originalFilename: undefined })).toBe(
+      false,
+    );
+    expect(isRemoteBookMissingLocally({ ...local, deletedAt: 300 }, remote)).toBe(false);
+    expect(isRemoteBookMissingLocally(local, { ...remote, deletedAt: 300 })).toBe(false);
+  });
+});
+
+describe('shouldApplyRemoteBookMetadata metadataUpdatedAt clause (issue #5438)', () => {
+  test('triggers when only the remote metadata stamp is newer', () => {
+    const local = { hash: 'h', title: 'L', author: 'A', updatedAt: 90 } as Book;
+    const remote = {
+      hash: 'h',
+      title: 'R',
+      author: 'A',
+      updatedAt: 40,
+      metadataUpdatedAt: 40,
+    } as Book;
+    expect(shouldApplyRemoteBookMetadata(local, remote)).toBe(true);
   });
 });

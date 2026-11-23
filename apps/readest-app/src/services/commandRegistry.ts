@@ -187,33 +187,33 @@ const fontPanelItems = [
   },
   {
     id: 'settings.font.defaultFont',
-    labelKey: _('Default Font'),
+    labelKey: _('Font Category'),
     keywords: ['font', 'family', 'serif', 'sans', 'default'],
-    section: 'Font Family',
+    section: 'Preferred Font',
   },
   {
     id: 'settings.font.cjkFont',
     labelKey: _('CJK Font'),
     keywords: ['font', 'cjk', 'chinese', 'japanese', 'korean', 'asian'],
-    section: 'Font Family',
+    section: 'CJK Font',
   },
   {
     id: 'settings.font.serifFont',
     labelKey: _('Serif Font'),
     keywords: ['font', 'serif', 'family', 'typeface'],
-    section: 'Font Face',
+    section: 'Preferred Font',
   },
   {
     id: 'settings.font.sansSerifFont',
     labelKey: _('Sans-Serif Font'),
     keywords: ['font', 'sans', 'serif', 'family', 'typeface'],
-    section: 'Font Face',
+    section: 'Preferred Font',
   },
   {
     id: 'settings.font.monospaceFont',
     labelKey: _('Monospace Font'),
     keywords: ['font', 'monospace', 'mono', 'code', 'fixed', 'width'],
-    section: 'Font Face',
+    section: 'Preferred Font',
   },
 ];
 
@@ -293,8 +293,14 @@ const layoutPanelItems = [
   },
   {
     id: 'settings.layout.pageGap',
-    labelKey: _('Column Gap (%)'),
-    keywords: ['page', 'gap', 'spacing', 'gutter'],
+    labelKey: _('Additional Margin (%)'),
+    keywords: ['page', 'margin', 'additional', 'gap', 'spacing', 'gutter', 'column'],
+    section: 'Page',
+  },
+  {
+    id: 'settings.layout.columnGap',
+    labelKey: _('Column Gap (px)'),
+    keywords: ['column', 'gap', 'gutter', 'spine', 'spread', 'two', 'dual'],
     section: 'Page',
   },
   {
@@ -333,6 +339,28 @@ const layoutPanelItems = [
     keywords: ['progress', 'display', 'page', 'number', 'percentage'],
     section: 'Header & Footer',
   },
+  {
+    id: 'settings.layout.headerFooterFontSize',
+    labelKey: _('Font Size'),
+    keywords: ['font', 'size', 'header', 'footer', 'progress', 'page', 'number', 'text'],
+    section: 'Header & Footer',
+  },
+  {
+    id: 'settings.layout.headerFooterBackground',
+    labelKey: _('Background Color'),
+    keywords: [
+      'background',
+      'color',
+      'transparent',
+      'text',
+      'header',
+      'footer',
+      'progress',
+      'page',
+      'number',
+    ],
+    section: 'Header & Footer',
+  },
 ];
 
 // color panel items
@@ -350,6 +378,12 @@ const colorPanelItems = [
     section: 'Theme',
   },
   {
+    id: 'settings.color.transparentImageBackground',
+    labelKey: _('Transparent Image Background'),
+    keywords: ['image', 'white', 'background', 'transparent', 'diagram'],
+    section: 'Theme',
+  },
+  {
     id: 'settings.color.overrideBookColor',
     labelKey: _('Override Book Color'),
     keywords: ['override', 'book', 'color', 'custom'],
@@ -364,7 +398,7 @@ const colorPanelItems = [
   {
     id: 'settings.color.backgroundTexture',
     labelKey: _('Background Image'),
-    keywords: ['background', 'texture', 'image', 'paper', 'pattern'],
+    keywords: ['background', 'texture', 'image', 'paper', 'pattern', 'library', 'reader'],
     section: 'Theme',
   },
   {
@@ -386,6 +420,18 @@ const colorPanelItems = [
     section: 'TTS',
   },
   {
+    id: 'settings.tts.voices',
+    labelKey: _('Voice Library'),
+    keywords: ['tts', 'voice', 'preview', 'default', 'language', 'gender', 'read aloud'],
+    section: 'TTS',
+  },
+  {
+    id: 'settings.tts.customServices',
+    labelKey: _('Custom TTS Services'),
+    keywords: ['tts', 'custom', 'voice', 'api key', 'openai', 'kokoro', 'speech', 'byok'],
+    section: 'TTS',
+  },
+  {
     id: 'settings.tts.playerStyle',
     labelKey: _('TTS Player Style'),
     keywords: ['tts', 'player', 'mini', 'style', 'cover', 'full', 'minimal'],
@@ -402,6 +448,12 @@ const colorPanelItems = [
     labelKey: _('Code Highlighting'),
     keywords: ['code', 'highlighting', 'syntax', 'programming'],
     section: 'Code',
+  },
+  {
+    id: 'settings.color.dialogueHighlight',
+    labelKey: _('Dialogue Highlighting'),
+    keywords: ['dialogue', 'dialog', 'speech', 'quote', 'highlight', 'theme'],
+    section: 'Theme',
   },
 ];
 
@@ -450,10 +502,37 @@ const controlPanelItems = [
     section: 'Pagination',
   },
   {
+    id: 'settings.control.imageViewerGesture',
+    labelKey: _('Open Images'),
+    keywords: ['image', 'viewer', 'gallery', 'tap', 'click', 'long', 'press', 'hold'],
+    section: 'Pagination',
+  },
+  {
     id: 'settings.control.showPaginationButtons',
     labelKey: _('Show Page Navigation Buttons'),
     keywords: ['show', 'pagination', 'buttons', 'navigation', 'arrows', 'chevron', 'page', 'turn'],
     section: 'Pagination',
+  },
+  {
+    id: 'settings.control.stablePageNumbers',
+    labelKey: _('Stable Page Numbers'),
+    keywords: [
+      'stable',
+      'page',
+      'number',
+      'count',
+      'screen',
+      'calibrate',
+      'measured',
+      'pagination',
+    ],
+    section: 'Pagination',
+  },
+  {
+    id: 'settings.control.disablePullDownToBookmark',
+    labelKey: _('Pull-Down to Bookmark'),
+    keywords: ['pull', 'down', 'bookmark', 'gesture'],
+    section: 'Annotation Tools',
   },
   {
     id: 'settings.control.enableQuickActions',
@@ -492,9 +571,45 @@ const controlPanelItems = [
     section: 'Device',
   },
   {
+    id: 'settings.control.autoFullRefresh',
+    labelKey: _('Auto Full Refresh'),
+    keywords: ['eink', 'e-ink', 'ghosting', 'full', 'refresh', 'interval', 'pages'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.hideBookshelfPageButtons',
+    labelKey: _('Hide Bookshelf Buttons'),
+    keywords: ['eink', 'e-ink', 'library', 'bookshelf', 'previous', 'next', 'page', 'buttons'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.alwaysShowStatusBar',
+    labelKey: _('Always Show Status Bar'),
+    keywords: ['status', 'bar', 'system', 'clock', 'battery', 'fullscreen'],
+    section: 'Device',
+  },
+  {
     id: 'settings.control.screenWakeLock',
     labelKey: _('Keep Screen Awake'),
     keywords: ['screen', 'wake', 'lock', 'awake', 'sleep', 'display'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.autohideCursor',
+    labelKey: _('Auto-hide Cursor'),
+    keywords: ['cursor', 'mouse', 'pointer', 'hide', 'autohide', 'idle'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.reverseWheelPaging',
+    labelKey: _('Reverse Mouse Wheel'),
+    keywords: ['mouse', 'wheel', 'scroll', 'reverse', 'invert', 'direction', 'page'],
+    section: 'Device',
+  },
+  {
+    id: 'settings.control.gamepadEnabled',
+    labelKey: _('Gamepad Support'),
+    keywords: ['gamepad', 'controller', 'joystick', 'steam', 'deck', 'joypad'],
     section: 'Device',
   },
   {
@@ -523,6 +638,18 @@ const languagePanelItems = [
     id: 'settings.language.translationProvider',
     labelKey: _('Translation Service'),
     keywords: ['translation', 'provider', 'google', 'deepl', 'service'],
+    section: 'Translation',
+  },
+  {
+    id: 'settings.language.translationPrompt',
+    labelKey: _('Translation Prompt'),
+    keywords: ['translation', 'prompt', 'ai', 'llm', 'style'],
+    section: 'Translation',
+  },
+  {
+    id: 'settings.language.customTranslators',
+    labelKey: _('Custom Translators'),
+    keywords: ['translation', 'custom', 'api key', 'openai', 'deepseek', 'ollama', 'deepl', 'llm'],
     section: 'Translation',
   },
   {
@@ -657,11 +784,6 @@ const actionItems = [
     keywords: ['screen', 'wake', 'lock', 'awake', 'sleep', 'display'],
   },
   {
-    id: 'action.autoUpload',
-    labelKey: _('Auto Upload Books to Cloud'),
-    keywords: ['auto', 'upload', 'cloud', 'sync', 'backup'],
-  },
-  {
     id: 'action.reload',
     labelKey: _('Reload Page'),
     keywords: ['reload', 'refresh', 'page'],
@@ -690,7 +812,6 @@ export interface CommandRegistryOptions {
   toggleFullscreen: () => void;
   toggleAlwaysOnTop: () => void;
   toggleScreenWakeLock: () => void;
-  toggleAutoUpload: () => void;
   reloadPage: () => void;
   toggleOpenLastBooks: () => void;
   showAbout: () => void;
@@ -817,13 +938,6 @@ export const buildCommandRegistry = (options: CommandRegistryOptions): CommandIt
     createActionItem({
       id: 'action.screenWakeLock',
       action: options.toggleScreenWakeLock,
-    }),
-  );
-
-  items.push(
-    createActionItem({
-      id: 'action.autoUpload',
-      action: options.toggleAutoUpload,
     }),
   );
 

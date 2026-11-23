@@ -32,6 +32,12 @@ export interface OPDSCatalog {
   customHeaders?: Record<string, string>;
   autoDownload?: boolean;
   /**
+   * Accept a self-signed or mismatched TLS certificate from this catalog on
+   * native requests. Unset on catalogs saved before the option existed, which
+   * keep accepting them; see `allowsSelfSignedCert`.
+   */
+  allowSelfSignedCert?: boolean;
+  /**
    * Stable cross-device identifier derived from the URL. Used as the
    * replica_id so two devices that import the same OPDS URL converge to a
    * single row instead of duplicating. Absent on legacy entries imported
@@ -40,6 +46,13 @@ export interface OPDSCatalog {
   contentId?: string;
   /** Wall-clock ms of first import, used for ordering. */
   addedAt?: number;
+  /**
+   * Manual display position, stamped 0..n-1 across the visible list every
+   * time the user drags a card. Absent until the first reorder — those
+   * entries keep the legacy `addedAt`-descending order and sort above the
+   * stamped ones, so a freshly added catalog still appears at the top.
+   */
+  sortOrder?: number;
   /** Soft-delete timestamp; non-null entries are hidden from the UI. */
   deletedAt?: number;
   /** Reincarnation token (re-import after server tombstone). */
@@ -115,12 +128,12 @@ export interface OPDSBaseLink {
   templated?: boolean;
 }
 
-interface OPDSPerson {
+export interface OPDSPerson {
   name?: string;
   links: Array<{ href: string; type?: string }>;
 }
 
-interface OPDSSubject {
+export interface OPDSSubject {
   name?: string;
   code?: string;
   scheme?: string;

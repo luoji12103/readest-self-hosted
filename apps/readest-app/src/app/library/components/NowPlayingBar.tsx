@@ -3,8 +3,11 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { MdClose, MdPauseCircleFilled, MdPlayCircleFilled } from 'react-icons/md';
 import { ttsSessionManager, TTSSession } from '@/services/tts';
+import { asAudiobookController } from '@/services/audiobook/AudiobookController';
+import { resumePlayback } from '@/services/playback/playbackSource';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useBookDataStore } from '@/store/bookDataStore';
+import { useLibraryStore } from '@/store/libraryStore';
 import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
@@ -96,16 +99,26 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
 
   if (!visible) return null;
 
-  const book = getBookData(session.bookKey)?.book;
+  // An audiobook session never runs through the reader's initViewState, so
+  // bookDataStore has no entry for it - fall back to the library record
+  // (harmless for a TTS session, whose bookDataStore entry already exists).
+  // Read the store directly rather than the reactive hook: the library
+  // array gets a fresh reference on every progress-cache tick (~15s while an
+  // audiobook plays), and this component has no reason to re-render off
+  // that - it already re-renders from its own session/playback state.
+  const book =
+    getBookData(session.bookKey)?.book ??
+    useLibraryStore.getState().getBookByHash(session.bookHash);
   const title = book?.title ?? '';
   const coverImageUrl = book?.coverImageUrl;
+  const isAudiobookSession = !!asAudiobookController(session.controller);
 
   const handleToggle = () => {
     const controller = session.controller;
     if (controller.state === 'playing') {
       void controller.pause();
     } else if (controller.state.includes('paused')) {
-      void controller.start();
+      void resumePlayback(controller);
     }
   };
 
@@ -117,7 +130,11 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
   };
 
   const handleOpen = () => {
-    navigateToReader(router, [session.bookHash]);
+    if (isAudiobookSession) {
+      router.push(`/player?id=${session.bookHash}`);
+    } else {
+      navigateToReader(router, [session.bookHash]);
+    }
   };
 
   return (
@@ -142,7 +159,7 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
         className={clsx(
           'not-eink:bg-base-300 eink-bordered flex items-center gap-2 rounded-full shadow-lg',
           'h-14 max-w-[calc(100vw-2rem)] min-w-[60vw] sm:min-w-0 cursor-pointer px-2',
-          'focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-none',
+          'focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-hidden',
         )}
       >
         {coverImageUrl ? (
@@ -159,7 +176,7 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
         )}
         <button
           type='button'
-          className='touch-target shrink-0 p-1 focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-none'
+          className='touch-target shrink-0 p-1 focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-hidden'
           aria-label={isPlaying ? _('Pause') : _('Play')}
           onClick={(e) => {
             e.stopPropagation();
@@ -170,7 +187,7 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
         </button>
         <button
           type='button'
-          className='touch-target shrink-0 p-1 focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-none'
+          className='touch-target shrink-0 p-1 focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-hidden'
           aria-label={_('Stop reading aloud')}
           onClick={(e) => {
             e.stopPropagation();

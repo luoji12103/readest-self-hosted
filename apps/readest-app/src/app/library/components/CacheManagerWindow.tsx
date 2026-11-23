@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   RiDatabase2Line,
   RiCheckboxCircleFill,
@@ -8,17 +8,22 @@ import {
 } from 'react-icons/ri';
 import { documentDir, join } from '@tauri-apps/api/path';
 import { useEnv } from '@/context/EnvContext';
+import { useLibraryStore } from '@/store/libraryStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { formatBytes } from '@/utils/book';
 import {
   clearCacheEntries,
-  getCacheEntries,
   getCacheStats,
+  getClearableEntries,
+  withoutLiveBookEntries,
   CacheClearProgress,
+  CacheEntry,
   CacheSource,
 } from '@/utils/cache';
 import { AppService } from '@/types/system';
 import Dialog from '@/components/Dialog';
+import BoxedList from '@/components/settings/primitives/BoxedList';
+import SettingsSwitchRow from '@/components/settings/primitives/SettingsSwitchRow';
 
 export const setCacheManagerDialogVisible = (visible: boolean) => {
   const dialog = document.getElementById('cache_manager_window');
@@ -33,12 +38,21 @@ export const setCacheManagerDialogVisible = (visible: boolean) => {
 type CacheStatus = 'scanning' | 'idle' | 'confirming' | 'clearing' | 'done' | 'error';
 
 /**
- * Locations Manage Cache clears (mobile only). Both iOS and Android clear the
- * app Cache and Temp bases; iOS additionally clears the `Documents/Inbox`
- * folder, where "Open in Readest" leaves already-imported book copies that
- * otherwise linger forever.
+ * Locations Manage Cache clears. Both iOS and Android clear the app Cache and
+ * Temp bases; iOS additionally clears the `Documents/Inbox` folder, where
+ * "Open in Readest" leaves already-imported book copies that otherwise linger
+ * forever. On desktop neither root is Readest's alone (WebKit's cache on
+ * macOS, the WebView2 profile on Windows, a system-wide Temp), so only the
+ * cache dirs Readest writes and rebuilds are cleared: in-app browser
+ * downloads, kept after import, and page thumbnails.
  */
-const getCacheSources = async (appService: AppService): Promise<CacheSource[]> => {
+export const getCacheSources = async (appService: AppService): Promise<CacheSource[]> => {
+  if (!appService.isMobileApp) {
+    return [
+      { base: 'Cache', dir: 'browser-downloads' },
+      { base: 'Cache', dir: 'page-thumbnails' },
+    ];
+  }
   const sources: CacheSource[] = [
     { base: 'Cache', dir: '' },
     { base: 'Temp', dir: '' },
@@ -59,22 +73,41 @@ export const CacheManagerWindow = () => {
   const { appService } = useEnv();
   const [isOpen, setIsOpen] = useState(false);
   const [status, setStatus] = useState<CacheStatus>('scanning');
+  // The scanned set is what the user confirms, so Clear deletes exactly the
+  // files the dialog described rather than rescanning under their feet.
+  const [entries, setEntries] = useState<CacheEntry[]>([]);
   const [count, setCount] = useState(0);
+  const [orphanCount, setOrphanCount] = useState(0);
   const [size, setSize] = useState(0);
   const [progress, setProgress] = useState<CacheClearProgress>({ current: 0, total: 0 });
   const [errorMessage, setErrorMessage] = useState('');
+  const [includeDeletedBooks, setIncludeDeletedBooks] = useState(false);
+  // Only the latest scan may fill the dialog: an older one could offer files
+  // the current option doesn't cover.
+  const scanIdRef = useRef(0);
 
-  const scanCache = async () => {
+  const scanCache = async (includeDeleted = includeDeletedBooks) => {
     if (!appService) return;
+    const scanId = ++scanIdRef.current;
     setStatus('scanning');
     setErrorMessage('');
     try {
-      const entries = await getCacheEntries(appService, await getCacheSources(appService));
+      const { library, libraryLoaded } = useLibraryStore.getState();
+      const { entries, orphanCount } = await getClearableEntries(
+        appService,
+        await getCacheSources(appService),
+        { books: library, loaded: libraryLoaded },
+        includeDeleted,
+      );
+      if (scanId !== scanIdRef.current) return;
       const stats = getCacheStats(entries);
+      setEntries(entries);
       setCount(stats.count);
+      setOrphanCount(orphanCount);
       setSize(stats.size);
       setStatus('idle');
     } catch (error) {
+      if (scanId !== scanIdRef.current) return;
       console.error('Error scanning cache:', error);
       setErrorMessage(_('Failed to read cache'));
       setStatus('error');
@@ -102,6 +135,11 @@ export const CacheManagerWindow = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appService]);
 
+  const handleToggleDeletedBooks = () => {
+    setIncludeDeletedBooks(!includeDeletedBooks);
+    scanCache(!includeDeletedBooks);
+  };
+
   const handleClearClick = () => {
     if (status === 'idle' && count > 0) {
       setStatus('confirming');
@@ -113,9 +151,18 @@ export const CacheManagerWindow = () => {
     setStatus('clearing');
     setProgress({ current: 0, total: 0 });
     try {
-      const entries = await getCacheEntries(appService, await getCacheSources(appService));
-      await clearCacheEntries(appService, entries, setProgress);
+      const { library } = useLibraryStore.getState();
+      const { failed } = await clearCacheEntries(
+        appService,
+        withoutLiveBookEntries(entries, library),
+        setProgress,
+      );
       await scanCache();
+      if (failed > 0) {
+        setErrorMessage(_('Failed to delete {{count}} file(s)', { count: failed }));
+        setStatus('error');
+        return;
+      }
       setStatus('done');
     } catch (error) {
       console.error('Error clearing cache:', error);
@@ -132,6 +179,8 @@ export const CacheManagerWindow = () => {
     setStatus('scanning');
     setProgress({ current: 0, total: 0 });
     setErrorMessage('');
+    setIncludeDeletedBooks(false);
+    scanIdRef.current++;
   };
 
   const progressPercentage =
@@ -141,7 +190,7 @@ export const CacheManagerWindow = () => {
   const ghostBtn = clsx(
     'eink-bordered flex h-11 items-center justify-center rounded-xl border border-transparent',
     'text-base-content hover:bg-base-200 text-sm font-medium transition-colors',
-    'focus-visible:ring-base-content/15 focus-visible:outline-none focus-visible:ring-2',
+    'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
     'disabled:opacity-40',
   );
 
@@ -171,7 +220,7 @@ export const CacheManagerWindow = () => {
       isOpen={isOpen}
       title={_('Manage Cache')}
       onClose={handleClose}
-      boxClassName='sm:!w-[440px] sm:!max-w-screen-sm sm:h-auto'
+      boxClassName='sm:w-[440px]! sm:max-w-(--breakpoint-sm)! sm:h-auto'
     >
       {isOpen && (
         <div className='cache-manager-content flex flex-col gap-7 px-2 pb-2 pt-3'>
@@ -188,8 +237,28 @@ export const CacheManagerWindow = () => {
                 {status === 'scanning' ? '—' : formatBytes(size)}
               </span>
               <span className='text-base-content/60 line-clamp-2 text-sm'>{heroCaption}</span>
+              {orphanCount > 0 && (status === 'idle' || status === 'confirming') && (
+                <span className='text-base-content/60 text-sm'>
+                  {_('Includes {{count}} orphaned book file(s) not in your library', {
+                    count: orphanCount,
+                  })}
+                </span>
+              )}
             </div>
           </div>
+
+          {status !== 'clearing' && status !== 'done' && (
+            <BoxedList
+              description={_('Also removes the covers, progress, and notes they left behind')}
+            >
+              <SettingsSwitchRow
+                label={_('Clear Deleted Books')}
+                checked={includeDeletedBooks}
+                onChange={handleToggleDeletedBooks}
+                disabled={status !== 'idle'}
+              />
+            </BoxedList>
+          )}
 
           {/* Clearing progress */}
           {status === 'clearing' && (
@@ -223,7 +292,15 @@ export const CacheManagerWindow = () => {
           {status === 'confirming' && (
             <p className='text-base-content/60 flex items-center justify-center gap-1.5 text-center text-[13px] leading-relaxed'>
               <RiErrorWarningFill className='text-warning h-4 w-4 shrink-0' aria-hidden='true' />
-              {_('This will delete all cached files. This cannot be undone.')}
+              {includeDeletedBooks
+                ? _(
+                    'This will delete all cached files and the files left behind by deleted books. This cannot be undone.',
+                  )
+                : orphanCount > 0
+                  ? _(
+                      'This will delete all cached files and orphaned book files not in your library. This cannot be undone.',
+                    )
+                  : _('This will delete all cached files. This cannot be undone.')}
             </p>
           )}
 

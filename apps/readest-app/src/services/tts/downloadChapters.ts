@@ -22,6 +22,8 @@ export interface SectionCacheStatus {
   total: number;
   recorded: number;
   packed: boolean;
+  pinned: boolean;
+  active: boolean;
 }
 
 const flatten = (
@@ -35,13 +37,13 @@ const flatten = (
   }
 };
 
-export const deriveDownloadChapters = (
+export const deriveDownloadChapters = async (
   toc: TOCItem[],
-  resolveSection: (href: string) => number | null,
+  resolveSection: (href: string) => number | null | Promise<number | null>,
   sectionCount: number,
   // User-facing label for TOC-less sections; the component injects i18n.
   sectionLabel: (oneBasedIndex: number) => string = (n) => `Section ${n}`,
-): DownloadChapter[] => {
+): Promise<DownloadChapter[]> => {
   const flat: { label: string; href: string; depth: number }[] = [];
   flatten(toc ?? [], 0, flat);
 
@@ -50,7 +52,7 @@ export const deriveDownloadChapters = (
   const seen = new Set<number>();
   const anchors: { key: string; label: string; depth: number; startSection: number }[] = [];
   for (const entry of flat) {
-    const section = resolveSection(entry.href);
+    const section = await resolveSection(entry.href);
     if (section === null || section < 0 || section >= sectionCount) continue;
     if (seen.has(section)) continue;
     seen.add(section);
@@ -88,14 +90,14 @@ export const chapterDownloadStatus = (
   chapter: DownloadChapter,
   statuses: Map<number, SectionCacheStatus>,
 ): ChapterDownloadStatus => {
-  let allPacked = true;
+  let allDownloaded = true;
   let anyRecorded = false;
   for (let section = chapter.startSection; section < chapter.endSection; section++) {
     const status = statuses.get(section);
-    if (!status?.packed) allPacked = false;
+    if (!status?.packed || !status.pinned) allDownloaded = false;
     if (status && (status.packed || status.recorded > 0)) anyRecorded = true;
   }
-  if (allPacked) return 'complete';
+  if (allDownloaded) return 'complete';
   return anyRecorded ? 'partial' : 'none';
 };
 

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { getReferencePageInfo } from '@/utils/progress';
+import { getReferencePageInfo, resolveReferencePageCount } from '@/utils/progress';
 
 const makePageList = (labels: string[]) => labels.map((label) => ({ label, href: '#' }));
+const makeIndexedPageList = (labels: string[]) =>
+  labels.map((label, index) => ({ label, href: String(index), index }));
 
 describe('getReferencePageInfo', () => {
   describe('with a page list from the book (issue #672)', () => {
@@ -87,6 +89,34 @@ describe('getReferencePageInfo', () => {
       });
       expect(info).toEqual({ current: '2', total: 3 });
     });
+
+    it('uses the physical count for a complete indexed PDF page list (#5951)', () => {
+      const pageList = makeIndexedPageList([
+        'i',
+        'ii',
+        'iii',
+        'iv',
+        '1',
+        '2',
+        '3',
+        '4',
+        '٤',
+        '٥',
+        '٦',
+        '٧',
+        ' Long Label - 11',
+        ' Long Label - 12',
+        ' Long Label - 13',
+        ' Long Label - 14',
+      ]);
+      const info = getReferencePageInfo({
+        pageList,
+        pageItem: pageList[15],
+        fraction: 1,
+        referencePageCount: 0,
+      });
+      expect(info).toEqual({ current: 'Long Label - 14', total: 16 });
+    });
   });
 
   describe('with a user-entered page count (issue #4542)', () => {
@@ -130,5 +160,38 @@ describe('getReferencePageInfo', () => {
         referencePageCount: 0,
       }),
     ).toBeNull();
+  });
+});
+
+// Issue #5716: the count describes the book's print edition, so it has to
+// cross devices even though the rest of viewSettings is device-local. Both
+// sync backends share this policy so they can never drift apart.
+describe('resolveReferencePageCount (cross-device merge policy)', () => {
+  it('adopts a peer count when this device has none', () => {
+    expect(resolveReferencePageCount(0, 350, false)).toBe(350);
+    expect(resolveReferencePageCount(undefined, 350, false)).toBe(350);
+  });
+
+  it('keeps the local count when the peer has none', () => {
+    expect(resolveReferencePageCount(350, 0, true)).toBe(350);
+    expect(resolveReferencePageCount(350, undefined, true)).toBe(350);
+  });
+
+  it('lets the newer config win when both sides have a count', () => {
+    expect(resolveReferencePageCount(350, 400, true)).toBe(400);
+    expect(resolveReferencePageCount(350, 400, false)).toBe(350);
+  });
+
+  it('never clears a local count from an absent remote one', () => {
+    // A peer running a build that predates this merge pushes a config with no
+    // count at all. That is indistinguishable on the wire from "the user
+    // cleared it", and wiping a number the user typed is the worse failure.
+    expect(resolveReferencePageCount(350, undefined, true)).toBe(350);
+    expect(resolveReferencePageCount(350, 0, true)).toBe(350);
+  });
+
+  it('resolves to 0 (unset) when neither side has one', () => {
+    expect(resolveReferencePageCount(0, 0, true)).toBe(0);
+    expect(resolveReferencePageCount(undefined, undefined, false)).toBe(0);
   });
 });
