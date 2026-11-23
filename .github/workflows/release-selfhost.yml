@@ -13,7 +13,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-selfhost-${{ github.repository }}-${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
@@ -35,7 +35,11 @@ jobs:
           INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
-          release_tag="${{ env.RELEASE_TAG }}"
+          release_tag="${RELEASE_TAG:-}"
+          if ! [[ "$release_tag" =~ ^selfhost-v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid selfhost release tag"
+            exit 1
+          fi
           version="${INPUT_RELEASE_VERSION:-}"
           if [ -z "$version" ]; then
             version="${release_tag#selfhost-v}"
@@ -58,6 +62,8 @@ jobs:
     secrets: inherit
 
   publish:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -104,7 +110,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release_tag="${{ env.RELEASE_TAG }}"
+          release_tag="${RELEASE_TAG:-}"
+          if ! [[ "$release_tag" =~ ^selfhost-v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid selfhost release tag"
+            exit 1
+          fi
           git fetch --force --tags origin
           if git rev-parse -q --verify "refs/tags/${release_tag}^{commit}" >/dev/null; then
             tag_commit=$(git rev-parse "refs/tags/${release_tag}^{commit}")
