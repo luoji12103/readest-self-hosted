@@ -31,6 +31,11 @@ def read_text(path: str) -> str:
         return ""
 
 
+def workflow_events(workflow: str) -> set[str]:
+    block = re.search(r"(?ms)^on:[ \t]*\n(.*?)(?=^\S|\Z)", workflow)
+    return set(re.findall(r"(?m)^  ([a-z_]+):", block.group(1))) if block else set()
+
+
 allowed_env_files = {
     "apps/readest-app/.env",
     "apps/readest-app/.env.tauri",
@@ -71,8 +76,10 @@ selfhost_paths = [
     ".github/workflows/build-selfhost.yml",
     ".github/workflows/build-selfhost-android-arm64.yml",
     ".github/workflows/release-selfhost.yml",
+    ".github/workflows/backfill-selfhost-releases.yml",
     ".github/workflows/sync-upstream.yml",
     ".github/workflows/selfhost-safety.yml",
+    "scripts/prepare-upstream-candidate.sh",
 ]
 selfhost_paths = [path for path in selfhost_paths if (ROOT / path).exists()]
 
@@ -121,30 +128,49 @@ if tauri_config_path.exists():
             fail(f"Tauri updater endpoint points to official Readest: {endpoint}")
 
 sync_workflow = read_text(".github/workflows/sync-upstream.yml")
-required_sync_markers = (
-    "refs/tags/upstream/v*",
-    "scripts/select-latest-stable-tag.sh",
-    "git merge-base --is-ancestor",
-    "git rebase --onto",
-    "--atomic",
-    "--force-with-lease=refs/heads/main:",
-    "--force-with-lease=refs/heads/selfhost-main:",
-    "HEAD:refs/tags/selfhost-$latest_tag",
-    "actions: write",
-    "gh workflow run release-selfhost.yml",
-    'git merge-base --is-ancestor "$existing_tag_commit" HEAD',
-    "luarocks --lua-version=5.1 install busted",
-    "pnpm --filter @readest/readest-app test:lua",
+sync_helper = read_text("scripts/prepare-upstream-candidate.sh")
+if workflow_events(sync_workflow) != {"workflow_dispatch", "schedule"}:
+    fail("stable sync must only run on its schedule or by manual dispatch")
+sync_permissions = re.search(r"(?ms)^permissions:[ \t]*\n(.*?)(?=^\S|\Z)", sync_workflow)
+if (
+    not sync_permissions
+    or sync_permissions.group(1).strip() != "contents: read"
+    or len(re.findall(r"(?m)^\s*permissions\s*:", sync_workflow)) != 1
+):
+    fail("stable sync must use only contents: read, with no job permission overrides")
+if not re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", sync_workflow):
+    fail("stable sync must not persist checkout credentials")
+
+sync_forbidden_patterns = (
+    (r"\bgit\s+(?:[^\n;|&]*?\s+)?(?:push|tag|rebase)\b|--force-with-lease", "Git push, tag, or rebase command"),
+    (r"\bgh\s+|/dispatches\b", "GitHub CLI or workflow dispatch call"),
+    (r"\b(?:GH_TOKEN|GITHUB_TOKEN)\b|github\.token\b|\bsecrets\.", "explicit token or secret"),
+    (r"\bselfhost-main\b|\brefs/tags/selfhost-", "retired branch or release ref"),
 )
-for marker in required_sync_markers:
-    if marker not in sync_workflow:
-        fail(f"stable sync workflow is missing required policy marker: {marker}")
-if "git rebase upstream/main" in sync_workflow:
-    fail("stable sync workflow still rebases directly onto upstream/main")
+for path, text in (("sync-upstream.yml", sync_workflow), ("prepare-upstream-candidate.sh", sync_helper)):
+    for pattern, description in sync_forbidden_patterns:
+        if re.search(pattern, text):
+            fail(f"{path} must not contain a {description}")
+
+sync_actions = re.findall(r"(?m)^\s*(?:-\s*)?uses:\s*(\S+)", sync_workflow)
+allowed_sync_actions = {
+    "actions/checkout",
+    "actions/setup-node",
+    "actions-rust-lang/setup-rust-toolchain",
+    "pnpm/action-setup",
+}
+for action in sync_actions:
+    name, sep, revision = action.partition("@")
+    if name not in allowed_sync_actions or not sep or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        fail(f"stable sync uses an unexpected or unpinned action: {action}")
 
 build_workflow = read_text(".github/workflows/build-selfhost.yml")
-if re.search(r"(?m)^  push:\s*$", build_workflow):
+if "push" in workflow_events(build_workflow):
     fail("build-selfhost must not run independently for selfhost tag pushes")
+
+selfhost_release = read_text(".github/workflows/release-selfhost.yml")
+if workflow_events(selfhost_release) != {"workflow_dispatch"}:
+    fail("release-selfhost must only run by manual dispatch")
 
 official_release = read_text(".github/workflows/release.yml")
 get_release_block = official_release.split("  update-release:", 1)[0]
@@ -168,6 +194,18 @@ upload_r2_match = re.search(
 if not upload_r2_match or "if: github.repository == 'readest/readest'" not in upload_r2_match.group(1):
     fail("official R2 release upload job is not guarded in the fork")
 
+for path in ("nix-build.yml", "nix-deps-check.yml", "nix-update-inputs.yml"):
+    workflow = read_text(f".github/workflows/{path}")
+    job_blocks = re.findall(
+        r"(?ms)^  ([a-zA-Z0-9_-]+):\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow.partition("\njobs:\n")[2],
+    )
+    if not job_blocks:
+        fail(f"official Nix workflow is missing or contains no jobs: {path}")
+    for job_name, job in job_blocks:
+        if not re.search(r"(?m)^    if: github\.repository == 'readest/readest'[ \t]*$", job):
+            fail(f"official Nix job is not guarded in the fork: {path}:{job_name}")
+
 url_scan_paths = [
     "apps/readest-app/src/services/customServerConfig.ts",
     "apps/readest-app/src/components/settings/ServerSettingsPanel.tsx",
@@ -178,8 +216,10 @@ url_scan_paths = [
     ".github/workflows/build-selfhost.yml",
     ".github/workflows/build-selfhost-android-arm64.yml",
     ".github/workflows/release-selfhost.yml",
+    ".github/workflows/backfill-selfhost-releases.yml",
     ".github/workflows/sync-upstream.yml",
     ".github/workflows/selfhost-safety.yml",
+    "scripts/prepare-upstream-candidate.sh",
 ]
 url_re = re.compile(r"https?://[^\s\"'<>)]*")
 
@@ -229,8 +269,10 @@ dangerous_scan_paths = [
     ".github/workflows/build-selfhost.yml",
     ".github/workflows/build-selfhost-android-arm64.yml",
     ".github/workflows/release-selfhost.yml",
+    ".github/workflows/backfill-selfhost-releases.yml",
     ".github/workflows/sync-upstream.yml",
     ".github/workflows/selfhost-safety.yml",
+    "scripts/prepare-upstream-candidate.sh",
 ]
 allowed_dangerous_field_mentions = {"scripts/scan-public-fork-safety.sh"}
 
