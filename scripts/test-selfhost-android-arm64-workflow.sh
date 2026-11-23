@@ -26,11 +26,12 @@ for marker in \
   'release_version:' \
   'contents: read' \
   'aarch64-linux-android' \
-  'create("selfhostRelease")' \
-  'signingConfigs.getByName("selfhostRelease")' \
-  'missingDimensionStrategy("store", "foss")' \
+  'pnpm patch-tauri-selfhost' \
+  'pnpm tauri android init' \
+  'python3 ../../scripts/configure-selfhost-android-gradle.py src-tauri/gen/android/app/build.gradle.kts' \
   'pnpm tauri android build -t aarch64 --apk' \
   'arm64-v8a' \
+  'SELFHOST_PRODUCT_NAME: My Readest' \
   'SELFHOST_APP_IDENTIFIER: com.readest.selfhost' \
   'SELFHOST_ANDROID_VERSION: 0.11.21-selfhost.1' \
   'SELFHOST_ANDROID_VERSION_CODE: 11021' \
@@ -72,9 +73,49 @@ do
 done
 
 python3 - <<'PY'
+import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 text = Path('.github/workflows/build-selfhost-android-arm64.yml').read_text()
+release = Path('.github/workflows/build-selfhost.yml').read_text().split('\n  build-android:\n', 1)[1]
+if 'python3 ../../scripts/configure-selfhost-android-gradle.py src-tauri/gen/android/app/build.gradle.kts' not in release:
+    raise SystemExit('Android release job does not use the shared Gradle setup')
+
+with TemporaryDirectory() as temp:
+    generated = Path(temp) / 'build.gradle.kts'
+    generated.write_text('''android {
+    namespace = "com.readest.selfhost"
+    defaultConfig {
+        applicationId = "com.readest.selfhost"
+    }
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = true
+        }
+    }
+}
+''')
+    subprocess.run(['python3', 'scripts/configure-selfhost-android-gradle.py', str(generated)], check=True)
+    gradle = generated.read_text()
+
+for required in (
+    'namespace = "com.readest.selfhost"',
+    'applicationId = "com.readest.selfhost"',
+    'val storeFlavor = project.findProperty("storeFlavor")?.toString() ?: "foss"',
+    'missingDimensionStrategy("store", storeFlavor)',
+    'val penFlavor = project.findProperty("penFlavor")?.toString() ?: "genericPen"',
+    'missingDimensionStrategy("pen", penFlavor)',
+    'create("selfhostRelease")',
+    'signingConfig = signingConfigs.getByName("selfhostRelease")',
+    'System.getenv("ANDROID_KEY_ALIAS")',
+    'System.getenv("ANDROID_KEY_PASSWORD")',
+    'storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH") ?: error("ANDROID_KEYSTORE_PATH is required"))',
+    'System.getenv("ANDROID_KEYSTORE_PASSWORD")',
+):
+    if required not in gradle:
+        raise SystemExit(f'Android Gradle setup does not preserve {required}')
+
 job_start = text.index('  build-android-arm64:')
 steps_start = text.index('    steps:', job_start)
 if '${{ secrets.' in text[job_start:steps_start]:
