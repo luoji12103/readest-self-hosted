@@ -47,6 +47,7 @@ vi.mock('@/context/AuthContext', () => ({
 }));
 
 vi.mock('@/utils/supabase', () => ({
+  resetSupabaseClientCache: vi.fn(),
   supabase: {
     auth: {
       onAuthStateChange: () => ({ data: { subscription: { unsubscribe: vi.fn() } } }),
