@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { detectLanguage } from '@/utils/lang';
+import { detectLanguage, getPDFSpeechLang } from '@/utils/lang';
 
 describe('detectLanguage - Result Tests', () => {
   describe('English text detection', () => {
@@ -185,6 +185,16 @@ describe('detectLanguage - Result Tests', () => {
         expect(result).toBe('en');
       });
     });
+
+    // franc returns "und" for short CJK headers such as a TXT title line.
+    // Falling back to "en" there means the Chinese chapter regexps never run.
+    // See issue #6172.
+    it('should fall back to script detection when franc cannot classify CJK text', () => {
+      expect(detectLanguage('万国之国')).toBe('zh');
+      expect(detectLanguage('三体')).toBe('zh');
+      expect(detectLanguage('こんにちは')).toBe('ja');
+      expect(detectLanguage('한글 제목')).toBe('ko');
+    });
   });
 
   describe('mixed content', () => {
@@ -269,5 +279,33 @@ describe('detectLanguage - Real World Samples', () => {
       const result = detectLanguage(text);
       expect(result).toBe(expected);
     });
+  });
+});
+
+describe('getPDFSpeechLang', () => {
+  const turkishPage =
+    'Bu kitap bir zamanlar çok uzak bir ülkede yaşayan küçük bir prensin hikayesini anlatıyor. ' +
+    'Prens her sabah gül bahçesine gider ve çiçeklerle konuşurdu.';
+  const englishPage =
+    'Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say that they were ' +
+    'perfectly normal, thank you very much.';
+
+  it('reads the language of the page when the PDF declares none', () => {
+    expect(getPDFSpeechLang('en', turkishPage)).toBe('tr');
+    expect(getPDFSpeechLang(undefined, turkishPage)).toBe('tr');
+    expect(getPDFSpeechLang('en-US', turkishPage)).toBe('tr');
+  });
+
+  it('keeps English for an English page', () => {
+    expect(getPDFSpeechLang('en', englishPage)).toBe('en');
+  });
+
+  it('keeps a language the PDF declares', () => {
+    expect(getPDFSpeechLang('de', turkishPage)).toBe('de');
+  });
+
+  it('does not guess from a page with too little text', () => {
+    expect(getPDFSpeechLang('en', 'Hasta la vista, baby. I will be back.')).toBe('en');
+    expect(getPDFSpeechLang(undefined, '')).toBe('en');
   });
 });

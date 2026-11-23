@@ -1,4 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
+import { afterAll, describe, it, expect } from 'vitest';
 // Import the real exported helpers from the .mjs build script (vitest/vite can
 // import ESM .mjs directly), so the test exercises the actual logic.
 import {
@@ -19,6 +23,8 @@ import {
   parseFrequencyWords as parseFrequencyWordsUntyped,
   extractXToEn as extractXToEnUntyped,
   extractEnToX as extractEnToXUntyped,
+  extractXToEnStream as extractXToEnStreamUntyped,
+  extractEnToXStream as extractEnToXStreamUntyped,
   extractWikDict as extractWikDictUntyped,
   inflectionMapFromPack as inflectionMapFromPackUntyped,
   parseLemmatizationList as parseLemmatizationListUntyped,
@@ -87,6 +93,14 @@ const extractEnToX = extractEnToXUntyped as (
   jsonlText: string,
   targetCode: string,
 ) => Map<string, string[]>;
+const extractXToEnStream = extractXToEnStreamUntyped as (
+  path: string,
+  sourceCode: string,
+) => Promise<Map<string, string[]>>;
+const extractEnToXStream = extractEnToXStreamUntyped as (
+  path: string,
+  targetCode: string,
+) => Promise<Map<string, string[]>>;
 const extractWikDict = extractWikDictUntyped as (
   rows: { written_rep: string; trans_list: string }[],
 ) => Map<string, string[]>;
@@ -658,13 +672,127 @@ describe('extractEnToX', () => {
     expect(extractEnToX(enEntry, 'fr').get('dog')).toEqual(['chien']);
   });
 
-  it('appends a roman field in parens when present', () => {
+  it('drops the roman transliteration (the hint is read by a native speaker)', () => {
     const ru = JSON.stringify({
       word: 'dog',
       lang_code: 'en',
       translations: [{ code: 'ru', word: 'собака', roman: 'sobaka' }],
     });
-    expect(extractEnToX(ru, 'ru').get('dog')).toEqual(['собака (sobaka)']);
+    expect(extractEnToX(ru, 'ru').get('dog')).toEqual(['собака']);
+  });
+
+  it('skips translations tagged as a regional variety ("<Variety>-<Language>")', () => {
+    // Wiktionary nests Arabic dialects under the Arabic translation with the
+    // dialect as a tag; the gloss must stay in the standard written language.
+    const ar = JSON.stringify({
+      word: 'cat',
+      lang_code: 'en',
+      translations: [
+        { lang: 'Arabic', code: 'ar', word: 'قِطّ', roman: 'qiṭṭ', tags: ['masculine'] },
+        {
+          lang: 'Arabic',
+          code: 'ar',
+          word: 'بسة',
+          roman: 'bissa',
+          tags: ['Hijazi-Arabic', 'feminine'],
+        },
+        { lang: 'Arabic', code: 'ar', word: 'هِرّ', roman: 'hirr' },
+      ],
+    });
+    expect(extractEnToX(ar, 'ar').get('cat')).toEqual(['قِطّ', 'هِرّ']);
+  });
+
+  it('skips a translation that mixes Latin letters into another script (template artifacts)', () => {
+    // Gender markers, "or", "imperfective:" and inline dialect labels leak into the
+    // word field of some Wiktionary translation templates; a pure-Latin target
+    // (vi, hu) never trips this, only a foreign-script word carrying ASCII letters.
+    const ar = JSON.stringify({
+      word: 'spoke',
+      lang_code: 'en',
+      translations: [
+        { lang: 'Arabic', code: 'ar', word: 'سِلْك m شُعَاع' },
+        { lang: 'Arabic', code: 'ar', word: 'Hijazi Arabic وحش' },
+        { lang: 'Arabic', code: 'ar', word: 'شُعَاع' },
+        { lang: 'Vietnamese', code: 'vi', word: 'học sinh' },
+      ],
+    });
+    expect(extractEnToX(ar, 'ar').get('spoke')).toEqual(['شُعَاع']);
+    expect(extractEnToX(ar, 'vi').get('spoke')).toEqual(['học sinh']);
+  });
+
+  it('drops an all-Latin editorial note once the target is a non-Latin script', () => {
+    // Wiktionary files the odd note where a translation belongs ("not known in
+    // Arabic lands" under honesty's plant sense). It only reads as a gloss in the
+    // wrong script, so it goes once the pack's dominant script is known; a
+    // Latin-script target (vi, hu) is left alone.
+    const lines = [
+      {
+        word: 'honesty',
+        lang_code: 'en',
+        translations: [{ code: 'ar', word: 'not known in Arabic lands' }],
+      },
+      { word: 'cat', lang_code: 'en', translations: [{ code: 'ar', word: 'قِطّ' }] },
+      { word: 'dog', lang_code: 'en', translations: [{ code: 'ar', word: 'كَلْب' }] },
+      { word: 'cat', lang_code: 'en', translations: [{ code: 'vi', word: 'mèo' }] },
+      { word: 'dog', lang_code: 'en', translations: [{ code: 'vi', word: 'chó' }] },
+      {
+        word: 'honesty',
+        lang_code: 'en',
+        translations: [{ code: 'vi', word: 'probably no term' }],
+      },
+    ]
+      .map((o) => JSON.stringify(o))
+      .join('\n');
+    const ar = extractEnToX(lines, 'ar');
+    expect(ar.has('honesty')).toBe(false);
+    expect(ar.get('cat')).toEqual(['قِطّ']);
+    expect(extractEnToX(lines, 'vi').get('honesty')).toEqual(['probably no term']);
+  });
+});
+
+describe('extractEnToXStream / extractXToEnStream', () => {
+  // The kaikki raw dump (raw-wiktextract-data.jsonl.gz) is gzipped and holds EVERY
+  // language section of the English Wiktionary plus redirect lines, so one file
+  // serves both build directions and each build must filter by lang_code.
+  const rawLines = [
+    JSON.stringify({ title: 'Dictionary', redirect: 'dictionary' }),
+    JSON.stringify({
+      word: 'dictionary',
+      lang_code: 'en',
+      translations: [
+        { code: 'vi', word: 'từ điển' },
+        { code: 'hu', word: 'szótár' },
+      ],
+    }),
+    JSON.stringify({
+      word: 'diccionario',
+      lang_code: 'es',
+      senses: [{ glosses: ['dictionary'] }],
+    }),
+    JSON.stringify({
+      word: 'dictionnaire',
+      lang_code: 'fr',
+      senses: [{ glosses: ['dictionary'] }],
+    }),
+  ].join('\n');
+  const dir = mkdtempSync(join(tmpdir(), 'wordlens-raw-'));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('streams a gzipped raw dump, keeping only the requested lang_code', async () => {
+    const gz = join(dir, 'raw-wiktextract-data.jsonl.gz');
+    writeFileSync(gz, gzipSync(rawLines));
+    const enVi = await extractEnToXStream(gz, 'vi');
+    expect(enVi.get('dictionary')).toEqual(['từ điển']);
+    expect(enVi.size).toBe(1);
+    const esEn = await extractXToEnStream(gz, 'es');
+    expect(esEn.get('diccionario')).toEqual(['dictionary']);
+    expect(esEn.has('dictionnaire')).toBe(false);
+  });
+
+  it('still streams a plain .jsonl file', async () => {
+    const plain = join(dir, 'raw.jsonl');
+    writeFileSync(plain, rawLines);
+    expect((await extractEnToXStream(plain, 'hu')).get('dictionary')).toEqual(['szótár']);
   });
 });
 

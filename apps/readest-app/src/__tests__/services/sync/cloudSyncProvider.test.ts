@@ -19,6 +19,7 @@ import {
   isReadestCloudEnabled,
   isReadestCloudStorageActive,
   resolveCloudSyncGate,
+  setCachedCustomizationPurchased,
   setCachedUserPlan,
   settingsKeyForBackend,
 } from '@/services/sync/cloudSyncProvider';
@@ -269,5 +270,49 @@ describe('isReadestCloudStorageActive (follows the flag, not exclusivity)', () =
 describe('cloudProvidersDisplayName', () => {
   test('joins provider names for the "synced via" copy', () => {
     expect(cloudProvidersDisplayName(['readest', 'gdrive'])).toBe('Readest Cloud, Google Drive');
+  });
+});
+
+describe('icloud backend kind', () => {
+  test('getEnabledFileSyncBackends appends icloud last', () => {
+    expect(
+      getEnabledFileSyncBackends(
+        s({ webdav: { enabled: true }, icloud: { enabled: true } } as never),
+      ),
+    ).toEqual(['webdav', 'icloud']);
+  });
+
+  test('settingsKeyForBackend maps icloud to its own slice', () => {
+    expect(settingsKeyForBackend('icloud')).toBe('icloud');
+  });
+
+  test('cloudProviderDisplayName names iCloud', () => {
+    expect(cloudProviderDisplayName('icloud')).toBe('iCloud');
+  });
+
+  test('applySyncBooksAutoEnable flips syncBooks on for an enabled icloud', () => {
+    const settings = s({ icloud: { enabled: true, syncBooks: false } } as never);
+    expect(applySyncBooksAutoEnable(settings)).toBe(true);
+    expect(settings.icloud?.syncBooks).toBe(true);
+  });
+});
+
+// The cache is read synchronously by non-React gates, so a signed-out session
+// must not keep the previous account's entitlement. `useQuotaStats` clears it
+// on logout; this pins the wiring that clear depends on.
+describe('resolveCloudSyncGate — cached customization entitlement', () => {
+  const webdavOn = () => makeSettings({ webdav: { enabled: true } } as Partial<SystemSettings>);
+
+  test('passes the cached unlock through to the gate', () => {
+    setCachedCustomizationPurchased(true);
+    resolveCloudSyncGate(webdavOn(), 'free');
+    expect(isCloudSyncAllowed).toHaveBeenCalledWith('free', true);
+  });
+
+  test('passes false once the cache is cleared on sign-out', () => {
+    setCachedCustomizationPurchased(true);
+    setCachedCustomizationPurchased(false);
+    resolveCloudSyncGate(webdavOn(), 'free');
+    expect(isCloudSyncAllowed).toHaveBeenCalledWith('free', false);
   });
 });

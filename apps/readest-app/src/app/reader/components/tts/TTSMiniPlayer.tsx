@@ -14,17 +14,21 @@ import {
   MdSkipNext,
   MdSkipPrevious,
 } from 'react-icons/md';
+import { RiForward30Line, RiReplay15Line } from 'react-icons/ri';
 import { Insets } from '@/types/misc';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useBookDataStore } from '@/store/bookDataStore';
+import { useThemeStore } from '@/store/themeStore';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useTranslation } from '@/hooks/useTranslation';
-import { formatPlaybackTime } from '@/utils/time';
+import { formatCompactTime, formatPlaybackTime } from '@/utils/time';
+import { isForcedMobileLayout } from '../../utils/mobileLayout';
 import { TTSPlaybackInfo, usePlaybackInfo } from './usePlaybackInfo';
 import { useCountdownLabel } from './useCountdownLabel';
 import { formatRate } from './SpeedRuler';
+import BufferingRing from './BufferingRing';
 import { getTTSMiniPlayerBottomOffset } from '../../utils/ttsMiniPlayerPosition';
 
 // Playback-settings glyph: a hex nut whose top-right edge is left open so
@@ -59,8 +63,16 @@ const SpeedSettingsIcon = ({ size, label }: { size: number; label: string }) => 
 type TTSMiniPlayerProps = {
   bookKey: string;
   isPlaying: boolean;
+  // Playing, but nothing audible yet — the play/pause button wears a ring.
+  buffering: boolean;
   isEink: boolean;
+  visible: boolean;
   hasTimeline: boolean;
+  // A paired audiobook has no sentences to step by: the small step is the
+  // audiobook player's 30s forward / 15s back skip and the large step moves
+  // by audiobook chapter, with the glyphs and labels of an audio player
+  // (#5863).
+  audioTransport: boolean;
   timeoutTimestamp: number;
   chapterRemainingSec: number | null;
   gridInsets: Insets;
@@ -72,19 +84,24 @@ type TTSMiniPlayerProps = {
   onGetPlaybackInfo: () => TTSPlaybackInfo | null;
 };
 
-// Persistent mini-player shown while a TTS session is active: passive
-// progress line with buffer-ahead fill on the card's bottom edge and, per the
-// ttsPlayerStyle setting, one of two card layouts. 'full' (the default) is
-// the 0.11.18 card: book cover, book title, chapter + timestamps line, and a
-// sentence-only transport with a filled play blob. 'minimal' is chrome-free —
-// no cover, no titles, plain glyphs — with only the time info and the same
+// Mini-player shown while a TTS session is active: passive progress line with
+// buffer-ahead fill on the card's bottom edge and, per the ttsPlayerStyle
+// setting, one of two card layouts. 'full' (the default) is the 0.11.18 card:
+// book cover, book title, chapter + timestamps line, and a sentence-only
+// transport with a filled play blob; it rides with the reader chrome and fades
+// out with it (see useMiniPlayerAutoHide). 'minimal' is chrome-free — no cover,
+// no titles, plain glyphs — showing the remaining time alone plus the same
 // paragraph/sentence transport vocabulary as the full player sheet (#5101 —
-// the paragraph skips matter to eyes-off listeners).
+// the paragraph skips matter to eyes-off listeners); it stays up for the whole
+// session, which is why it is the style that reserves a band of book text.
 const TTSMiniPlayer = ({
   bookKey,
   isPlaying,
+  buffering,
   isEink,
+  visible,
   hasTimeline,
+  audioTransport,
   timeoutTimestamp,
   chapterRemainingSec,
   gridInsets,
@@ -97,6 +114,7 @@ const TTSMiniPlayer = ({
 }: TTSMiniPlayerProps) => {
   const _ = useTranslation();
   const { appService } = useEnv();
+  const isIPhoneDuo = useThemeStore((s) => s.isIPhoneDuo);
   const { hoveredBookKey, setHoveredBookKey, getViewSettings, bottomBarTab } = useReaderStore();
   const { getBookData } = useBookDataStore();
   const progress = useBookProgress(bookKey);
@@ -118,32 +136,45 @@ const TTSMiniPlayer = ({
   const viewSettings = getViewSettings(bookKey);
   const barVisible = hoveredBookKey === bookKey;
   const safeAreaMargin = appService?.hasSafeAreaInset ? gridInsets.bottom * 0.33 : 0;
-  const forceMobileLayout =
-    !!appService?.isMobile && window.innerWidth >= 640 && window.innerWidth <= window.innerHeight;
+  const forceMobileLayout = isForcedMobileLayout(appService?.isMobile, isIPhoneDuo);
   const usesMobileBar = forceMobileLayout || window.innerWidth < 640 || window.innerHeight < 640;
 
-  // Distance from the bottom edge (safe-area margin excluded) to the top of
-  // the expanded action panel, so the card rides above it. Measured from the
-  // DOM because panel heights are content-driven and their anchor differs per
-  // platform. The panels' paddings are constant and the slide is
-  // transform-only, so subtracting the in-flight translate yields the settled
-  // top edge even mid-animation.
+  // A book can carry a coverImageUrl that no longer resolves (cover never
+  // extracted, file pruned). Showing the browser's broken-image glyph in the
+  // card is worse than showing no cover at all.
+  const [coverFailed, setCoverFailed] = useState(false);
+
   const [panelTopOffset, setPanelTopOffset] = useState(0);
   useLayoutEffect(() => {
     const cell = document.getElementById(`gridcell-${bookKey}`);
-    const panel =
-      barVisible && bottomBarTab ? cell?.querySelector(`.footerbar-${bottomBarTab}-mobile`) : null;
-    const rect = panel?.getBoundingClientRect();
-    if (!cell || !panel || !rect || rect.height === 0) {
+    const footer = barVisible ? cell?.querySelector<HTMLElement>('.footer-bar') : null;
+    if (!cell || !footer) {
       setPanelTopOffset(0);
       return;
     }
-    const transform = getComputedStyle(panel).transform;
-    const translateY = transform && transform !== 'none' ? new DOMMatrixReadOnly(transform).m42 : 0;
-    const settledTop = rect.top - translateY;
-    setPanelTopOffset(
-      Math.max(0, Math.round(cell.getBoundingClientRect().bottom - settledTop - safeAreaMargin)),
-    );
+    const panel = bottomBarTab
+      ? footer.querySelector<HTMLElement>(`.footerbar-${bottomBarTab}-mobile`)
+      : null;
+    const measure = () => {
+      // offsetTop ignores both the footer's slide and the panel's CSS translate.
+      // A fixed footer uses viewport coordinates; an absolute footer is relative
+      // to its offset parent (the book cell, including when a sidebar is pinned).
+      const parent = footer.offsetParent;
+      const footerTop =
+        footer.offsetTop + (parent ? parent.getBoundingClientRect().top + parent.clientTop : 0);
+      const settledTop = panel?.getBoundingClientRect().height
+        ? footerTop + footer.clientTop + panel.offsetTop
+        : footerTop;
+      setPanelTopOffset(
+        Math.max(0, Math.round(cell.getBoundingClientRect().bottom - settledTop - safeAreaMargin)),
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(cell);
+    observer.observe(footer);
+    if (panel) observer.observe(panel);
+    return () => observer.disconnect();
   }, [barVisible, bottomBarTab, bookKey, safeAreaMargin]);
 
   const bottomOffset = viewSettings
@@ -155,16 +186,29 @@ const TTSMiniPlayer = ({
   const forceHours = total >= 3600;
   const playedPct = ready && total > 0 ? Math.min((position / total) * 100, 100) : 0;
   const bufferedPct = ready ? Math.max(playedPct, Math.min(measuredFraction, 1) * 100) : 0;
-  // The minimal style weights the two halves differently, so keep them split;
-  // the full style joins them into the 0.11.18 "elapsed · -remaining" string.
+  const remainingSec = Math.max(total - position, 0);
+  // The full style keeps the 0.11.18 "elapsed · -remaining" string. The minimal
+  // style shows the remaining time alone, compactly (#5310): elapsed is the
+  // half nobody listens by, and dropping it stops the pair from being chopped
+  // off at anything but the smallest UI font size.
   const elapsedLabel = hasTimeline && ready ? formatPlaybackTime(position, forceHours) : '';
   const remainingLabel =
-    hasTimeline && ready ? `-${formatPlaybackTime(Math.max(total - position, 0), forceHours)}` : '';
-  const timeLabel = elapsedLabel
-    ? `${elapsedLabel} · ${remainingLabel}`
-    : chapterRemainingSec !== null
+    hasTimeline && ready ? `-${formatPlaybackTime(remainingSec, forceHours)}` : '';
+  // Books with no playback timeline fall back to the chapter estimate. The
+  // full style has room to say what the number means; the minimal style spends
+  // its one slot on the number alone, in the same counting-down form as the
+  // timeline case so the two never read as different quantities.
+  const chapterLabel =
+    chapterRemainingSec !== null
       ? _('{{time}} left in chapter', { time: formatPlaybackTime(chapterRemainingSec) })
       : '';
+  const timeLabel = elapsedLabel ? `${elapsedLabel} · ${remainingLabel}` : chapterLabel;
+  const compactLabel =
+    hasTimeline && ready
+      ? `-${formatCompactTime(remainingSec)}`
+      : chapterRemainingSec !== null
+        ? `-${formatCompactTime(chapterRemainingSec)}`
+        : '';
 
   return (
     <div
@@ -172,11 +216,23 @@ const TTSMiniPlayer = ({
       aria-label={`${_('Reading aloud')}: ${book?.title ?? ''}`}
       className={clsx(
         'absolute z-40 inset-x-4 sm:inset-x-0 sm:mx-auto sm:w-full sm:max-w-md',
-        'pointer-events-auto transition-[bottom] duration-300',
+        'transition-[bottom,opacity] duration-300',
+        visible ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0',
       )}
       style={{
         bottom: `${bottomOffset}px`,
         marginBottom: `${safeAreaMargin}px`,
+        // iPhone Duo's status-bar strip reports as a large left/right inset
+        // (#6307); clear it without losing the card's inset-x-4 margin. Width
+        // auto so the card fits between the offsets in a book cell narrower
+        // than max-w-md plus the strip (two books side by side).
+        ...(isIPhoneDuo
+          ? {
+              left: `${16 + gridInsets.left}px`,
+              right: `${16 + gridInsets.right}px`,
+              width: 'auto',
+            }
+          : {}),
       }}
       onMouseEnter={() => !appService?.isMobile && setHoveredBookKey('')}
       onTouchStart={() => !appService?.isMobile && setHoveredBookKey('')}
@@ -214,12 +270,13 @@ const TTSMiniPlayer = ({
               aria-label={_('Open Read Aloud player')}
               className='flex min-w-0 flex-1 cursor-pointer items-center gap-2'
             >
-              {book?.coverImageUrl ? (
+              {book?.coverImageUrl && !coverFailed ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
                   src={book.coverImageUrl}
                   alt=''
                   className='h-10 w-10 shrink-0 rounded-lg object-cover'
+                  onError={() => setCoverFailed(true)}
                 />
               ) : null}
               <div className='flex min-w-0 flex-col'>
@@ -238,15 +295,20 @@ const TTSMiniPlayer = ({
               <button
                 type='button'
                 className='shrink-0 rounded-full p-1'
-                aria-label={_('Previous Sentence')}
+                aria-label={audioTransport ? _('Back 15 Seconds') : _('Previous Sentence')}
                 onClick={() => onBackward(true)}
               >
-                <MdSkipPrevious size={iconSize28} />
+                {audioTransport ? (
+                  <RiReplay15Line size={iconSize26} />
+                ) : (
+                  <MdSkipPrevious size={iconSize28} />
+                )}
               </button>
               <button
                 type='button'
-                className='shrink-0 rounded-full p-0.5'
+                className='relative shrink-0 rounded-full p-0.5'
                 aria-label={isPlaying ? _('Pause') : _('Play')}
+                aria-busy={buffering}
                 onClick={onTogglePlay}
               >
                 {isPlaying ? (
@@ -254,14 +316,22 @@ const TTSMiniPlayer = ({
                 ) : (
                   <MdPlayCircleFilled size={iconSize40} />
                 )}
+                {/* Hugging the filled glyph: the drawn circle only fills about
+                    five sixths of the icon box, so the ring tracks the box
+                    rather than standing off from it. */}
+                {buffering && <BufferingRing size={iconSize40 - 2} isEink={isEink} />}
               </button>
               <button
                 type='button'
                 className='shrink-0 rounded-full p-1'
-                aria-label={_('Next Sentence')}
+                aria-label={audioTransport ? _('Forward 30 Seconds') : _('Next Sentence')}
                 onClick={() => onForward(true)}
               >
-                <MdSkipNext size={iconSize28} />
+                {audioTransport ? (
+                  <RiForward30Line size={iconSize26} />
+                ) : (
+                  <MdSkipNext size={iconSize28} />
+                )}
               </button>
               <button
                 type='button'
@@ -274,21 +344,94 @@ const TTSMiniPlayer = ({
             </div>
           </div>
         ) : (
-          <div className='text-base-content flex h-14 items-center gap-2 pe-1 ps-1.5'>
+          // A symmetric transport (#5636): one between-spread row whose item
+          // widths mirror about the middle -- a fixed box at each end, two skip
+          // glyphs each side -- so the equal gaps land the play glyph on the
+          // card's exact midpoint, where it doubles as a halfway mark against
+          // the progress line on the bottom edge, and the remaining time sits
+          // on the far right where it hangs over the un-played part of that
+          // line. The spreading is also what keeps "<<" and "<" from being
+          // mistaken for each other on a phone (#5310). The row is dir=ltr
+          // because the progress line it annotates fills physically
+          // left-to-right.
+          <div dir='ltr' className='text-base-content flex h-14 items-center justify-between px-3'>
             {/* Visible route into the full player: a settings glyph carrying
-              the live speed as a superscript (the sheet is where speed and
-              voice live). The time text expands too, but text alone reads
-              as a label, not an affordance. */}
+                the live speed as a superscript (the sheet is where speed and
+                voice live). The time text expands too, but text alone reads
+                as a label, not an affordance. */}
             <button
               type='button'
               aria-label={_('Playback settings')}
               onClick={onExpand}
-              className='text-base-content/70 flex shrink-0 rounded-full p-1 pe-4'
+              className='text-base-content/70 flex w-14 shrink justify-center rounded-full p-1'
             >
               <SpeedSettingsIcon
                 size={iconSize26}
                 label={formatRate(viewSettings?.ttsRate ?? 1.0)}
               />
+            </button>
+            <button
+              type='button'
+              className='shrink-0 rounded-full p-1'
+              aria-label={audioTransport ? _('Previous Chapter') : _('Previous Paragraph')}
+              onClick={() => onBackward(false)}
+            >
+              {audioTransport ? (
+                <MdSkipPrevious size={iconSize26} />
+              ) : (
+                <MdKeyboardDoubleArrowLeft size={iconSize26} />
+              )}
+            </button>
+            <button
+              type='button'
+              className='shrink-0 rounded-full p-1'
+              aria-label={audioTransport ? _('Back 15 Seconds') : _('Previous Sentence')}
+              onClick={() => onBackward(true)}
+            >
+              {audioTransport ? (
+                <RiReplay15Line size={iconSize26} />
+              ) : (
+                <MdKeyboardArrowLeft size={iconSize26} />
+              )}
+            </button>
+            <button
+              type='button'
+              className='relative shrink-0 rounded-full p-1'
+              aria-label={isPlaying ? _('Pause') : _('Play')}
+              aria-busy={buffering}
+              onClick={onTogglePlay}
+            >
+              {/* Same canvas size for both glyphs, or the row shifts on toggle. */}
+              {isPlaying ? <MdOutlinePause size={iconSize26} /> : <MdPlayArrow size={iconSize26} />}
+              {buffering && <BufferingRing size={iconSize26 + 8} isEink={isEink} />}
+            </button>
+            <button
+              type='button'
+              className='shrink-0 rounded-full p-1'
+              aria-label={audioTransport ? _('Forward 30 Seconds') : _('Next Sentence')}
+              onClick={() => onForward(true)}
+            >
+              {audioTransport ? (
+                <RiForward30Line size={iconSize26} />
+              ) : (
+                <MdKeyboardArrowRight size={iconSize26} />
+              )}
+            </button>
+            {/* No stop button on purpose (#5310): five transport glyphs already
+                crowd a phone, and an accidental hit on a sixth ends the
+                session. Stopping lives on the same toolbar TTS button that
+                started it. */}
+            <button
+              type='button'
+              className='shrink-0 rounded-full p-1'
+              aria-label={audioTransport ? _('Next Chapter') : _('Next Paragraph')}
+              onClick={() => onForward(false)}
+            >
+              {audioTransport ? (
+                <MdSkipNext size={iconSize26} />
+              ) : (
+                <MdKeyboardDoubleArrowRight size={iconSize26} />
+              )}
             </button>
             <div
               role='button'
@@ -298,23 +441,25 @@ const TTSMiniPlayer = ({
                 if (e.key === 'Enter' || e.key === ' ') onExpand();
               }}
               aria-label={_('Open Read Aloud player')}
-              className='flex min-w-0 flex-1 cursor-pointer flex-col items-center justify-center gap-0.5'
+              className='flex w-14 min-w-0 cursor-pointer flex-col items-center justify-center gap-0.5'
             >
-              {/* Centered in the flexible middle; elapsed carries the weight,
-                  the remaining half stays dim. An armed sleep timer stacks on
-                  its own line so it can never squeeze the time into
-                  truncation. */}
-              {elapsedLabel ? (
-                <span className='flex min-w-0 items-baseline gap-1 text-sm tabular-nums'>
-                  <span className='text-base-content truncate font-medium'>{elapsedLabel}</span>
-                  <span className='text-base-content/60 shrink-0'>· {remainingLabel}</span>
+              {/* A fixed 4rem box matching the settings glyph's, not a flexible
+                  or content-sized one: the latter would re-position every glyph
+                  each time the label changes width ("-9:59" -> "-10:00"), and
+                  the mirrored pair is what keeps the play glyph centered.
+                  Scales with the UI font since both the box and the text are
+                  rem-based (#5310). Default shrink is deliberate: on a tiny
+                  card at a large font scale the box gives way and the label
+                  truncates, rather than pushing a transport glyph off the
+                  edge. An armed sleep timer stacks on its own line so it can
+                  never squeeze the time into truncation. */}
+              {compactLabel && (
+                // max-w-full is load-bearing: a nowrap span is a flex item in a
+                // column, and without it the cross size resolves to the text's
+                // width and spills over the transport instead of truncating.
+                <span className='text-base-content max-w-full truncate text-sm font-medium tabular-nums'>
+                  {compactLabel}
                 </span>
-              ) : (
-                timeLabel && (
-                  <span className='text-base-content/60 truncate text-xs tabular-nums'>
-                    {timeLabel}
-                  </span>
-                )
               )}
               {timerLabel && (
                 <span className='text-base-content/60 flex shrink-0 items-center gap-0.5 text-xs tabular-nums'>
@@ -322,61 +467,6 @@ const TTSMiniPlayer = ({
                   {timerLabel}
                 </span>
               )}
-            </div>
-            <div dir='ltr' className='flex shrink-0 items-center'>
-              <button
-                type='button'
-                className='shrink-0 rounded-full p-1'
-                aria-label={_('Previous Paragraph')}
-                onClick={() => onBackward(false)}
-              >
-                <MdKeyboardDoubleArrowLeft size={iconSize26} />
-              </button>
-              <button
-                type='button'
-                className='shrink-0 rounded-full p-1'
-                aria-label={_('Previous Sentence')}
-                onClick={() => onBackward(true)}
-              >
-                <MdKeyboardArrowLeft size={iconSize26} />
-              </button>
-              <button
-                type='button'
-                className='shrink-0 rounded-full p-1'
-                aria-label={isPlaying ? _('Pause') : _('Play')}
-                onClick={onTogglePlay}
-              >
-                {/* Same canvas size for both glyphs, or the row shifts on toggle. */}
-                {isPlaying ? (
-                  <MdOutlinePause size={iconSize26} />
-                ) : (
-                  <MdPlayArrow size={iconSize26} />
-                )}
-              </button>
-              <button
-                type='button'
-                className='shrink-0 rounded-full p-1'
-                aria-label={_('Next Sentence')}
-                onClick={() => onForward(true)}
-              >
-                <MdKeyboardArrowRight size={iconSize26} />
-              </button>
-              <button
-                type='button'
-                className='shrink-0 rounded-full p-1'
-                aria-label={_('Next Paragraph')}
-                onClick={() => onForward(false)}
-              >
-                <MdKeyboardDoubleArrowRight size={iconSize26} />
-              </button>
-              <button
-                type='button'
-                className='text-base-content/70 ms-0.5 shrink-0 rounded-full p-1'
-                aria-label={_('Stop reading aloud')}
-                onClick={onStop}
-              >
-                <MdClose size={iconSize20} />
-              </button>
             </div>
           </div>
         )}

@@ -1,7 +1,6 @@
 'use client';
 
 import clsx from 'clsx';
-import { md5 } from 'js-md5';
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { isOPDSCatalog, getPublication, getFeed, getOpenSearch } from 'foliate-js/opds.js';
@@ -9,6 +8,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useEnv } from '@/context/EnvContext';
 import { useAuth } from '@/context/AuthContext';
 import { isWebAppPlatform } from '@/services/environment';
+import { recordFlow } from '@/services/sync/dataFlow/log';
 import { downloadFile } from '@/libs/storage';
 import { Toast } from '@/components/Toast';
 import { useThemeStore } from '@/store/themeStore';
@@ -17,8 +17,7 @@ import { useKeyDownActions } from '@/hooks/useKeyDownActions';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useCustomOPDSStore } from '@/store/customOPDSStore';
-import { transferManager } from '@/services/transferManager';
-import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { queueOPDSBookUploads } from '@/services/opds/cloudUpload';
 import { useTransferQueue } from '@/hooks/useTransferQueue';
 import { useTheme } from '@/hooks/useTheme';
 import { useLibrary } from '@/hooks/useLibrary';
@@ -33,6 +32,7 @@ import {
   isSearchLink,
   looksLikeXMLContent,
   MIME,
+  normalizeOpenSearchTemplates,
   parseMediaType,
   parseOPDSXML,
   resolveURL,
@@ -42,23 +42,42 @@ import {
   fetchWithAuth,
   probeAuth,
   needsProxy,
+  needsNativeImageFetch,
   probeFilename,
 } from './utils/opdsReq';
 import { getPublicationDetailHref, parsePublicationDocument } from './utils/opdsPublication';
 import { ImportError } from '@/services/errors';
 import { READEST_OPDS_USER_AGENT } from '@/services/constants';
 import { findBookByOPDSSources, upsertOPDSSourceMapping } from '@/services/opds/sourceMap';
+import { applyOPDSCover, getOPDSCoverHref, getOPDSImageCacheFilename } from '@/services/opds/cover';
+import { applyOPDSMetadata, getOPDSBookMetadata } from '@/services/opds/metadata';
 import { buildPseStreamFileName } from '@/services/opds/pseStream';
+import { md5 } from '@/utils/md5';
+import { makeOpdsAudioFilePath, opdsAudioIdentity } from '@/services/opds/audiobook';
+import {
+  makeBookOrbitAudioFilePath,
+  matchBookOrbitAudiobook,
+} from '@/services/bookorbit/audiobookId';
+import { autoPairBookOrbitAudiobook, loadEbookChapterIds } from '@/services/bookorbit/autoPair';
+import { BookOrbitClient } from '@/services/bookorbit/client';
+import { pickAudioLinks } from '@/services/opds/audiobook';
+import type { OpdsAudioTrackLink } from '@/services/opds/audiobook';
 import type { Book } from '@/types/book';
 import { FeedView } from './components/FeedView';
 import { PublicationView } from './components/PublicationView';
 import { SearchView } from './components/SearchView';
 import { Navigation } from './components/Navigation';
-import { normalizeOPDSCustomHeaders } from './utils/customHeaders';
+import { normalizeCustomHeaders } from '@/utils/customHeaders';
 import { closeOPDSBrowser, stashOPDSReturnTarget } from './utils/opdsClose';
 import { findExistingBookForPublication } from './utils/findExistingBook';
 import Dialog from '@/components/Dialog';
 import { uniqueId } from '@/utils/misc';
+import { getHorizontalInsetStyle } from '@/utils/insets';
+import {
+  allowsSelfSignedCert,
+  allowsSelfSignedCertAt,
+  type SelfSignedCertOption,
+} from '@/utils/tls';
 
 type ViewMode = 'feed' | 'publication' | 'search' | 'loading' | 'error';
 
@@ -88,7 +107,7 @@ export default function BrowserPage() {
   // already imported (shown as "Open & Read" instead of "Download"), and
   // re-evaluate whenever a download finishes or a book is removed.
   const library = useLibraryStore((s) => s.library);
-  const { safeAreaInsets, isRoundedWindow } = useThemeStore();
+  const { safeAreaInsets, isRoundedWindow, isIPhoneDuo } = useThemeStore();
   const { settings } = useSettingsStore();
   const [viewMode, setViewMode] = useState<ViewMode>('loading');
   const [state, setState] = useState<OPDSState>({
@@ -129,6 +148,8 @@ export default function BrowserPage() {
   const usernameRef = useRef<string | null | undefined>(undefined);
   const passwordRef = useRef<string | null | undefined>(undefined);
   const customHeadersRef = useRef<Record<string, string>>({});
+  // The saved catalog whose certificate choice applies (to its own origin).
+  const certOwnerRef = useRef<SelfSignedCertOption & { url?: string }>({});
   const startURLRef = useRef<string | null | undefined>(undefined);
   const loadingOPDSRef = useRef(false);
   const historyIndexRef = useRef(-1);
@@ -214,7 +235,15 @@ export default function BrowserPage() {
         const username = usernameRef.current || '';
         const password = passwordRef.current || '';
         const customHeaders = customHeadersRef.current;
-        const res = await fetchWithAuth(url, username, password, useProxy, {}, customHeaders);
+        const res = await fetchWithAuth(
+          url,
+          username,
+          password,
+          useProxy,
+          {},
+          customHeaders,
+          allowsSelfSignedCertAt(certOwnerRef.current, url),
+        );
 
         if (!res.ok) {
           if (isSearch && res.status === 404) {
@@ -288,7 +317,7 @@ export default function BrowserPage() {
               addToHistory(url, newState, 'publication', null);
             }
           } else if (localName === 'OpenSearchDescription') {
-            const search = getOpenSearch(doc) as OPDSSearch;
+            const search = getOpenSearch(normalizeOpenSearchTemplates(doc)) as OPDSSearch;
             const newState = {
               search,
               baseURL: responseURL,
@@ -388,7 +417,10 @@ export default function BrowserPage() {
         usernameRef.current = null;
         passwordRef.current = null;
       }
-      customHeadersRef.current = normalizeOPDSCustomHeaders(catalog?.customHeaders);
+      customHeadersRef.current = normalizeCustomHeaders(catalog?.customHeaders);
+      // An ad-hoc URL opened without a saved catalog accepts self-signed
+      // certificates; a saved catalog's choice covers its own origin only.
+      certOwnerRef.current = catalog ?? {};
       if (libraryLoaded) {
         lastLoadedKeyRef.current = loadKey;
         loadOPDS(url);
@@ -492,7 +524,15 @@ export default function BrowserPage() {
         const username = usernameRef.current || '';
         const password = passwordRef.current || '';
         const customHeaders = customHeadersRef.current;
-        const res = await fetchWithAuth(url, username, password, useProxy, {}, customHeaders);
+        const res = await fetchWithAuth(
+          url,
+          username,
+          password,
+          useProxy,
+          {},
+          customHeaders,
+          allowsSelfSignedCertAt(certOwnerRef.current, url),
+        );
         if (!res.ok) return null;
         const text = await res.text();
         return parsePublicationDocument(text, res.url);
@@ -550,6 +590,8 @@ export default function BrowserPage() {
     };
   }, [basePublication, detailPublication]);
 
+  const publicationCoverHref = publication ? getOPDSCoverHref(publication) : undefined;
+
   const handleDownload = useCallback(
     async (
       href: string,
@@ -572,19 +614,23 @@ export default function BrowserPage() {
           const password = passwordRef.current || '';
           const customHeaders = customHeadersRef.current;
           const useProxy = needsProxy(url);
-          let downloadUrl = useProxy ? getProxiedURL(url, '', true, customHeaders) : url;
+          const downloadUrl = useProxy ? getProxiedURL(url, true, customHeaders) : url;
           const headers: Record<string, string> = {
             'User-Agent': READEST_OPDS_USER_AGENT,
             Accept: '*/*',
             ...(!useProxy ? customHeaders : {}),
           };
           if (username || password) {
-            const authHeader = await probeAuth(url, username, password, useProxy, customHeaders);
+            const authHeader = await probeAuth(
+              url,
+              username,
+              password,
+              useProxy,
+              customHeaders,
+              allowsSelfSignedCertAt(certOwnerRef.current, url),
+            );
             if (authHeader) {
-              if (!useProxy) {
-                headers['Authorization'] = authHeader;
-              }
-              downloadUrl = useProxy ? getProxiedURL(url, authHeader, true, customHeaders) : url;
+              headers['Authorization'] = authHeader;
             }
           }
 
@@ -602,7 +648,7 @@ export default function BrowserPage() {
             url: downloadUrl,
             headers,
             singleThreaded: true,
-            skipSslVerification: true,
+            skipSslVerification: allowsSelfSignedCertAt(certOwnerRef.current, url),
             onProgress,
           });
           const probedFilename = await probeFilename(responseHeaders);
@@ -617,6 +663,73 @@ export default function BrowserPage() {
           const { library, setLibrary } = useLibraryStore.getState();
           try {
             const book = await appService.importBook(dstFilePath, library);
+            recordFlow({
+              connector: 'opds',
+              direction: 'pull',
+              kind: 'books',
+              bookTitle: book?.title,
+              count: book ? 1 : 0,
+            });
+            // The catalog's curated metadata wins over the file's embedded
+            // record (#5270) — applied before the cloud upload is queued so
+            // peers get the same fields. `publication` already carries the
+            // detail-document merge (#4749), so this is the fullest record.
+            if (book && publication) {
+              applyOPDSMetadata(book, getOPDSBookMetadata(publication));
+            }
+            // The catalog's own artwork wins over the one embedded in the file
+            // (#5270) — applied before the cloud upload is queued so peers get
+            // the same cover. Best effort: never fail the import over it.
+            if (book && publicationCoverHref) {
+              try {
+                await applyOPDSCover({
+                  appService,
+                  book,
+                  coverUrl: resolveURL(publicationCoverHref, state.baseURL),
+                  username,
+                  password,
+                  customHeaders,
+                  allowSelfSignedCert: allowsSelfSignedCertAt(
+                    certOwnerRef.current,
+                    resolveURL(publicationCoverHref, state.baseURL),
+                  ),
+                });
+              } catch (coverError) {
+                console.warn('OPDS: failed to apply the feed cover:', coverError);
+              }
+            }
+            // A BookOrbit entry that offers both formats is one book: importing
+            // the ebook is enough to know what the narration is, so pair them
+            // outright rather than sending the user to the wizard (#6224).
+            if (book && publication) {
+              const audioHrefs = pickAudioLinks(publication.links ?? [])
+                .map((link) => resolveURL(link.href ?? '', state.baseURL))
+                .filter(Boolean);
+              const native = matchBookOrbitAudiobook(
+                audioHrefs,
+                settings.bookorbit ?? { serverUrl: '', password: '' },
+              );
+              if (native) {
+                void autoPairBookOrbitAudiobook({
+                  book,
+                  bookId: native.bookId,
+                  loadManifest: (id) =>
+                    new BookOrbitClient(
+                      {
+                        serverUrl: settings.bookorbit!.serverUrl,
+                        username: settings.bookorbit!.username,
+                        password: settings.bookorbit!.password,
+                        customHeaders: settings.bookorbit!.customHeaders,
+                        allowSelfSignedCert: allowsSelfSignedCert(settings.bookorbit!),
+                      },
+                      { onTokensUpdated: () => {} },
+                    ).getManifest(id),
+                  loadTocChapterIds: (target) => loadEbookChapterIds(appService, target),
+                  appService,
+                  settings,
+                });
+              }
+            }
             if (book && catalogSourceId) {
               try {
                 await upsertOPDSSourceMapping(appService, {
@@ -628,16 +741,8 @@ export default function BrowserPage() {
                 console.error('OPDS: failed to update source map:', sourceMapError);
               }
             }
-            if (
-              user &&
-              book &&
-              !book.uploadedAt &&
-              settings.autoUpload &&
-              isReadestCloudStorageActive(settings)
-            ) {
-              setTimeout(() => {
-                transferManager.queueUpload(book);
-              }, 3000);
+            if (book) {
+              queueOPDSBookUploads(!!user, useSettingsStore.getState().settings, [book]);
             }
             setLibrary(library);
             appService.saveLibraryBooks(library);
@@ -649,10 +754,24 @@ export default function BrowserPage() {
         }
       } catch (e) {
         console.error('Download error:', e);
+        recordFlow({
+          connector: 'opds',
+          direction: 'pull',
+          kind: 'books',
+          error: e instanceof Error ? e.message : String(e),
+        });
         throw e;
       }
     },
-    [user, state.baseURL, appService, libraryLoaded, settings.autoUpload, catalogSourceId],
+    [
+      user,
+      state.baseURL,
+      appService,
+      libraryLoaded,
+      catalogSourceId,
+      publication,
+      publicationCoverHref,
+    ],
   );
 
   const handleStream = useCallback(
@@ -678,34 +797,131 @@ export default function BrowserPage() {
     [state.baseURL, catalogId, appService, libraryLoaded, router, _],
   );
 
+  // Audio entries are played from the catalog, never imported (#6224): the
+  // stub carries the acquisition links as its identity, the way an ABS stub
+  // carries `abs://<serverId>/<itemId>`.
+  const handlePlayAudio = useCallback(
+    async (tracks: OpdsAudioTrackLink[], title: string, author: string) => {
+      if (!appService || !libraryLoaded) return;
+      try {
+        const resolved = tracks.map((track) => ({
+          ...track,
+          href: resolveURL(track.href, state.baseURL),
+        }));
+        // When the catalog being browsed IS the BookOrbit configured for sync,
+        // its audiobook API serves the same book with chapters, byte ranges and
+        // a shared listening position — none of which OPDS can express (#6224).
+        const native = matchBookOrbitAudiobook(
+          resolved.map((track) => track.href),
+          settings.bookorbit ?? { serverUrl: '', password: '' },
+        );
+        const filePath = native
+          ? makeBookOrbitAudioFilePath(native.bookId)
+          : makeOpdsAudioFilePath({ catalogId, title, author, tracks: resolved });
+        const { library, setLibrary } = useLibraryStore.getState();
+        // Hashed over the book's identity, not the whole filePath: that string
+        // also carries the title and author, so a catalog correcting either one
+        // would hash to a new row and strand the listening progress on the old
+        // one. The BookOrbit path is already just `bookorbit://<id>`.
+        const hash = md5(native ? filePath : opdsAudioIdentity(catalogId, resolved));
+        const now = Date.now();
+        const existing = library.find((b) => b.hash === hash);
+        if (!existing) {
+          const stub: Book = {
+            hash,
+            format: native ? 'BOOKORBIT' : 'OPDSAUDIO',
+            filePath,
+            title,
+            author,
+            sourceTitle: title,
+            createdAt: now,
+            updatedAt: now,
+            deletedAt: null,
+          };
+          // An audio stub has no file to extract artwork from, so the entry's
+          // own cover is the only one it will ever have — without it the
+          // player and the media session fall back to a placeholder. Best
+          // effort, exactly like the download path (#5270).
+          if (publicationCoverHref) {
+            try {
+              await applyOPDSCover({
+                appService,
+                book: stub,
+                coverUrl: resolveURL(publicationCoverHref, state.baseURL),
+                username: usernameRef.current || '',
+                password: passwordRef.current || '',
+                customHeaders: customHeadersRef.current,
+                allowSelfSignedCert: allowsSelfSignedCertAt(
+                  certOwnerRef.current,
+                  resolveURL(publicationCoverHref, state.baseURL),
+                ),
+              });
+            } catch (coverError) {
+              console.warn('OPDS: failed to apply the feed cover:', coverError);
+            }
+          }
+          const newLibrary = [stub, ...library];
+          setLibrary(newLibrary);
+          await appService.saveLibraryBooks(newLibrary);
+        }
+        router.push(`/player?id=${hash}`);
+      } catch (e) {
+        console.error('Play error:', e);
+        eventDispatcher.dispatch('toast', {
+          type: 'error',
+          message: _('Failed to start playback') + `:\n${e instanceof Error ? e.message : e}`,
+        });
+      }
+    },
+    [
+      state.baseURL,
+      catalogId,
+      appService,
+      libraryLoaded,
+      router,
+      publicationCoverHref,
+      settings.bookorbit,
+      _,
+    ],
+  );
+
   const handleGenerateCachedImageUrl = useCallback(
-    async (url: string) => {
+    async (url: string, cacheVersion?: string) => {
       if (!appService) return url;
       const username = usernameRef.current || '';
       const password = passwordRef.current || '';
       const customHeaders = customHeadersRef.current;
-      if (!username && !password && Object.keys(customHeaders).length === 0) {
-        return needsProxy(url) ? getProxiedURL(url, '', true) : url;
+      if (
+        !username &&
+        !password &&
+        Object.keys(customHeaders).length === 0 &&
+        !needsNativeImageFetch(url)
+      ) {
+        return needsProxy(url) ? getProxiedURL(url, true) : url;
       }
 
-      const cachedKey = `img_${md5(url)}.png`;
+      const cachedKey = getOPDSImageCacheFilename(url, cacheVersion);
       const cachePrefix = await appService.resolveFilePath('', 'Cache');
       const cachedPath = `${cachePrefix}/${cachedKey}`;
       if (await appService.exists(cachedPath, 'None')) {
         return await appService.getImageURL(cachedPath);
       } else {
         const useProxy = needsProxy(url);
-        let downloadUrl = useProxy ? getProxiedURL(url, '', true, customHeaders) : url;
+        const downloadUrl = useProxy ? getProxiedURL(url, true, customHeaders) : url;
         const headers: Record<string, string> = {
           ...(!useProxy ? customHeaders : {}),
         };
         if (username || password) {
-          const authHeader = await probeAuth(url, username, password, useProxy, customHeaders);
+          const authHeader = await probeAuth(
+            url,
+            username,
+            password,
+            useProxy,
+            customHeaders,
+            allowsSelfSignedCertAt(certOwnerRef.current, url),
+          );
           if (authHeader) {
-            if (!useProxy) {
-              headers['Authorization'] = authHeader;
-            }
-            downloadUrl = useProxy ? getProxiedURL(url, authHeader, true, customHeaders) : url;
+            headers['Authorization'] = authHeader;
           }
         }
         await downloadFile({
@@ -714,7 +930,7 @@ export default function BrowserPage() {
           cfp: '',
           url: downloadUrl,
           singleThreaded: true,
-          skipSslVerification: true,
+          skipSslVerification: allowsSelfSignedCertAt(certOwnerRef.current, url),
           headers,
         });
         return await appService.getImageURL(cachedPath);
@@ -954,6 +1170,7 @@ export default function BrowserPage() {
       password: passwordRef.current || undefined,
       customHeaders: customHeadersRef.current,
       autoDownload: catalog?.autoDownload || false,
+      allowSelfSignedCert: allowsSelfSignedCert(certOwnerRef.current),
     });
 
     useCustomOPDSStore.getState().saveCustomOPDSCatalogs(envConfig);
@@ -978,6 +1195,8 @@ export default function BrowserPage() {
         className='relative top-0 z-40 w-full'
         style={{
           paddingTop: `${safeAreaInsets?.top || 0}px`,
+          // Clear iPhone Duo's side status strip (#6307).
+          ...getHorizontalInsetStyle(safeAreaInsets, isIPhoneDuo),
         }}
       >
         <Navigation
@@ -1030,6 +1249,7 @@ export default function BrowserPage() {
             onGenerateCachedImageUrl={handleGenerateCachedImageUrl}
             isOPDSCatalog={isOPDSCatalog}
             onAddCatalog={handleOpenAddCatalog}
+            scrollKey={state.currentURL}
           />
         )}
 
@@ -1040,6 +1260,7 @@ export default function BrowserPage() {
             existingBook={existingBookForPublication}
             onDownload={handleDownload}
             onStream={handleStream}
+            onPlayAudio={handlePlayAudio}
             resolveURL={resolveURL}
             onNavigate={handleNavigate}
             onGenerateCachedImageUrl={handleGenerateCachedImageUrl}
@@ -1061,18 +1282,18 @@ export default function BrowserPage() {
         title={_('Add to My Catalogs')}
         onClose={() => setShowAddCatalog(false)}
         boxClassName='sm:max-w-md sm:h-auto'
-        contentClassName='!px-6 !py-4'
+        contentClassName='px-6! py-4!'
       >
         <div className='flex flex-col gap-4 pt-2'>
-          <div className='form-control'>
-            <label className='label'>
-              <span className='label-text font-medium text-sm'>{_('Catalog Name')}</span>
+          <div className='flex flex-col'>
+            <label className='flex select-none items-center justify-between px-1 py-2'>
+              <span className='text-sm font-medium text-sm'>{_('Catalog Name')}</span>
             </label>
             <input
               type='text'
               value={newCatalogName}
               onChange={(e) => setNewCatalogName(e.target.value)}
-              className='input input-bordered eink-bordered w-full'
+              className='input eink-bordered w-full'
               autoFocus
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && newCatalogName.trim()) {

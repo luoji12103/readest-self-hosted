@@ -1,5 +1,11 @@
 import { describe, test, expect, beforeEach } from 'vitest';
-import { useTransferStore, TransferItem, TransferStatus } from '@/store/transferStore';
+import {
+  selectActiveBookDownloadProgress,
+  useTransferStore,
+  TransferItem,
+  TransferStatus,
+} from '@/store/transferStore';
+import { INDETERMINATE_PROGRESS } from '@/utils/transfer';
 
 const initialState = {
   transfers: {} as Record<string, TransferItem>,
@@ -11,6 +17,42 @@ const initialState = {
 
 beforeEach(() => {
   useTransferStore.setState(initialState);
+});
+
+describe('provider file history', () => {
+  test('file log entries cannot be retried or consume queue slots', () => {
+    const store = useTransferStore.getState();
+    const id = store.addFileTransfer('s3', '/Readest/library.json', 'download');
+    expect(store.getPendingTransfers()).toEqual([]);
+    expect(store.getActiveTransfers()).toEqual([]);
+    store.setTransferStatus(id, 'failed', 'Offline');
+    store.retryTransfer(id);
+    expect(useTransferStore.getState().transfers[id]?.status).toBe('failed');
+    expect(store.getFailedTransfers()).toHaveLength(1);
+  });
+
+  test('bounds completed file history while retaining active files and queued jobs', () => {
+    const store = useTransferStore.getState();
+    const queued = store.addTransfer('hash', 'Book', 'download');
+    const active = store.addFileTransfer('s3', '/Readest/active.json', 'download');
+    for (let i = 0; i < 510; i++) {
+      const id = store.addFileTransfer('s3', `/Readest/${i}.json`, 'upload');
+      store.setTransferStatus(id, 'completed');
+    }
+    store.addFileTransfer('s3', '/Readest/latest.json', 'download');
+    const transfers = useTransferStore.getState().transfers;
+    expect(Object.values(transfers).filter((row) => row.status === 'completed')).toHaveLength(500);
+    expect(transfers[queued]?.status).toBe('pending');
+    expect(transfers[active]?.status).toBe('in_progress');
+  });
+
+  test('restores interrupted file activity as cancelled history, never pending work', () => {
+    const store = useTransferStore.getState();
+    const id = store.addFileTransfer('s3', '/Readest/library.json', 'upload');
+    store.restoreTransfers(useTransferStore.getState().transfers, false);
+    expect(useTransferStore.getState().transfers[id]).toMatchObject({ status: 'cancelled' });
+    expect(store.getPendingTransfers()).toEqual([]);
+  });
 });
 
 describe('transferStore', () => {
@@ -613,6 +655,87 @@ describe('transferStore', () => {
       };
       useTransferStore.getState().restoreTransfers(legacy, false);
       expect(useTransferStore.getState().transfers['legacy1']!.kind).toBe('book');
+    });
+  });
+
+  // ── selectActiveBookDownloadProgress ─────────────────────────────
+  //
+  // The cover transfer overlay derives its queue progress from this selector
+  // instead of mirroring rows into a second React state. A mirror needs both
+  // writers to agree on who owns an entry, and got it wrong three ways: stale
+  // completed rows (which persist as history and survive restarts) deleted
+  // live progress, rows cleared out of the queue orphaned their entry, and a
+  // restored `pending` row painted a frozen 0%.
+  describe('selectActiveBookDownloadProgress', () => {
+    const row = (over: Partial<TransferItem>): TransferItem =>
+      ({
+        id: over.id ?? 't1',
+        kind: 'book',
+        bookHash: 'h1',
+        bookTitle: 'Book',
+        type: 'download',
+        status: 'in_progress',
+        progress: 0,
+        totalBytes: 0,
+        transferredBytes: 0,
+        transferSpeed: 0,
+        retryCount: 0,
+        maxRetries: 3,
+        createdAt: 1,
+        priority: 10,
+        isBackground: false,
+        ...over,
+      }) as TransferItem;
+
+    const select = (...rows: TransferItem[]) =>
+      selectActiveBookDownloadProgress(Object.fromEntries(rows.map((r) => [r.id, r])));
+
+    test('returns an empty map for an empty queue', () => {
+      expect(selectActiveBookDownloadProgress({})).toEqual({});
+    });
+
+    test('reports an in_progress download as its percentage', () => {
+      expect(select(row({ status: 'in_progress', progress: 42 }))).toEqual({ h1: 42 });
+    });
+
+    test('reports a pending download as indeterminate, not a frozen 0%', () => {
+      // A queued-but-not-started row has no bytes yet. Reporting its literal
+      // `progress: 0` renders a stuck "0%" on the cover — which is what a
+      // restored row (restoreTransfers resets in_progress -> pending/0) shows
+      // on every launch, permanently when the queue is paused.
+      expect(select(row({ status: 'pending', progress: 0 }))).toEqual({
+        h1: INDETERMINATE_PROGRESS,
+      });
+    });
+
+    test('ignores completed, failed and cancelled rows', () => {
+      expect(
+        select(
+          row({ id: 'a', bookHash: 'done', status: 'completed', progress: 100 }),
+          row({ id: 'b', bookHash: 'bad', status: 'failed', progress: 30 }),
+          row({ id: 'c', bookHash: 'gone', status: 'cancelled', progress: 30 }),
+        ),
+      ).toEqual({});
+    });
+
+    test('a stale completed row never masks a live download of the same book', () => {
+      // queueDownload only dedups against pending/in_progress rows, so a
+      // completed row and a fresh active row for one book coexist. The result
+      // must not depend on which is visited first.
+      const stale = row({ id: 'old', status: 'completed', progress: 100 });
+      const live = row({ id: 'new', status: 'in_progress', progress: 12 });
+      expect(select(stale, live)).toEqual({ h1: 12 });
+      expect(select(live, stale)).toEqual({ h1: 12 });
+    });
+
+    test('ignores uploads, deletes and replica transfers', () => {
+      expect(
+        select(
+          row({ id: 'a', bookHash: 'up', type: 'upload' }),
+          row({ id: 'b', bookHash: 'del', type: 'delete' }),
+          row({ id: 'c', bookHash: 'rep', kind: 'replica' }),
+        ),
+      ).toEqual({});
     });
   });
 });

@@ -2,6 +2,7 @@ import { Book, BookNote, HighlightColor } from '@/types/book';
 import { ReadwiseSettings } from '@/types/settings';
 import { READWISE_API_BASE_URL } from '@/services/constants';
 import { isTauriAppPlatform } from '@/services/environment';
+import { isPublicImageUrl } from '@/utils/cover';
 import { buildAnnotationWebUrl } from '@/utils/deeplink';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 
@@ -59,25 +60,36 @@ export class ReadwiseClient {
   async pushHighlights(
     notes: BookNote[],
     book: Book,
-  ): Promise<{ success: boolean; message?: string; isNetworkError?: boolean }> {
+    coverImageUrl?: string,
+  ): Promise<{ success: boolean; sent?: number; message?: string; isNetworkError?: boolean }> {
     const syncable = notes.filter(
-      (n) => (n.type === 'annotation' || n.type === 'excerpt') && !n.deletedAt && n.text,
+      (n) =>
+        !n.deletedAt &&
+        (n.type === 'bookmark' || ((n.type === 'annotation' || n.type === 'excerpt') && n.text)),
     );
-    if (syncable.length === 0) return { success: true };
+    if (syncable.length === 0) return { success: true, sent: 0 };
 
-    const isPublicUrl = (url?: string | null) =>
-      !!url && /^https?:\/\/(?!localhost|127\.|asset\.localhost)/.test(url);
+    // Readwise only accepts a fetchable image_url (max 2047 chars), never
+    // image bytes; the caller resolves/publishes a public URL (issue #5424)
+    // and the book's own metadata URL is the fallback.
+    const includeCover = this.config.includeCoverImage ?? true;
+    const coverUrl = includeCover ? (coverImageUrl ?? book.coverImageUrl) : undefined;
 
     const highlights = syncable.map((note) => ({
-      text: note.text!,
+      text:
+        note.type === 'bookmark'
+          ? note.page != null
+            ? `Page ${note.page}`
+            : `Position ${note.cfi}`
+          : note.text!,
       title: book.title,
       author: book.author,
-      ...(isPublicUrl(book.coverImageUrl) ? { image_url: book.coverImageUrl } : {}),
+      ...(isPublicImageUrl(coverUrl) ? { image_url: coverUrl } : {}),
       source_type: 'readest',
       category: 'books',
       note: note.note || undefined,
       location: note.page,
-      location_type: 'page',
+      location_type: note.page != null ? 'page' : 'order',
       highlighted_at: new Date(note.createdAt).toISOString(),
       highlight_url: buildAnnotationWebUrl({
         bookHash: book.hash,
@@ -104,7 +116,7 @@ export class ReadwiseClient {
         }
         return { success: false, message };
       }
-      return { success: true };
+      return { success: true, sent: syncable.length };
     } catch (e) {
       return { success: false, message: (e as Error).message, isNetworkError: true };
     }

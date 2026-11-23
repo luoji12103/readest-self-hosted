@@ -4,10 +4,20 @@ import clsx from 'clsx';
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { IoPricetag } from 'react-icons/io5';
+import { MdArrowDropDown } from 'react-icons/md';
 import { Book } from '@/types/book';
 import { OPDSPublication, REL, SYMBOL, OPDSAcquisitionLink, OPDSStreamLink } from '@/types/opds';
+import { audioMimeType, pickAudioLinks } from '@/services/opds/audiobook';
+import { isAudioLink } from '@/services/opds/formats';
+import type { OpdsAudioTrackLink } from '@/services/opds/audiobook';
+import { getOPDSCoverHref } from '@/services/opds/cover';
+import {
+  classifyAcquisitionLink,
+  getFormatName,
+  getFormatTier,
+  pickPreferredLink,
+} from '@/services/opds/formats';
 import { useTranslation } from '@/hooks/useTranslation';
-import { getFileExtFromMimeType } from '@/libs/document';
 import { formatDate, formatLanguage } from '@/utils/book';
 import { getImportErrorMessage, ImportError } from '@/services/errors';
 import { eventDispatcher } from '@/utils/event';
@@ -38,7 +48,8 @@ interface PublicationViewProps {
     onProgress?: (progress: { progress: number; total: number }) => void,
   ) => Promise<Book | null | undefined>;
   onStream?: (href: string, count: number, title: string, author: string) => void;
-  onGenerateCachedImageUrl: (url: string) => Promise<string>;
+  onPlayAudio?: (tracks: OpdsAudioTrackLink[], title: string, author: string) => void;
+  onGenerateCachedImageUrl: (url: string, cacheVersion?: string) => Promise<string>;
 }
 
 export function PublicationView({
@@ -49,6 +60,7 @@ export function PublicationView({
   onNavigate,
   onDownload,
   onStream,
+  onPlayAudio,
   onGenerateCachedImageUrl,
 }: PublicationViewProps) {
   const _ = useTranslation();
@@ -83,14 +95,11 @@ export function PublicationView({
     [publication.links],
   );
 
-  const coverImage = useMemo(() => {
-    const covers = publication.images?.filter((img) =>
-      REL.COVER.some((rel: string) => img.rel?.includes(rel)),
-    );
-    return covers?.[0] || publication.images?.[0];
-  }, [publication.images]);
+  // Same pick the download path stores as the book cover, so the detail view
+  // never previews artwork the library won't end up showing (issue #5270).
+  const coverHref = useMemo(() => getOPDSCoverHref(publication), [publication]);
 
-  const imageUrl = coverImage?.href ? resolveURL(coverImage.href, baseURL) : null;
+  const imageUrl = coverHref ? resolveURL(coverHref, baseURL) : null;
 
   const authors = useMemo(() => {
     const author = publication.metadata?.author;
@@ -110,7 +119,7 @@ export function PublicationView({
 
   const authorNames = useMemo(() => authors.map((a) => a.name), [authors]);
 
-  const acquisitionLinks = useMemo(() => {
+  const allAcquisitionLinks = useMemo(() => {
     const links: Array<{ rel: string; links: OPDSAcquisitionLink[] }> = [];
     for (const [rel, linkList] of Array.from(linksByRel.entries())) {
       if (rel?.startsWith(REL.ACQ)) {
@@ -120,9 +129,36 @@ export function PublicationView({
     return links;
   }, [linksByRel]);
 
+  // Audio is played, never imported, so it is pulled out before the download
+  // buttons are built. A group that was ALL audio disappears from the download
+  // UI entirely rather than rendering an empty dropdown (#6224).
+  const acquisitionLinks = useMemo(
+    () =>
+      allAcquisitionLinks
+        .map(({ rel, links }) => ({ rel, links: links.filter((link) => !isAudioLink(link)) }))
+        .filter(({ links }) => links.length > 0),
+    [allAcquisitionLinks],
+  );
+
   const streamLinks = useMemo(() => {
     return (linksByRel.get(REL.STREAM) || []) as OPDSStreamLink[];
   }, [linksByRel]);
+
+  // Audio is streamed by the player, so it never belongs in the download
+  // buttons -- an entry with both (an audiobook plus its ebook) keeps the
+  // ebook download and gains a Play action (#6224).
+  const audioTracks = useMemo<OpdsAudioTrackLink[]>(
+    () =>
+      allAcquisitionLinks
+        .flatMap(({ links }) => pickAudioLinks(links))
+        .filter((link): link is OPDSAcquisitionLink & { href: string } => !!link.href)
+        .map((link) => ({
+          href: link.href,
+          mimeType: audioMimeType(link),
+          ...(link.title ? { title: link.title } : {}),
+        })),
+    [allAcquisitionLinks],
+  );
 
   const handleActionButton = async (href: string, type?: string, forceDownload = false) => {
     if (downloadedBook && !forceDownload) {
@@ -165,14 +201,95 @@ export function PublicationView({
     }
   };
 
-  const getAcquisitionLabel = (rel: string): string => {
+  // `formatExt` names the format the button would fetch. Only the generic
+  // Download label takes it: the entitlement rels describe an action rather
+  // than a file, so "Borrow EPUB" would read wrong (#5583).
+  const getAcquisitionLabel = (rel: string, formatExt?: string): string => {
     if (rel === REL.ACQ + '/open-access') return _('Open Access');
     if (rel === REL.ACQ + '/borrow') return _('Borrow');
     if (rel === REL.ACQ + '/buy') return _('Buy');
     if (rel === REL.ACQ + '/subscribe') return _('Subscribe');
     if (rel === REL.ACQ + '/sample') return _('Sample');
-    return _('Download');
+    return formatExt
+      ? _('Download {{format}}', { format: formatExt.toUpperCase() })
+      : _('Download');
   };
+
+  const formatMenu = (links: OPDSAcquisitionLink[]) => (
+    <div
+      // Stays absolutely positioned (daisyui's default). Forcing `relative`
+      // here puts the menu in flow inside the fixed-height detail column, and
+      // `justify-between` then shoves the whole button row 156px up the moment
+      // it opens.
+      className={clsx(
+        'dropdown-content no-triangle',
+        'border-base-300 eink-bordered bg-base-200! z-20 mt-2 max-w-[80vw] min-w-max',
+        'rounded-2xl border shadow-2xl',
+      )}
+    >
+      {links.map((link, idx: number) => (
+        <MenuItem
+          key={idx}
+          noIcon
+          transient
+          label={link.title || getFormatName(link).toUpperCase() || _('Download')}
+          onClick={() => handleActionButton(link.href!, link.type)}
+        />
+      ))}
+    </div>
+  );
+
+  // DESIGN.md §4.1/§4.4: one solid primary per surface, everything else quieter.
+  // `btn-contrast` sets its background with `!important`, so it survives the
+  // `bg-base-300/50` tint the Dropdown puts on an open toggle -- a plain
+  // `btn-primary` half would turn beige while its sibling stayed filled. The
+  // secondary gets a soft surface rather than a bare ghost: a transparent half
+  // has no shape to split, so its caret rendered as a detached sliver.
+  const SOLID_ACTION = 'btn btn-contrast';
+  const FLAT_ACTION =
+    'btn eink-bordered border-transparent bg-base-200! hover:bg-base-300! text-base-content';
+
+  /**
+   * A default action plus, when there is more than one format to choose from, a
+   * caret that opens the full list.
+   *
+   * The halves are separated by a 1px gap showing the page behind rather than a
+   * border: `btn-contrast` declares its own border `!important`, so a seam
+   * colour set here is ignored. The gap also survives e-ink, where hover does
+   * not exist and two same-tone buttons would otherwise flatten into one.
+   */
+  const splitDownloadButton = (
+    label: string,
+    onPrimary: () => void,
+    menuLinks: OPDSAcquisitionLink[],
+    solid = true,
+  ) => (
+    <div className='flex gap-px'>
+      <button
+        type='button'
+        onClick={onPrimary}
+        disabled={downloading}
+        className={clsx(
+          solid ? SOLID_ACTION : FLAT_ACTION,
+          'min-w-20 rounded-l-3xl rounded-r-none px-4',
+        )}
+      >
+        {label}
+      </button>
+      <Dropdown
+        label={_('More formats')}
+        className='dropdown-bottom dropdown-end'
+        buttonClassName={clsx(
+          solid ? SOLID_ACTION : FLAT_ACTION,
+          'w-10 rounded-l-none rounded-r-3xl px-0',
+        )}
+        disabled={downloading}
+        toggleButton={<MdArrowDropDown size={20} />}
+      >
+        {formatMenu(menuLinks)}
+      </Dropdown>
+    </div>
+  );
 
   const content = publication.metadata?.[SYMBOL.CONTENT] || publication.metadata?.content;
   const description = publication.metadata?.description;
@@ -188,7 +305,7 @@ export function PublicationView({
   return (
     <div className='flex w-full flex-col px-6 py-6'>
       <div className='mb-6 flex w-full flex-row items-start gap-6 max-[320px]:flex-col'>
-        <div className='h-44 flex-shrink-0 sm:h-56 md:h-64'>
+        <div className='h-44 shrink-0 sm:h-56 md:h-64'>
           <div className='bg-base-200 relative aspect-[28/41] h-full overflow-hidden rounded-none shadow-lg'>
             <CachedImage
               src={imageUrl}
@@ -196,12 +313,17 @@ export function PublicationView({
               fill
               className='object-cover'
               sizes='(max-width: 640px) 50vw, (max-width: 1024px) 33vw, 25vw'
+              cacheVersion={publication.metadata?.updated}
               onGenerateCachedImageUrl={onGenerateCachedImageUrl}
             />
           </div>
         </div>
 
-        <div className='flex h-44 min-w-0 flex-col justify-between max-[320px]:h-32 sm:h-56 md:h-64'>
+        {/* Min-height, not height: `justify-between` still pins the actions to
+            the bottom alongside the cover, but a narrow viewport that wraps the
+            action row onto a second line grows the column instead of spilling
+            the buttons over the description. */}
+        <div className='flex min-h-44 min-w-0 flex-1 flex-col justify-between max-[320px]:min-h-32 sm:min-h-56 md:min-h-64'>
           <div className='flex flex-col'>
             {publication.metadata?.subtitle && (
               <p className='text-base-content/60 mb-1 text-sm'>{publication.metadata.subtitle}</p>
@@ -231,80 +353,107 @@ export function PublicationView({
             )}
           </div>
 
-          {!downloadedBook && acquisitionLinks.length === 0 && streamLinks.length === 0 && (
-            <p className='text-base-content/60 text-sm'>{_('No downloadable format available')}</p>
-          )}
+          {!downloadedBook &&
+            acquisitionLinks.length === 0 &&
+            streamLinks.length === 0 &&
+            audioTracks.length === 0 && (
+              <p className='text-base-content/60 text-sm'>
+                {_('No downloadable format available')}
+              </p>
+            )}
 
-          {(acquisitionLinks.length > 0 || streamLinks.length > 0) && (
+          {(acquisitionLinks.length > 0 || streamLinks.length > 0 || audioTracks.length > 0) && (
             <div className='flex flex-wrap items-center gap-2'>
               {acquisitionLinks.map(({ rel, links }) => {
                 const validLinks = links.filter((l) => l.href);
                 if (validLinks.length === 0) return null;
 
+                // Drop formats Readest cannot import — unless that would leave
+                // nothing, in which case the incompatible links are still the
+                // only path this book has (#5583).
+                const compatible = validLinks.filter(
+                  (l) => classifyAcquisitionLink(l) !== 'unsupported',
+                );
+                const usableLinks = compatible.length > 0 ? compatible : validLinks;
+                const menuLinks = [...usableLinks].sort(
+                  (a, b) => getFormatTier(a) - getFormatTier(b),
+                );
+                const preferred = pickPreferredLink(usableLinks)!;
+                // Only an EPUB earns a default action. Anything else and the
+                // user picks, rather than the app quietly taking second best.
+                const hasDefaultAction = getFormatTier(preferred) <= 1;
+                const primaryLabel = getAcquisitionLabel(
+                  rel,
+                  hasDefaultAction || usableLinks.length === 1
+                    ? getFormatName(preferred)
+                    : undefined,
+                );
+                const showCaret = usableLinks.length > 1;
+
                 return (
-                  <div key={rel} className='flex gap-1'>
+                  <div key={rel} className='flex flex-wrap items-center gap-2'>
                     {downloadedBook ? (
                       <>
+                        {/* Reading the copy you already have is the primary
+                            action here, so it takes the one solid button and
+                            re-downloading drops to flat. */}
                         <button
                           type='button'
-                          onClick={() =>
-                            handleActionButton(validLinks[0]!.href!, validLinks[0]!.type)
-                          }
+                          onClick={() => handleActionButton(preferred.href!, preferred.type)}
                           disabled={downloading}
-                          className='btn btn-primary btn-success min-w-20 rounded-3xl'
+                          className={clsx(SOLID_ACTION, 'min-w-20 rounded-3xl px-4')}
                         >
                           {_('Open & Read')}
                         </button>
-                        <button
-                          type='button'
-                          onClick={() =>
-                            handleActionButton(validLinks[0]!.href!, validLinks[0]!.type, true)
-                          }
-                          disabled={downloading}
-                          className='btn btn-primary min-w-20 rounded-3xl'
-                        >
-                          {_('Download Again')}
-                        </button>
+                        {showCaret ? (
+                          splitDownloadButton(
+                            _('Download Again'),
+                            () => handleActionButton(preferred.href!, preferred.type, true),
+                            menuLinks,
+                            false,
+                          )
+                        ) : (
+                          <button
+                            type='button'
+                            onClick={() =>
+                              handleActionButton(preferred.href!, preferred.type, true)
+                            }
+                            disabled={downloading}
+                            className={clsx(FLAT_ACTION, 'min-w-20 rounded-3xl px-4')}
+                          >
+                            {_('Download Again')}
+                          </button>
+                        )}
                       </>
-                    ) : validLinks.length === 1 ? (
+                    ) : !showCaret ? (
                       <button
                         type='button'
-                        onClick={() =>
-                          handleActionButton(validLinks[0]!.href!, validLinks[0]!.type)
-                        }
+                        onClick={() => handleActionButton(preferred.href!, preferred.type)}
                         disabled={downloading}
-                        className='btn btn-primary min-w-20 rounded-3xl'
+                        className={clsx(SOLID_ACTION, 'min-w-20 rounded-3xl px-4')}
                       >
-                        {getAcquisitionLabel(rel)}
+                        {primaryLabel}
                       </button>
+                    ) : hasDefaultAction ? (
+                      splitDownloadButton(
+                        primaryLabel,
+                        () => handleActionButton(preferred.href!, preferred.type),
+                        menuLinks,
+                      )
                     ) : (
                       <Dropdown
                         label={_('Download')}
                         className='dropdown-bottom dropdown-center flex justify-center'
-                        buttonClassName='btn btn-primary min-w-20 rounded-3xl p-0 bg-primary hover:bg-primary'
+                        buttonClassName={clsx(SOLID_ACTION, 'min-w-20 gap-1 rounded-3xl px-4')}
                         disabled={downloading}
-                        toggleButton={<div>{getAcquisitionLabel(rel)}</div>}
+                        toggleButton={
+                          <div className='flex items-center gap-1'>
+                            {primaryLabel}
+                            <MdArrowDropDown size={18} />
+                          </div>
+                        }
                       >
-                        <div
-                          className={clsx(
-                            'delete-menu dropdown-content no-triangle !relative',
-                            'border-base-300 !bg-base-200 z-20 mt-2 max-w-[80vw] shadow-2xl',
-                          )}
-                        >
-                          {validLinks.map((link, idx: number) => (
-                            <MenuItem
-                              key={idx}
-                              noIcon
-                              transient
-                              label={
-                                link.title ||
-                                getFileExtFromMimeType(link.type || '').toUpperCase() ||
-                                idx.toString()
-                              }
-                              onClick={() => handleActionButton(link.href!, link.type)}
-                            />
-                          ))}
-                        </div>
+                        {formatMenu(menuLinks)}
                       </Dropdown>
                     )}
                   </div>
@@ -340,25 +489,42 @@ export function PublicationView({
                 return null;
               })}
 
-              <div className='flex h-12 w-12 items-center justify-center'>
-                {downloading && progress && progress > 0 && (
-                  <div
-                    className='radial-progress flex items-center justify-center'
-                    style={
-                      {
-                        '--value': progress,
-                        '--size': '2.5rem',
-                        fontSize: '0.6rem',
-                        lineHeight: '0.8rem',
-                      } as React.CSSProperties
-                    }
-                    aria-valuenow={progress || 0}
-                    role='progressbar'
-                  >
-                    {progress}%
-                  </div>
-                )}
-              </div>
+              {audioTracks.length > 0 && (
+                <button
+                  type='button'
+                  onClick={() =>
+                    onPlayAudio?.(
+                      audioTracks,
+                      publication.metadata?.title || '',
+                      authorNames.join(' & '),
+                    )
+                  }
+                  className={clsx('btn btn-secondary min-w-20 rounded-3xl')}
+                >
+                  {_('Play')}
+                </button>
+              )}
+
+              {/* Rendered only while a download is running. A permanently
+                  mounted 48px slot left a dead gap after the actions on every
+                  viewport, and cost real width on narrow ones. */}
+              {downloading && progress !== null && progress > 0 && (
+                <div
+                  className='radial-progress flex items-center justify-center'
+                  style={
+                    {
+                      '--value': progress,
+                      '--size': '2.5rem',
+                      fontSize: '0.6rem',
+                      lineHeight: '0.8rem',
+                    } as React.CSSProperties
+                  }
+                  aria-valuenow={progress}
+                  role='progressbar'
+                >
+                  {progress}%
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -34,6 +34,28 @@ EXTS = {
 }
 
 CLOUD_BOOKS_SUBDIR = 'Readest/Books'
+COVER_FILE_NAME = 'cover.png'
+
+# calibre marks: in-memory labels shown in the book list and searchable as
+# `marked:<label>`. Derived from the cloud on every status check, never stored.
+MARK_PREFIX = 'readest_'
+PLAN_MARKS = {
+    'new': MARK_PREFIX + 'missing',
+    'replace': MARK_PREFIX + 'outdated',
+    'update': MARK_PREFIX + 'metadata',
+    'skip': MARK_PREFIX + 'synced',
+}
+
+
+def merge_marks(existing, new_marks):
+    """Our marks replaced wholesale, everyone else's left alone.
+
+    `existing` is calibre's `View.marked_ids` ({book_id: label}), which also
+    holds marks the user set by hand.
+    """
+    merged = {i: l for i, l in (existing or {}).items() if not str(l).startswith(MARK_PREFIX)}
+    merged.update(new_marks or {})
+    return merged
 
 
 def pick_format(available):
@@ -53,7 +75,26 @@ def book_file_name(file_hash, fmt):
 
 
 def cover_file_name(file_hash):
-    return '%s/%s/cover.png' % (CLOUD_BOOKS_SUBDIR, file_hash)
+    return '%s/%s/%s' % (CLOUD_BOOKS_SUBDIR, file_hash, COVER_FILE_NAME)
+
+
+def cloud_book_hashes(files):
+    """Book hashes that still have a book blob (not just a cover) in storage.
+
+    Read from the file key (`{user_id}/Readest/Books/{hash}/{name}`) rather
+    than the row's `book_hash`, which is only set when the uploader passed it.
+    """
+    marker = CLOUD_BOOKS_SUBDIR + '/'
+    hashes = set()
+    for record in files or []:
+        key = record.get('file_key') or ''
+        index = key.find(marker)
+        if index < 0:
+            continue
+        book_hash, _, name = key[index + len(marker) :].partition('/')
+        if book_hash and name and name != COVER_FILE_NAME:
+            hashes.add(book_hash)
+    return hashes
 
 
 def _clean(value):
@@ -62,6 +103,49 @@ def _clean(value):
     if isinstance(value, str):
         return value.replace('\x00', '')
     return value
+
+
+def _jsonable(value):
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def calibre_columns(user_metadata):
+    """Custom columns as BookMetadata.calibreColumns (libs/document.ts).
+
+    `user_metadata` maps '#label' to calibre's field metadata (name, datatype,
+    '#value#', '#extra#'), as Metadata.get_all_user_metadata() does. The records
+    match what foliate-js parses from the OPF's calibre:user_metadata, so a
+    pushed row and a locally parsed file agree, and empty values are dropped
+    the same way.
+    """
+    columns = []
+    for key, fm in (user_metadata or {}).items():
+        datatype = fm.get('datatype') or 'text'
+        value = _jsonable(fm.get('#value#'))
+        if (
+            value in (None, '', [])
+            or (datatype == 'datetime' and str(value).startswith('0101-01-01'))
+            or (datatype == 'rating' and not value)
+        ):
+            continue
+        label = key.lstrip('#')
+        column = {
+            'label': label,
+            'name': fm.get('name') or label,
+            'datatype': datatype,
+            'value': value,
+        }
+        extra = _jsonable(fm.get('#extra#'))
+        if extra is not None:
+            column['extra'] = extra
+        columns.append(column)
+    return columns
 
 
 def build_metadata(book):
@@ -99,7 +183,7 @@ def build_metadata(book):
     if book.get('uuid'):
         optional['identifier'] = 'urn:uuid:%s' % book['uuid']
     if book.get('custom_columns'):
-        optional['customColumns'] = book['custom_columns']
+        optional['calibreColumns'] = book['custom_columns']
     for key, value in optional.items():
         if value not in (None, '', []):
             meta[key] = value
@@ -142,6 +226,12 @@ def iso_to_ms(iso):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def ms_to_iso(ms):
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
 
 
 def _parse_row_metadata(row):
@@ -218,7 +308,22 @@ def pick_server_row(hash_row, uuid_row):
     return hash_row if hash_row is not None else uuid_row
 
 
-def plan_push(server_row, wire, local_cover_hash, source_hash):
+def should_bulk_list(total_pages, selected_books):
+    """Whether paging the whole storage listing beats per-book lookups.
+
+    Paging costs one request per page no matter how many books are selected;
+    a per-book lookup costs one request per book that needs checking. Measured
+    against a real account both are around a second, so compare the counts.
+    Page 1 is already paid for by the time we can ask, hence the <=.
+    """
+    return total_pages <= max(1, selected_books)
+
+
+def _resolve_blob_present(blob_present, book_hash):
+    return blob_present(book_hash) if callable(blob_present) else bool(blob_present)
+
+
+def plan_push(server_row, wire, local_cover_hash, source_hash, blob_present=True):
     """Decide what to do for one book.
 
     Returns {'action': 'new' | 'replace' | 'update' | 'skip',
@@ -228,10 +333,24 @@ def plan_push(server_row, wire, local_cover_hash, source_hash):
                fresh embedded blob under its new hash, tombstone the old row
     - update:  file unchanged, but metadata/cover/tombstone differ — row only
     - skip:    file + metadata + cover all unchanged
+
+    `blob_present` says whether the row's book file is actually in cloud
+    storage. `uploaded_at` alone doesn't prove it: deleting files under
+    "Manage Storage" drops the object and its `files` row but never touches
+    `books.uploaded_at`, and a row-only push against a missing blob leaves a
+    book that shows up in the library but 404s on download.
+
+    It may be a bool, or a callable(book_hash) -> bool for callers that look
+    storage up one book at a time. It is checked last, so a lookup only costs
+    a request when it can still change the answer.
     """
     if server_row is None:
         return {'action': 'new', 'upload_cover': bool(local_cover_hash)}
-    if not server_row.get('uploaded_at') or row_source_hash(server_row) != source_hash:
+    if (
+        not server_row.get('uploaded_at')
+        or row_source_hash(server_row) != source_hash
+        or not _resolve_blob_present(blob_present, server_row['book_hash'])
+    ):
         # A replaced book gets a new hash namespace, so it needs its own cover.
         return {'action': 'replace', 'upload_cover': bool(local_cover_hash)}
     cover_changed = bool(local_cover_hash) and local_cover_hash != server_row.get('cover_hash')
@@ -289,4 +408,12 @@ def merge_for_push(wire, server_row, now_ms, uploaded_at_ms=None, cover_hash=Non
     elif row.get('cover_hash'):
         record['coverHash'] = row['cover_hash']
         record['coverUpdatedAt'] = iso_to_ms(row.get('cover_updated_at'))
+    # The server resolves title/author/tags/metadata by metadata_updated_at
+    # (field-level LWW, readest#5438). Stamp it when this push changes the
+    # group; carry the row's stamp otherwise, so a cover-only push can't win
+    # the group over a newer Readest edit racing with it.
+    if server_row is None or not _row_matches_wire(server_row, wire):
+        record['metadataUpdatedAt'] = now_ms
+    else:
+        record['metadataUpdatedAt'] = iso_to_ms(row.get('metadata_updated_at'))
     return record

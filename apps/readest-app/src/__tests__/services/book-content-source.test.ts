@@ -1,5 +1,12 @@
-import { describe, expect, test, vi } from 'vitest';
-import { exportBook, getBookFileSize, isBookAvailable } from '@/services/bookService';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  exportBook,
+  getBookFileSize,
+  isBookAvailable,
+  loadBookContent,
+} from '@/services/bookService';
+import { resolveBookContentSource } from '@/services/bookContent';
+import { useABSServerStore } from '@/store/absServerStore';
 import { getLocalBookFilename } from '@/utils/book';
 import type { Book } from '@/types/book';
 import type { BaseDir, FileSystem } from '@/types/system';
@@ -91,5 +98,68 @@ describe('book content source resolution', () => {
     const fs = makeFs({});
 
     await expect(isBookAvailable(fs, book)).resolves.toBe(true);
+  });
+
+  test('isBookAvailable treats an ABS book as available without probing the filesystem', async () => {
+    const book = makeBook({
+      format: 'ABS',
+      downloadedAt: undefined,
+      filePath: 'abs://server-1/item-abc',
+    });
+    const fs = makeFs({});
+
+    await expect(isBookAvailable(fs, book)).resolves.toBe(true);
+    // ABS books stream from the server; resolving a content source (and thus
+    // probing the abs:// filePath) must never happen for them.
+    expect(fs.exists).not.toHaveBeenCalled();
+  });
+
+  test('getBookFileSize returns null for an ABS book instead of a false-positive size', async () => {
+    const book = makeBook({
+      format: 'ABS',
+      downloadedAt: undefined,
+      filePath: 'abs://server-1/item-abc',
+    });
+    const fs = makeFs({});
+
+    await expect(getBookFileSize(fs, book)).resolves.toBeNull();
+  });
+});
+
+describe('ABS ebook content source', () => {
+  const server = {
+    id: 'server-1',
+    contentId: 'server-1',
+    name: 'Home',
+    url: 'http://abs.local',
+    accessToken: 'tok-1',
+  };
+  const path = 'http://abs.local/api/items/item-abc/ebook?token=tok-1';
+  const absEbook = () =>
+    makeBook({
+      format: 'ABS',
+      downloadedAt: undefined,
+      filePath: 'abs://server-1/item-abc',
+      metadata: { title: 'sample', author: 'Author', language: 'en', absMediaType: 'ebook' },
+    });
+
+  beforeEach(() => {
+    useABSServerStore.setState({ servers: [server] });
+  });
+
+  test('resolves to a url source whose fetcher owns the access token', async () => {
+    const source = await resolveBookContentSource(makeFs({}), absEbook());
+
+    expect(source).toMatchObject({ kind: 'url', base: 'None', path });
+    if (source.kind !== 'url') throw new Error('expected a url source');
+    expect(source.fetcher).toBeTypeOf('function');
+  });
+
+  test('loadBookContent opens the stream through that fetcher', async () => {
+    const fs = makeFs({ files: { [`None:${path}`]: new File([], 'ebook') } });
+
+    await loadBookContent(fs, absEbook());
+
+    expect(fs.openFile).toHaveBeenCalledWith(path, 'None', undefined, expect.any(Function));
   });
 });

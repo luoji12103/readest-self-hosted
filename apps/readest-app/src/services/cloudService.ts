@@ -11,6 +11,8 @@ import {
   uploadFile,
   uploadReplicaFile,
   deleteFile as deleteCloudFile,
+  listAllFiles,
+  purgeFiles,
   createProgressHandler,
   batchGetDownloadUrls,
 } from '@/libs/storage';
@@ -18,6 +20,26 @@ import { ClosableFile } from '@/utils/file';
 import { ProgressHandler } from '@/utils/transfer';
 import { CLOUD_BOOKS_SUBDIR, CLOUD_REPLICAS_SUBDIR } from './constants';
 import { isBookFileContentSource, resolveBookContentSource } from './bookContent';
+import { getAbsOfflineDir } from '@/utils/audiobook';
+import { isBookDataFileKey } from '@/utils/bookDataKey';
+
+// A book's synced data (downloaded TTS packs) sits under its cloud folder by
+// content name, so it is found by listing, not by name. Best-effort.
+const purgeCloudBookData = async (bookHash: string): Promise<void> => {
+  try {
+    const files = await listAllFiles({ bookHash, search: `/${bookHash}/` });
+    const keys = files.map((f) => f.file_key).filter(isBookDataFileKey);
+    // The purge route takes at most 100 keys a request.
+    let failed = 0;
+    for (let i = 0; i < keys.length; i += 100) {
+      const result = await purgeFiles(keys.slice(i, i + 100), true);
+      failed += result?.failedCount ?? 0;
+    }
+    if (failed) console.warn(`Failed to delete ${failed} synced book data file(s)`);
+  } catch (error) {
+    console.warn('Failed to delete synced book data:', error);
+  }
+};
 
 export async function deleteBook(
   fs: FileSystem,
@@ -59,6 +81,16 @@ export async function deleteBook(
       }
     }
 
+    // An offline Audiobookshelf download keeps its tracks beside the book
+    // (#6256); purge already wiped the whole directory above.
+    if (book.format === 'ABS' && deleteAction !== 'purge') {
+      const offlineDir = getAbsOfflineDir(book.hash);
+      if (await fs.exists(offlineDir, 'Books')) {
+        await fs.removeDir(offlineDir, 'Books', true);
+      }
+    }
+    book.absDownloadedAt = null;
+
     if (deleteAction === 'both' && (await fs.exists(getCoverFilename(book), 'Books'))) {
       await fs.removeFile(getCoverFilename(book), 'Books');
     }
@@ -83,6 +115,7 @@ export async function deleteBook(
         console.log('Failed to delete uploaded file:', error);
       }
     }
+    void purgeCloudBookData(book.hash);
     book.uploadedAt = null;
   }
 }
@@ -96,11 +129,12 @@ export async function uploadFileToCloud(
   handleProgress: ProgressHandler,
   hash: string,
   temp: boolean = false,
+  media?: string,
 ): Promise<string | undefined> {
   console.log('Uploading file:', lfp, 'to', cfp);
   const file = await fs.openFile(lfp, base, cfp);
   const localFullpath = await resolveFilePath(lfp, base);
-  const downloadUrl = await uploadFile(file, localFullpath, handleProgress, hash, temp);
+  const downloadUrl = await uploadFile(file, localFullpath, handleProgress, hash, temp, media);
   const f = file as ClosableFile;
   if (f && f.close) {
     await f.close();
@@ -220,6 +254,7 @@ export async function uploadBook(
   completedFiles.count++;
 
   book.deletedAt = null;
+  book.fileSyncDeletionRequestedAt = null;
   book.updatedAt = Date.now();
   book.uploadedAt = Date.now();
   book.downloadedAt = Date.now();
@@ -293,6 +328,10 @@ export async function downloadBookCovers(
         }
       } catch (error) {
         console.log(`Failed to download cover file for book: '${file.lfp}'`, error);
+        // The sync still adopts the new cover hash, so mark the cover as not
+        // downloaded or it is never fetched again (#6816).
+        const book = booksLfps.get(file.lfp);
+        if (book) book.coverDownloadedAt = null;
       }
     }),
   );

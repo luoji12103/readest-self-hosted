@@ -2,6 +2,7 @@ local DataStorage = require("datastorage")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local SQ3 = require("lua-ljsqlite3/init")
+local SyncError = require("readest_syncerror")
 local logger = require("logger")
 local _ = require("readest_i18n")
 
@@ -159,6 +160,14 @@ function SyncStats:applyRemote(books, pages, live_book_id)
     conn:close()
 end
 
+-- Page events per push request. A large backlog (e.g. a fresh push cursor
+-- after pulling the full multi-device history, #5666) cannot go out as one
+-- request: the sync client's 10s total socket timeout kills it, the cursor
+-- never advances, and every retry re-sends the same payload — wedging "Push
+-- stats now" forever. Mirrors PUSH_CHUNK in the app's statsSync.ts and the
+-- server's stat_pages batch size.
+local PUSH_CHUNK = 500
+
 function SyncStats:push(settings, client, interactive)
     -- `settings` is the plain readest_sync data table (see main.lua:init), so
     -- the cursor is a field; persist by saving the whole table back to
@@ -175,79 +184,142 @@ function SyncStats:push(settings, client, interactive)
         end
         return
     end
-    local max_start = cursor
-    for _, p in ipairs(pages) do if p.start_time > max_start then max_start = p.start_time end end
-    logger.dbg("ReadestStats push: dispatching " .. #pages .. " page(s); new cursor would be "
-        .. tostring(max_start))
-    -- pushChanges declares books/notes/configs as required_params (shared /sync
-    -- POST contract, readest-sync-api.json); include them empty so Spore sends
-    -- the request — the server defaults each to [] and processes statBooks/
-    -- statPages independently (apps/readest-app/src/pages/api/sync.ts).
-    client:pushChanges(
-        { books = {}, notes = {}, configs = {}, statBooks = books, statPages = pages },
-        function(success, body, status)
-            logger.dbg("ReadestStats push: response success=" .. tostring(success)
-                .. " status=" .. tostring(status))
-            if success then
-                settings.stats_push_cursor = max_start
-                G_reader_settings:saveSetting("readest_sync", settings)
-                logger.dbg("ReadestStats push: cursor advanced to " .. tostring(max_start))
-                if interactive then
-                    UIManager:show(InfoMessage:new{ text = _("Reading statistics pushed"), timeout = 2 })
-                end
-            else
-                logger.dbg("ReadestStats push: failed, cursor unchanged; body=" .. tostring(body))
-                if interactive then
-                    UIManager:show(InfoMessage:new{ text = _("Failed to push reading statistics"), timeout = 2 })
-                end
+    local book_by_hash = {}
+    for _, b in ipairs(books) do book_by_hash[b.book_hash] = b end
+    local function pushFrom(i)
+        if i > #pages then
+            logger.dbg("ReadestStats push: all " .. #pages .. " page(s) pushed")
+            if interactive then
+                UIManager:show(InfoMessage:new{ text = _("Reading statistics pushed"), timeout = 2 })
             end
-        end)
+            return
+        end
+        local last = math.min(i + PUSH_CHUNK - 1, #pages)
+        -- Never split a start_time across chunks (pages are ordered by
+        -- start_time): advancing the cursor past it would drop the remaining
+        -- same-second events on resume.
+        while last < #pages and pages[last + 1].start_time == pages[last].start_time do
+            last = last + 1
+        end
+        local chunk_pages, chunk_books, seen = {}, {}, {}
+        for j = i, last do
+            local p = pages[j]
+            table.insert(chunk_pages, p)
+            local b = p.book_hash and book_by_hash[p.book_hash]
+            if b and not seen[p.book_hash] then
+                seen[p.book_hash] = true
+                table.insert(chunk_books, b)
+            end
+        end
+        logger.dbg("ReadestStats push: dispatching pages " .. i .. ".." .. last
+            .. " of " .. #pages)
+        -- pushChanges declares books/notes/configs as required_params (shared
+        -- /sync POST contract, readest-sync-api.json); include them empty so
+        -- Spore sends the request — the server defaults each to [] and
+        -- processes statBooks/statPages independently
+        -- (apps/readest-app/src/pages/api/sync.ts).
+        client:pushChanges(
+            { books = {}, notes = {}, configs = {}, statBooks = chunk_books, statPages = chunk_pages },
+            function(success, body, status)
+                logger.dbg("ReadestStats push: response success=" .. tostring(success)
+                    .. " status=" .. tostring(status))
+                if success then
+                    settings.stats_push_cursor = pages[last].start_time
+                    G_reader_settings:saveSetting("readest_sync", settings)
+                    logger.dbg("ReadestStats push: cursor advanced to "
+                        .. tostring(settings.stats_push_cursor))
+                    -- nextTick so the next chunk starts from the event loop:
+                    -- chaining inside the callback would nest a coroutine
+                    -- resume per chunk on the synchronous (non-Turbo) HTTP
+                    -- path and could blow the C stack on a huge backlog.
+                    UIManager:nextTick(function() pushFrom(last + 1) end)
+                else
+                    logger.dbg("ReadestStats push: failed, cursor kept at "
+                        .. tostring(settings.stats_push_cursor) .. "; body=" .. tostring(body))
+                    if interactive and not (type(body) == "table" and body.auth_required) then
+                        UIManager:show(InfoMessage:new{
+                            text = SyncError.withDetail(_("Failed to push reading statistics"), body, status),
+                            timeout = 5,
+                        })
+                    end
+                end
+            end)
+    end
+    pushFrom(1)
 end
 
-function SyncStats:pull(settings, client, interactive, logout_fn, ui)
-    local since = settings.stats_pull_cursor or 0
-    logger.dbg("ReadestStats pull: since=" .. tostring(since)
+-- Page events per pull request. The server pages stat_pages by updated_at and
+-- completes the trailing millisecond of each page, so a strict
+-- `since = cursor` next request never skips rows that share an updated_at
+-- (same contract as PULL_PAGE in the app's statsSync.ts). A full multi-device
+-- history would otherwise come back as one multi-MB response under the sync
+-- client's 10s total socket timeout: the pull-side twin of #5666, failing
+-- forever without ever advancing the cursor. Paging also keeps every
+-- applyRemote transaction bounded on the device.
+local PULL_PAGE = 1000
+
+function SyncStats:pull(settings, client, interactive, ui)
+    logger.dbg("ReadestStats pull: since=" .. tostring(settings.stats_pull_cursor or 0)
         .. " interactive=" .. tostring(interactive))
-    -- pullChanges requires since/type/book/meta_hash params (readest-sync-api.json).
-    client:pullChanges(
-        { since = since, type = "stats", book = "", meta_hash = "" },
-        function(success, response, status)
-            logger.dbg("ReadestStats pull: response success=" .. tostring(success)
-                .. " status=" .. tostring(status))
-            if not success then
-                if status == 401 or status == 403 then
-                    if logout_fn then logout_fn() end
+    local total_pages = 0
+    local function pullFrom(since)
+        -- pullChanges requires since/type/book/meta_hash params and accepts
+        -- limit (readest-sync-api.json).
+        client:pullChanges(
+            { since = since, type = "stats", book = "", meta_hash = "", limit = PULL_PAGE },
+            function(success, response, status)
+                logger.dbg("ReadestStats pull: response success=" .. tostring(success)
+                    .. " status=" .. tostring(status))
+                if not success then
+                    if type(response) == "table" and response.auth_required then return end -- auth wrapper owns the prompt
+                    -- Pages already applied stay applied and the cursor stays
+                    -- at the last successful page, so a retry resumes there.
+                    if interactive then
+                        UIManager:show(InfoMessage:new{
+                            text = SyncError.withDetail(_("Failed to pull reading statistics"), response, status),
+                            timeout = 5,
+                        })
+                    end
+                    return
+                end
+                local nbooks = response and response.statBooks and #response.statBooks or 0
+                local npages = response and response.statPages and #response.statPages or 0
+                logger.dbg("ReadestStats pull: applying statBooks=" .. nbooks .. " statPages=" .. npages
+                    .. " since=" .. tostring(since))
+                -- Resolved inside the callback so it reflects the session state
+                -- at apply time, after the async network round-trip.
+                local live_book_id = ui and ui.statistics and ui.statistics.id_curr_book or nil
+                self:applyRemote(response.statBooks, response.statPages, live_book_id)
+                total_pages = total_pages + npages
+                local newest = since
+                for _, p in ipairs(response.statPages or {}) do
+                    local u = tonumber(p.updated_at_ms) or 0
+                    if u > newest then newest = u end
+                end
+                if newest > since then
+                    settings.stats_pull_cursor = newest
+                    G_reader_settings:saveSetting("readest_sync", settings)
+                    logger.dbg("ReadestStats pull: cursor advanced to " .. tostring(newest))
+                else
+                    logger.dbg("ReadestStats pull: cursor unchanged (no newer rows)")
+                end
+                -- A full page means more may follow; a short page (or no cursor
+                -- progress) means we have caught up. nextTick so the next page
+                -- starts from the event loop: chaining inside the callback would
+                -- nest a coroutine resume per page on the synchronous (non-Turbo)
+                -- HTTP path and could blow the C stack on a huge history.
+                if npages >= PULL_PAGE and newest > since then
+                    UIManager:nextTick(function() pullFrom(newest) end)
+                    return
                 end
                 if interactive then
-                    UIManager:show(InfoMessage:new{ text = _("Failed to pull reading statistics"), timeout = 2 })
+                    local text = total_pages > 0 and _("Reading statistics pulled")
+                        or _("Reading statistics are up to date")
+                    UIManager:show(InfoMessage:new{ text = text, timeout = 2 })
                 end
-                return
-            end
-            local nbooks = response and response.statBooks and #response.statBooks or 0
-            local npages = response and response.statPages and #response.statPages or 0
-            logger.dbg("ReadestStats pull: applying statBooks=" .. nbooks .. " statPages=" .. npages)
-            -- Resolved inside the callback so it reflects the session state
-            -- at apply time, after the async network round-trip.
-            local live_book_id = ui and ui.statistics and ui.statistics.id_curr_book or nil
-            self:applyRemote(response.statBooks, response.statPages, live_book_id)
-            local newest = since
-            for _, p in ipairs(response.statPages or {}) do
-                local u = tonumber(p.updated_at_ms) or 0
-                if u > newest then newest = u end
-            end
-            if newest > since then
-                settings.stats_pull_cursor = newest
-                G_reader_settings:saveSetting("readest_sync", settings)
-                logger.dbg("ReadestStats pull: cursor advanced to " .. tostring(newest))
-            else
-                logger.dbg("ReadestStats pull: cursor unchanged (no newer rows)")
-            end
-            if interactive then
-                local text = npages > 0 and _("Reading statistics pulled")
-                    or _("Reading statistics are up to date")
-                UIManager:show(InfoMessage:new{ text = text, timeout = 2 })
-            end
-        end)
+            end)
+    end
+    pullFrom(settings.stats_pull_cursor or 0)
 end
 
 return SyncStats

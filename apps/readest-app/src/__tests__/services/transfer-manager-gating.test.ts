@@ -92,6 +92,9 @@ const settingsNotLoaded = (): void => {
 const webdavSelected = (): void =>
   settingsLoaded({ webdav: { enabled: true } } as Partial<SystemSettings>);
 
+const booksSyncOff = (): void =>
+  settingsLoaded({ syncCategories: { book: false } } as Partial<SystemSettings>);
+
 function makeAppService(overrides: Record<string, unknown> = {}) {
   return {
     uploadBook: vi.fn().mockResolvedValue(undefined),
@@ -177,6 +180,68 @@ describe('provider gating of book uploads', () => {
       'Data' as never,
     );
     expect(replicaId).toBeTruthy();
+  });
+});
+
+describe('Books sync category gating of book uploads', () => {
+  // A cloud file is only reachable through its `books` row, and that row is
+  // pushed only while Books sync is on. Uploading with it off stored files
+  // that no other device could ever list, while still spending quota.
+  test('queueUpload returns null when Books sync is off', async () => {
+    booksSyncOff();
+    await initManager();
+
+    const id = transferManager.queueUpload(makeBook());
+    expect(id).toBeNull();
+    expect(Object.keys(useTransferStore.getState().transfers)).toHaveLength(0);
+  });
+
+  test('turning Books sync off policy-cancels pending book uploads', async () => {
+    await initManager();
+    useTransferStore.getState().pauseQueue();
+    const id = transferManager.queueUpload(makeBook())!;
+
+    booksSyncOff();
+    await flushAsync();
+
+    const transfer = useTransferStore.getState().transfers[id];
+    expect(transfer?.status).toBe('cancelled');
+    expect(transfer?.cancelReason).toBe('policy');
+  });
+
+  test('isBookUploadAllowed reflects the Books sync category', () => {
+    settingsLoaded();
+    expect(transferManager.isBookUploadAllowed()).toBe(true);
+    booksSyncOff();
+    expect(transferManager.isBookUploadAllowed()).toBe(false);
+  });
+});
+
+describe('ABS books never enter the cloud file transfer queue', () => {
+  test('queueUpload returns null for an ABS book even with Readest Cloud selected', async () => {
+    await initManager();
+
+    const id = transferManager.queueUpload(makeBook({ format: 'ABS' }));
+    expect(id).toBeNull();
+    expect(Object.keys(useTransferStore.getState().transfers)).toHaveLength(0);
+  });
+
+  test('queueDownload returns null for an ABS book', async () => {
+    await initManager();
+
+    const id = transferManager.queueDownload(makeBook({ format: 'ABS' }));
+    expect(id).toBeNull();
+    expect(Object.keys(useTransferStore.getState().transfers)).toHaveLength(0);
+  });
+
+  test('queueBatchUploads drops ABS books but still queues the rest', async () => {
+    await initManager();
+
+    const ids = transferManager.queueBatchUploads([
+      makeBook({ format: 'ABS' }),
+      makeBook({ hash: 'hash2' }),
+    ]);
+    expect(ids).toHaveLength(1);
   });
 });
 

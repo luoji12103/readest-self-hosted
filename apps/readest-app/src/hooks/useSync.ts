@@ -3,6 +3,8 @@ import { useRouter } from 'next/navigation';
 import { useEnv } from '@/context/EnvContext';
 import { useSyncContext } from '@/context/SyncContext';
 import { SyncData, SyncOp, SyncResult, SyncType } from '@/libs/sync';
+import { recordFlow } from '@/services/sync/dataFlow/log';
+import type { FlowDirection } from '@/services/sync/dataFlow/types';
 import { isSyncCategoryEnabled } from '@/services/sync/syncCategories';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useBookDataStore } from '@/store/bookDataStore';
@@ -55,6 +57,71 @@ export const countSyncedRecords = (
   if (!records?.length) return 0;
   return records.filter((rec) => !rec.deleted_at && (type !== 'books' || !!rec.uploaded_at)).length;
 };
+
+const FLOW_KINDS = { books: 'books', configs: 'progress', notes: 'notes' } as const;
+
+// Book rows are metadata: their files are counted by the transfer manager.
+const recordCloudFlow = (
+  direction: FlowDirection,
+  type: SyncType,
+  count: number,
+  error?: string,
+) => {
+  if (type === 'stats') return;
+  const kind = FLOW_KINDS[type];
+  const entries = type === 'books' ? 0 : count;
+  recordFlow({ connector: 'readest-cloud', direction, kind, count: entries, error });
+};
+
+export const BOOKS_PULL_PAGE_SIZE = 1000;
+
+/**
+ * Pull the books delta in bounded pages: a delta grown to a whole 10k-book
+ * library in one response exceeded Cloudflare Worker limits (error 1102) and
+ * wedged the device — the pull failed forever and the cursor never advanced.
+ * The server orders each page by synced_at ascending and completes it to the
+ * trailing timestamp, so advancing the cursor to the newest row seen never
+ * skips rows; the millisecond-truncated cursor can re-return boundary rows,
+ * deduped here with last-wins. A page shorter than the limit — or a cursor
+ * that cannot advance — ends the walk. `onPage` runs after each page so the
+ * caller can persist the cursor and an interrupted initial sync resumes
+ * instead of restarting.
+ */
+export async function pullBooksPaged(
+  pull: (since: number, limit: number) => Promise<BookDataRecord[] | null | undefined>,
+  since: number,
+  onPage?: (cursor: number) => void,
+  pageSize = BOOKS_PULL_PAGE_SIZE,
+): Promise<BookDataRecord[]> {
+  const byHash = new Map<string, BookDataRecord>();
+  let cursor = since;
+  for (;;) {
+    let page: BookDataRecord[];
+    try {
+      page = (await pull(cursor, pageSize)) ?? [];
+    } catch (err) {
+      // A failed FIRST page delivered nothing — let the caller handle it
+      // (auth redirect, error surface). A failed LATER page must not discard
+      // the pages already pulled: the cursor persisted by onPage has advanced
+      // past them, so dropping them here would skip their rows forever. Keep
+      // the partial delta — it matches the cursor — and resume next sync.
+      if (cursor === since) throw err;
+      break;
+    }
+    for (const rec of page) {
+      byHash.set(rec.book_hash ?? rec.id, rec);
+    }
+    const pageMax = computeMaxTimestamp(page);
+    if (pageMax > cursor) {
+      cursor = pageMax;
+      onPage?.(cursor);
+    } else if (page.length > 0) {
+      break;
+    }
+    if (page.length < pageSize) break;
+  }
+  return [...byHash.values()];
+}
 
 const ONE_DAY_IN_MS = 24 * 60 * 60 * 1000;
 export function useSync(bookKey?: string) {
@@ -115,6 +182,20 @@ export function useSync(bookKey?: string) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bookKey, settings, config]);
 
+  /** Newest change this device already had before a sync, from the live store. */
+  const lastSeenAt = (type: SyncType, bookId?: string) => {
+    const latest = useSettingsStore.getState().settings;
+    // The live config: a push moments ago moved lastPushedAt, and a pull brings
+    // this device's own push back, since the server doesn't tell devices apart.
+    const book = bookId && bookKey ? getConfig(bookKey) : null;
+    if (type === 'configs') {
+      if (!bookId) return latest.lastSyncedAtConfigs ?? 0;
+      return Math.max(book?.lastSyncedAtConfig ?? 0, book?.lastPushedAtConfig ?? 0);
+    }
+    if (!bookId) return latest.lastSyncedAtNotes ?? 0;
+    return Math.max(book?.lastSyncedAtNotes ?? 0, book?.lastPushedAtNotes ?? 0);
+  };
+
   // bookId is for configs and notes only, if bookId is provided, only pull changes for that book
   // and update the lastSyncedAt for that book in the book config
   const pullChanges = async (
@@ -129,13 +210,32 @@ export function useSync(bookKey?: string) {
     setSyncError(null);
 
     try {
-      const result = await syncClient.pullChanges(since, type, bookId, metaHash);
-      const resultAsRecord = result as unknown as Record<
-        string,
-        BookDataRecord[] | null | undefined
-      >;
-      setSyncResult({ ...syncResult, [type]: resultAsRecord[type] });
-      const records = resultAsRecord[type];
+      let records: BookDataRecord[] | null | undefined;
+      if (type === 'books' && !bookId && !metaHash) {
+        records = await pullBooksPaged(
+          async (cursor, limit) => {
+            const result = await syncClient.pullChanges(cursor, type, undefined, undefined, limit);
+            return (result as unknown as Record<string, BookDataRecord[] | null | undefined>)[type];
+          },
+          since,
+          (cursor) => {
+            // Persist the cursor per page so an interrupted initial sync
+            // resumes from the last page instead of restarting from `since`.
+            setLastSyncedAt(cursor);
+            const settings = useSettingsStore.getState().settings;
+            settings.lastSyncedAtBooks = cursor;
+            setSettings(settings);
+          },
+        );
+      } else {
+        const result = await syncClient.pullChanges(since, type, bookId, metaHash);
+        records = (result as unknown as Record<string, BookDataRecord[] | null | undefined>)[type];
+      }
+      setSyncResult({ ...syncResult, [type]: records });
+      // A pull looks back further than the cursor, so it brings records again.
+      const seenUpTo = lastSeenAt(type, bookId);
+      const newRecords = records?.filter((rec) => computeMaxTimestamp([rec]) > seenUpTo);
+      recordCloudFlow('pull', type, countSyncedRecords(type, newRecords));
       if (since > 1000 && !records?.length) return 0;
       // For since <= 1000, we set lastSyncedAt to now if no records returned
       const maxTime = records?.length ? computeMaxTimestamp(records) : Date.now();
@@ -169,6 +269,12 @@ export function useSync(bookKey?: string) {
       return countSyncedRecords(type, records);
     } catch (err: unknown) {
       console.error(err);
+      recordCloudFlow(
+        'pull',
+        type,
+        0,
+        err instanceof Error ? err.message : `Error pulling ${type}`,
+      );
       if (err instanceof Error) {
         // Read live store settings, not the stale hook closure (see below).
         const latest = useSettingsStore.getState().settings;
@@ -197,13 +303,22 @@ export function useSync(bookKey?: string) {
   const pushChanges = async (payload: SyncData): Promise<boolean> => {
     setSyncing(true);
     setSyncError(null);
+    const pushedTypes = (['books', 'configs', 'notes'] as const).filter((type) => payload[type]);
 
     try {
       const result = await syncClient.pushChanges(payload);
       setSyncResult(result);
+      for (const type of pushedTypes) {
+        const seenUpTo = lastSeenAt(type, bookKey);
+        const rows = (payload[type] ?? []) as { updatedAt?: number }[];
+        const changed = rows.filter((row) => (row.updatedAt ?? seenUpTo + 1) > seenUpTo);
+        recordCloudFlow('push', type, changed.length);
+      }
       return true;
     } catch (err: unknown) {
       console.error(err);
+      const message = err instanceof Error ? err.message : 'Error pushing changes';
+      for (const type of pushedTypes) recordCloudFlow('push', type, 0, message);
       if (err instanceof Error) {
         setSyncError(err.message || 'Error pushing changes');
       } else {
@@ -265,8 +380,9 @@ export function useSync(bookKey?: string) {
     async (bookNotes?: BookNote[], bookId?: string, metaHash?: string, op: SyncOp = 'both') => {
       if (!lastSyncedAtInited) return;
       if (!isSyncCategoryEnabled('note')) return;
+      let pushed: boolean | undefined;
       if ((op === 'push' || op === 'both') && bookNotes?.length) {
-        const pushed = await pushChanges({ notes: bookNotes });
+        pushed = await pushChanges({ notes: bookNotes });
         if (pushed && bookId && bookKey) {
           setConfig(bookKey, { lastPushedAtNotes: Date.now() });
         }
@@ -281,6 +397,7 @@ export function useSync(bookKey?: string) {
           metaHash,
         );
       }
+      return pushed;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [lastSyncedAtInited, lastSyncedAtNotes],

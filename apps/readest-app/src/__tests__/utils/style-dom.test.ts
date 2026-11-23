@@ -20,12 +20,17 @@ import type { ThemeCode } from '@/utils/style';
 import {
   applyThemeModeClass,
   applyScrollModeClass,
+  applyEinkModeAttribute,
   applyScrollbarStyle,
   applyTranslationStyle,
   getThemeCode,
   getStyles,
   applyImageStyle,
+  applyNamespacedAttributes,
   keepTextAlignment,
+  applyLinkHitArea,
+  LINK_HIT_AREA_CLASS,
+  MAX_ENLARGED_LINKS,
 } from '@/utils/style';
 import {
   DEFAULT_BOOK_FONT,
@@ -105,6 +110,38 @@ describe('applyScrollModeClass', () => {
     document.body.className = '';
     applyScrollModeClass(document, false);
     expect(document.body.classList.contains('paginated-mode')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyEinkModeAttribute (#5795)
+// ---------------------------------------------------------------------------
+describe('applyEinkModeAttribute', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('data-eink');
+  });
+
+  it("sets data-eink='true' on the book document root when e-ink mode is on", () => {
+    applyEinkModeAttribute(document, true);
+    expect(document.documentElement.getAttribute('data-eink')).toBe('true');
+  });
+
+  it("writes data-eink='false' rather than removing it so LCD-only rules can match", () => {
+    applyEinkModeAttribute(document, true);
+    applyEinkModeAttribute(document, false);
+    expect(document.documentElement.getAttribute('data-eink')).toBe('false');
+    expect(document.body.matches("html[data-eink='false'] body")).toBe(true);
+  });
+
+  it('lets a synced user stylesheet gate rules on the rendering screen', () => {
+    const p = document.createElement('p');
+    document.body.appendChild(p);
+    const einkOnly = "html[data-eink='true'] body *";
+    applyEinkModeAttribute(document, true);
+    expect(p.matches(einkOnly)).toBe(true);
+    applyEinkModeAttribute(document, false);
+    expect(p.matches(einkOnly)).toBe(false);
+    p.remove();
   });
 });
 
@@ -243,6 +280,27 @@ describe('getThemeCode', () => {
     localStorage.setItem('systemIsDarkMode', 'false');
     const code = getThemeCode();
     expect(code.isDarkMode).toBe(false);
+  });
+
+  it('uses ambientIsDarkMode when themeMode is ambient', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('ambientIsDarkMode', 'true');
+    localStorage.setItem('systemIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(true);
+
+    localStorage.setItem('ambientIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(false);
+  });
+
+  // themeStore seeds ambientIsDarkMode from the system appearance until the
+  // first lux reading persists a value. getThemeCode has to agree, or the app
+  // chrome and the book content disagree on the very first launch in ambient
+  // mode.
+  it('falls back to systemIsDarkMode when no ambient reading was persisted', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('systemIsDarkMode', 'true');
+    localStorage.removeItem('ambientIsDarkMode');
+    expect(getThemeCode().isDarkMode).toBe(true);
   });
 
   it('falls back to default theme when custom themeColor not found', () => {
@@ -472,6 +530,24 @@ describe('applyImageStyle', () => {
     expect(img.style.height).toBeTruthy();
   });
 
+  it('preserves aspect ratio with object-fit: contain when both width and height percentages are specified', () => {
+    document.body.innerHTML = '<div><img width="100%" height="100%" /></div>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.hasAttribute('width')).toBe(false);
+    expect(img.hasAttribute('height')).toBe(false);
+    expect(img.style.objectFit).toBe('contain');
+  });
+
+  it('uses --available-height for %-based height calculation when defined', () => {
+    document.documentElement.style.setProperty('--available-height', '800');
+    document.body.innerHTML = '<div><img height="50%" /></div>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.style.height).toBe('400px');
+    document.documentElement.style.removeProperty('--available-height');
+  });
+
   it('does not convert pixel-based width attributes', () => {
     document.body.innerHTML = '<div><img width="200" /></div>';
     applyImageStyle(document);
@@ -522,6 +598,76 @@ describe('applyImageStyle', () => {
     const img = document.querySelector('img')!;
     expect(img.classList.contains('has-text-siblings')).toBe(true);
     expect(img.classList.contains('has-text-siblings-baseline')).toBe(false);
+  });
+
+  it('sets pointer-events: none on img[zy-enlarge-src="none"] and keeps the attribute', () => {
+    document.body.innerHTML = '<img zy-enlarge-src="none" src="a.png" />';
+
+    applyImageStyle(document);
+
+    const img = document.querySelector('img')!;
+    expect(img.getAttribute('zy-enlarge-src')).toBe('none');
+    expect(img.style.pointerEvents).toBe('none');
+  });
+
+  it('leaves img[zy-enlarge-src="self"] without pointer-events changes', () => {
+    document.body.innerHTML = `
+      <img zy-enlarge-src="self" src="a.png"/>
+      <img src="b.png"/>
+    `;
+
+    applyImageStyle(document);
+
+    document.querySelectorAll('img').forEach((img) => {
+      expect(img.style.pointerEvents).toBe('');
+    });
+  });
+
+  // :only-child ignores text nodes, so a selector like
+  // p:has(> a:only-child > img:only-child) also matched a body paragraph with
+  // a footnote icon (<a class="duokan-footnote"><img></a>) and dropped its
+  // indent.
+  it('exempts paragraphs that start with an image from the indent, not text paragraphs with an inline image', () => {
+    document.body.innerHTML = `
+      <p id="figure"><img src="a.png"/></p>
+      <p id="linked"><a href="#"><img src="a.png"/></a></p>
+      <p id="wrapped"><span><a href="#"><img src="a.png"/></a></span></p>
+      <p id="captioned"><a id="anchor"></a><img src="a.png"/><br/>Caption</p>
+      <p id="dropcap"><img src="d.png"/>ext</p>
+      <p id="footnote">Text<a class="duokan-footnote" href="#"><img src="n.png"/></a>more text</p>
+      <p id="footnote-end">Text<a class="duokan-footnote" href="#"><img src="n.png"/></a></p>
+      <p id="icon">Text<span><img src="i.png"/></span></p>
+      <p id="text-break">Text<br/><img src="a.png"/></p>
+      <p id="text-anchor">Text<a id="anchor2"></a><img src="a.png"/></p>
+    `;
+    applyImageStyle(document);
+
+    const css = getStyles(makeViewSettings({ textIndent: 2 }));
+    const block = css.split('}').find((b) => b.includes('(#6198)'))!;
+    const selector = block.slice(block.lastIndexOf('*/') + 2, block.indexOf('{'));
+    const exempt = Array.from(document.querySelectorAll(selector)).map((p) => p.id);
+
+    expect(exempt).toEqual(['figure', 'linked', 'wrapped', 'captioned', 'dropcap']);
+  });
+});
+
+describe('applyLinkHitArea', () => {
+  const links = (n: number) => '<a href="#x">1</a>'.repeat(n);
+
+  beforeEach(() => {
+    document.documentElement.classList.remove(LINK_HIT_AREA_CLASS);
+  });
+
+  it('opts a document with up to MAX_ENLARGED_LINKS links in', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(true);
+  });
+
+  it('leaves a document with more links than MAX_ENLARGED_LINKS out', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS + 1);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(false);
   });
 });
 
@@ -581,5 +727,135 @@ describe('keepTextAlignment', () => {
     expect(document.querySelector('p')!.classList.contains('aligned-center')).toBe(true);
     expect(document.querySelector('div')!.classList.contains('aligned-right')).toBe(true);
     expect(document.querySelector('blockquote')!.classList.contains('aligned-justify')).toBe(true);
+  });
+
+  it('skips the hidden placeholders of a chunked section', () => {
+    // A chunk of a huge section keeps one empty placeholder per top-level
+    // element outside it (foliate-js section-chunks.js): tens of thousands
+    // of them in a single-file book, none of which is ever shown.
+    document.body.innerHTML = `
+      <p data-foliate-chunk="0"></p>
+      <p style="text-align: center;">centered</p>
+      <div data-foliate-chunk="2"></div>
+    `;
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    keepTextAlignment(document);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+    expect(document.querySelector('p:not([data-foliate-chunk])')!.classList).toContain(
+      'aligned-center',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyNamespacedAttributes
+
+describe('applyNamespacedAttributes', () => {
+  const OPS = 'http://www.idpf.org/2007/ops';
+
+  // Sections reach the iframe through `srcdoc`, so they are always parsed as
+  // HTML no matter what the EPUB declares.
+  const parseAsSrcdoc = (body: string, root = 'xmlns:epub="http://www.idpf.org/2007/ops"') =>
+    new DOMParser().parseFromString(
+      `<html xmlns="http://www.w3.org/1999/xhtml" ${root}><body>${body}</body></html>`,
+      'text/html',
+    );
+
+  it('re-attaches the declared namespace to a prefixed attribute (#6038)', () => {
+    const doc = parseAsSrcdoc('<div epub:type="chapter">The Swans.</div>');
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS(OPS, 'type')).toBeNull();
+
+    applyNamespacedAttributes(doc);
+
+    expect(div.getAttributeNS(OPS, 'type')).toBe('chapter');
+  });
+
+  it('keeps the qualified-name lookup working', () => {
+    const doc = parseAsSrcdoc('<aside epub:type="footnote">note</aside>');
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('aside')!.getAttribute('epub:type')).toBe('footnote');
+  });
+
+  it('leaves a prefix the document never declared alone', () => {
+    const doc = parseAsSrcdoc('<div ops:type="chapter">x</div>');
+    applyNamespacedAttributes(doc);
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS(OPS, 'type')).toBeNull();
+    expect(div.getAttribute('ops:type')).toBe('chapter');
+  });
+
+  it('matches the namespace URI rather than the prefix the book chose', () => {
+    const doc = parseAsSrcdoc(
+      '<div ops:type="chapter">x</div>',
+      'xmlns:ops="http://www.idpf.org/2007/ops"',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('div')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+  });
+
+  it('restores the standard EPUB namespace when a section fragment lost its declaration', () => {
+    const doc = parseAsSrcdoc('<a epub:type="noteref">1</a>', '');
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('a')!.getAttributeNS(OPS, 'type')).toBe('noteref');
+  });
+
+  it('uses the EPUB fallback alongside an unrelated namespace declaration', () => {
+    const doc = parseAsSrcdoc(
+      '<section xmlns:svg="http://www.w3.org/2000/svg"><a epub:type="noteref">1</a></section>',
+      '',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('a')!.getAttributeNS(OPS, 'type')).toBe('noteref');
+  });
+
+  // The `xml` prefix is bound by the XML spec itself and never declared with
+  // `xmlns:xml`, so a book's `@namespace xml` + `[xml|lang="en"]` rule needs
+  // the implicit binding restored the same way.
+  it('binds the implicit xml prefix so [xml|lang] selectors can match', () => {
+    const doc = parseAsSrcdoc('<div xml:lang="en">x</div>', '');
+    applyNamespacedAttributes(doc);
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS('http://www.w3.org/XML/1998/namespace', 'lang')).toBe('en');
+    expect(div.getAttribute('xml:lang')).toBe('en');
+  });
+
+  it('leaves xmlns declarations untouched', () => {
+    const doc = parseAsSrcdoc('<div>x</div>');
+    applyNamespacedAttributes(doc);
+    const html = doc.documentElement;
+    expect(html.getAttribute('xmlns:epub')).toBe(OPS);
+    expect(html.getAttributeNS('http://www.w3.org/2000/xmlns/', 'epub')).toBeNull();
+  });
+
+  it('does not let a declaration reach a sibling that is out of its scope', () => {
+    const doc = parseAsSrcdoc(
+      '<section xmlns:epub="http://www.idpf.org/2007/ops"><div id="a" epub:type="chapter"></div></section>' +
+        '<section><div id="b" epub:type="chapter"></div></section>',
+      '',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('#a')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+    expect(doc.querySelector('#b')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+  });
+
+  it('restores the outer binding once a rebinding subtree ends', () => {
+    const OTHER = 'http://example.com/ns';
+    const doc = parseAsSrcdoc(
+      `<span xmlns:epub="${OTHER}"><i id="deep" epub:type="note"></i></span>` +
+        '<i id="after" epub:type="chapter"></i>',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('#deep')!.getAttributeNS(OTHER, 'type')).toBe('note');
+    expect(doc.querySelector('#after')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+    expect(doc.querySelector('#after')!.getAttributeNS(OTHER, 'type')).toBeNull();
+  });
+
+  it('is a no-op for a document that declares no prefix', () => {
+    const doc = parseAsSrcdoc('<div class="chapter">x</div>', '');
+    const before = doc.body.innerHTML;
+    applyNamespacedAttributes(doc);
+    expect(doc.body.innerHTML).toBe(before);
   });
 });

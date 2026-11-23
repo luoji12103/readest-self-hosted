@@ -9,6 +9,7 @@ import {
 } from 'react-icons/io5';
 import Dialog from '@/components/Dialog';
 import SegmentedControl from '@/components/SegmentedControl';
+import { recordFlow } from '@/services/sync/dataFlow/log';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
@@ -109,6 +110,21 @@ const ShareBookDialog: React.FC<ShareBookDialogProps> = ({ isOpen, book, cfi, on
           await appService.uploadBook(book, (progress) => {
             setUploadProgress((progress.progress / progress.total) * 100);
           });
+          recordFlow({
+            connector: 'readest-cloud',
+            direction: 'push',
+            kind: 'books',
+            bookTitle: book.title,
+          });
+        } catch (error) {
+          recordFlow({
+            connector: 'readest-cloud',
+            direction: 'push',
+            kind: 'books',
+            bookTitle: book.title,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
         } finally {
           setUploadProgress(null);
         }
@@ -241,7 +257,7 @@ const ShareBookDialog: React.FC<ShareBookDialogProps> = ({ isOpen, book, cfi, on
       title={_('Share Book')}
       onClose={onClose}
       boxClassName='sm:min-w-[460px] sm:max-w-[460px] sm:h-auto sm:max-h-[90%]'
-      contentClassName='!px-6 !py-4'
+      contentClassName='px-6! py-4!'
     >
       <div className='flex flex-col gap-5 pt-2'>
         {/* Hero: cover + metadata. Cover gets a real shadow so it reads as a
@@ -355,7 +371,7 @@ const ShareBookDialog: React.FC<ShareBookDialogProps> = ({ isOpen, book, cfi, on
                 readOnly
                 value={created.url}
                 aria-label={_('Share URL')}
-                className='text-base-content min-w-0 flex-1 bg-transparent font-mono text-xs outline-none'
+                className='text-base-content min-w-0 flex-1 bg-transparent font-mono text-xs outline-hidden'
                 onFocus={(e) => e.currentTarget.select()}
               />
               <button

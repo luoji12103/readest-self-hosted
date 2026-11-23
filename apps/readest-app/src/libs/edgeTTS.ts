@@ -1,36 +1,26 @@
 import { md5 } from 'js-md5';
 import WebSocket from 'isomorphic-ws';
+import type TauriWebSocketConnection from '@tauri-apps/plugin-websocket';
 import { randomMd5 } from '@/utils/misc';
 import { LRUCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
 import { fetchWithAuth } from '@/utils/fetch';
 import { getAPIBaseUrl, isTauriAppPlatform } from '@/services/environment';
+import type { TTSVoice } from '@/services/tts/types';
+import { EDGE_VOICE_GENDERS } from './edgeTTSGenders';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
 // `isomorphic-ws`) cannot run on Workers because it relies on
 // `http.createConnection`, which the Workers runtime does not implement.
-// Detecting Workers lets us use the fetch-based WebSocket upgrade pattern
-// (`fetch(..., { headers: { Upgrade: 'websocket' } })`) instead.
+// Detecting Workers lets us open the socket with `connectWorkersWebSocket`
+// instead.
 const isCloudflareWorkers = () =>
   typeof (globalThis as { WebSocketPair?: unknown }).WebSocketPair !== 'undefined';
 
-// The WebSocket returned by a Cloudflare Workers upgrade response must be
-// `accept()`ed before use. This minimal interface captures the bits we need
-// without pulling in `@cloudflare/workers-types`.
-interface AcceptableWebSocket {
-  accept(): void;
-  send(data: string | ArrayBuffer | ArrayBufferView): void;
-  close(code?: number, reason?: string): void;
-  addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
-  addEventListener(type: 'close', listener: () => void): void;
-  addEventListener(type: 'error', listener: (event: unknown) => void): void;
-}
-
-type UpgradeResponse = Response & { webSocket?: AcceptableWebSocket };
-
-const EDGE_SPEECH_URL =
-  'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1';
+// speech.platform.bing.com now rejects the handshake with 403 in many regions
+// (rany2/edge-tts#490); Edge Read Aloud moved to api.msedgeservices.com.
+const EDGE_SPEECH_URL = 'wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1';
 const EDGE_API_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const CHROMIUM_FULL_VERSION = '143.0.3650.75';
 const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split('.')[0];
@@ -216,36 +206,95 @@ const EDGE_TTS_VOICES = {
   'zu-ZA': ['zu-ZA-ThandoNeural', 'zu-ZA-ThembaNeural'],
 };
 
-/**
- * Generates the Sec-MS-GEC token value.
- * This function generates a token value based on the current time in Windows file time format
- * adjusted for clock skew, and rounded down to the nearest 5 minutes. The token is then hashed
- * using SHA256 and returned as an uppercased hex digest.
- *
- * @returns The generated Sec-MS-GEC token value.
- * @see https://github.com/rany2/edge-tts/issues/290#issuecomment-2464956570
- */
 const WIN_EPOCH_OFFSET = 11644473600; // Windows epoch offset in seconds (1601 to 1970)
 const S_TO_NS = 1000000000; // Seconds to nanoseconds conversion
-const generateSecMsGec = async () => {
-  let ticks = Math.floor(Date.now() / 1000);
+const GEC_PREFIX_WORDS = [
+  0x79706f43, 0x68676972, 0x43282074, 0x694d2029, 0x736f7263, 0x2074666f, 0x70726f43, 0x7461726f,
+  0x2e6e6f69, 0x6c6c4120, 0x67697220, 0x20737468, 0x65736572, 0x64657672, 0x0000002e,
+];
+const GEC_PREFIX_LENGTH = 57;
+
+const toHex = (bytes: Uint8Array) =>
+  Array.from(bytes, (b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase();
+
+const rol16 = (x: number) => ((x << 16) | (x >>> 16)) >>> 0;
+
+// Little-endian 32-bit words, zero-padded to an even word count.
+const toWords = (bytes: Uint8Array) => {
+  const padded = new Uint8Array(Math.ceil(bytes.length / 8) * 8);
+  padded.set(bytes);
+  const view = new DataView(padded.buffer);
+  return Array.from({ length: padded.length / 4 }, (_, i) => view.getUint32(i * 4, true));
+};
+
+// The two CS64 chains Edge xors into the first half of a v2 token.
+const cs64WordSwap = (words: number[], a: number, b: number) => {
+  let acc = 0;
+  let last = 0;
+  for (let i = 0; i < words.length; i += 2) {
+    const x = words[i]!;
+    const y = words[i + 1]!;
+    let t = rol16((Math.imul(rol16(x), 0xef0569fb) + Math.imul(x, a)) >>> 0);
+    let q = Math.imul(t, 0x76f50f34) >>> 0;
+    acc = (acc + Math.imul(rol16(q), 0xc3efea97) + q) >>> 0;
+    t = rol16((Math.imul(rol16(y), 0xc31713db) + Math.imul(y, b)) >>> 0);
+    q = Math.imul(t, 0x1881ce3c) >>> 0;
+    last = (Math.imul(rol16(q), 0x35bd1ec9) + q) >>> 0;
+    acc = (acc + last) >>> 0;
+  }
+  return [last, acc];
+};
+
+const cs64Reversible = (words: number[], a: number, b: number) => {
+  let state = 0;
+  let acc = 0;
+  for (let i = 0; i < words.length; i += 2) {
+    state = Math.imul(state + words[i]!, a) >>> 0;
+    for (const c of [0xcf98b111, 0x87085b9f, 0x12ceb96d, 0x257e1d83]) {
+      state = Math.imul(rol16(state), c) >>> 0;
+    }
+    let t = Math.imul(words[i + 1]! + state, b) >>> 0;
+    t = Math.imul(rol16(t), 0xa27416f5) >>> 0;
+    t = rol16(Math.imul(rol16(t), 0xd38396ff) >>> 0);
+    acc = (acc + state) >>> 0;
+    state = Math.imul(rol16(Math.imul(t, 0x7c932b89) >>> 0), 0xbfa49f69) >>> 0;
+    acc = (acc + state) >>> 0;
+  }
+  return [state, acc];
+};
+
+/**
+ * Generates a v2 Sec-MS-GEC token: `<CS64 hex>-<SHA256 hex>` over the prefix words followed
+ * by the Windows file time (rounded down to 5 minutes) and the trusted client token.
+ *
+ * @see https://github.com/rany2/edge-tts/pull/492
+ */
+export const generateSecMsGec = async (now = Date.now()) => {
+  let ticks = Math.floor(now / 1000);
   // Switch to Windows file time epoch (1601-01-01 00:00:00 UTC)
   ticks += WIN_EPOCH_OFFSET;
   // Round down to the nearest 5 minutes (300 seconds)
   ticks -= ticks % 300;
   // Convert the ticks to 100-nanosecond intervals (Windows file time format)
   ticks *= S_TO_NS / 100;
-  // Create the string to hash by concatenating the ticks and the trusted client token
-  const strToHash = `${ticks.toFixed(0)}${EDGE_API_TOKEN}`;
-  // Compute the SHA256 hash and return the uppercased hex digest
-  const encoder = new TextEncoder();
-  const data = encoder.encode(strToHash);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-    .toUpperCase();
+  const suffix = new TextEncoder().encode(`${ticks.toFixed(0)}${EDGE_API_TOKEN}`);
+  const data = new Uint8Array(GEC_PREFIX_LENGTH + suffix.length);
+  const view = new DataView(data.buffer);
+  GEC_PREFIX_WORDS.forEach((word, i) => view.setUint32(i * 4, word, true));
+  data.set(suffix, GEC_PREFIX_LENGTH);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  const words = toWords(data);
+  const [key0, key1] = toWords(digest);
+  const a = (key0! | 1) >>> 0;
+  const b = (key1! | 1) >>> 0;
+  const [s0, s1] = cs64WordSwap(words, a, b);
+  const [r0, r1] = cs64Reversible(words, a, b);
+  const cs64 = new DataView(new ArrayBuffer(8));
+  cs64.setUint32(0, s0! ^ r0!, true);
+  cs64.setUint32(4, s1! ^ r1!, true);
+  return `${toHex(new Uint8Array(cs64.buffer))}-${toHex(digest)}`;
 };
 
 const generateMuid = () => {
@@ -263,7 +312,12 @@ const genVoiceList = (voices: Record<string, string[]>) => {
   return Object.entries(voices).flatMap(([lang, voices]) => {
     return voices.map((id) => {
       const name = id.replace(`${lang}-`, '').replace('Neural', '');
-      return { name, id, lang };
+      const variant = name.match(/(Multilingual|Expressive)$/)?.[1];
+      const voice: TTSVoice = { name: variant ? name.slice(0, -variant.length) : name, id, lang };
+      if (variant) voice.variant = variant.toLowerCase() as TTSVoice['variant'];
+      const gender = EDGE_VOICE_GENDERS[id];
+      if (gender) voice.gender = gender;
+      return voice;
     });
   });
 };
@@ -350,6 +404,26 @@ export const hashTTSPayload = (payload: EdgeTTSPayload): string => {
 
 export type EDGE_TTS_PROTOCOL = 'wss' | 'https';
 
+// Inactivity budget for the Tauri WebSocket transport. Synthesis frames
+// stream continuously once the request is sent; a socket silent this long is
+// dead and would otherwise hang playback forever (#5230).
+const WS_INACTIVITY_TIMEOUT_MS = 30_000;
+
+// The same budget for the other WebSocket transports, which back the HTTPS
+// proxy route and direct browser playback: a connect that stalls (one took
+// 76s to fail) or a socket gone silent must fail so the caller can retry,
+// instead of holding every request that joined it.
+const inactivityWatchdog = (onTimeout: () => void) => {
+  let timer = setTimeout(onTimeout, WS_INACTIVITY_TIMEOUT_MS);
+  return {
+    touch: () => {
+      clearTimeout(timer);
+      timer = setTimeout(onTimeout, WS_INACTIVITY_TIMEOUT_MS);
+    },
+    stop: () => clearTimeout(timer),
+  };
+};
+
 export class EdgeSpeechTTS {
   static voices = genVoiceList(EDGE_TTS_VOICES);
   private static audioCache = new LRUCache<string, Blob>(200);
@@ -397,9 +471,9 @@ export class EdgeSpeechTTS {
     const connectId = randomMd5();
     const params = new URLSearchParams({
       ConnectionId: connectId,
-      TrustedClientToken: EDGE_API_TOKEN,
+      'Ocp-Apim-Subscription-Key': EDGE_API_TOKEN,
       'Sec-MS-GEC': await generateSecMsGec(),
-      'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
+      'Sec-MS-GEC-Version': `2-${CHROMIUM_FULL_VERSION}`,
     });
     const url = `${EDGE_SPEECH_URL}?${params.toString()}`;
     const date = new Date().toString();
@@ -474,24 +548,61 @@ export class EdgeSpeechTTS {
     const config = genSendContent(configHeaders, configContent);
 
     if (isTauriAppPlatform()) {
+      // Every exit path must settle this promise (#5230): the plugin's channel
+      // delivers a server close as a `Close` message and a connection read
+      // error as a bare string (no `type` field) — ignoring them left the
+      // promise pending forever, wedging the whole speak pipeline (and the
+      // static inflight map poisoned that sentence until app restart).
       return new Promise(async (resolve, reject) => {
+        let ws: TauriWebSocketConnection | null = null;
+        let settled = false;
+        let unlisten: (() => void) | null = null;
+        let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+        const cleanup = () => {
+          if (inactivityTimer !== null) clearTimeout(inactivityTimer);
+          inactivityTimer = null;
+          unlisten?.();
+          unlisten = null;
+          void ws?.disconnect().catch(() => {});
+        };
+        const settle = (complete: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          complete();
+        };
+        // Frames stream steadily during synthesis, so prolonged silence means
+        // a half-open socket (e.g. a mobile network handover) that will never
+        // error or close on its own. Reject so the caller's retry can open a
+        // fresh connection.
+        const armInactivityTimer = () => {
+          if (inactivityTimer !== null) clearTimeout(inactivityTimer);
+          inactivityTimer = setTimeout(() => {
+            settle(() => reject(new Error('WebSocket timed out waiting for audio.')));
+          }, WS_INACTIVITY_TIMEOUT_MS);
+        };
         try {
           const TauriWebSocket = (await import('@tauri-apps/plugin-websocket')).default;
-          const ws = await TauriWebSocket.connect(url, { headers: baseHeaders });
+          ws = await TauriWebSocket.connect(url, { headers: baseHeaders });
           let audioData = new ArrayBuffer(0);
           const boundaries: TTSWordBoundary[] = [];
-          const messageUnlisten = await ws.addListener((msg) => {
+          unlisten = ws.addListener((msg) => {
+            if (settled) return;
+            armInactivityTimer();
+            if (typeof msg === 'string') {
+              return settle(() => reject(new Error(`WebSocket error occurred: ${msg}`)));
+            }
             if (msg.type === 'Text') {
               const { headers, body } = getHeadersAndData(msg.data as string);
               if (headers['Path'] === 'audio.metadata') {
                 boundaries.push(...parseAudioMetadataBody(body.trim()));
               } else if (headers['Path'] === 'turn.end') {
-                ws.disconnect();
-                messageUnlisten();
-                if (!audioData.byteLength) {
-                  return reject(new Error('No audio data received.'));
-                }
-                resolve({ response: new Response(audioData), boundaries });
+                settle(() => {
+                  if (!audioData.byteLength) {
+                    return reject(new Error('No audio data received.'));
+                  }
+                  resolve({ response: new Response(audioData), boundaries });
+                });
               }
             } else if (msg.type === 'Binary') {
               let buffer: ArrayBufferLike;
@@ -509,44 +620,60 @@ export class EdgeSpeechTTS {
                 merged.set(new Uint8Array(newBody), audioData.byteLength);
                 audioData = merged.buffer;
               }
+            } else if (msg.type === 'Close') {
+              settle(() => reject(new Error('WebSocket closed before audio completed.')));
             }
+            // Ping/Pong frames only refresh the inactivity timer.
           });
+          armInactivityTimer();
           await ws.send(config);
           await ws.send(content);
         } catch (error) {
-          reject(new Error(`WebSocket error occurred: ${error}`));
+          settle(() => reject(new Error(`WebSocket error occurred: ${error}`)));
         }
       });
     } else if (isCloudflareWorkers()) {
       // The Workers path backs the HTTPS proxy route. It captures both the
       // audio body and the word boundaries (audio.metadata frames) so the
       // route can forward boundaries via the WORD_BOUNDARIES_HEADER.
-      return new Promise<EdgeSpeechAudio>((resolve, reject) => {
+      return new Promise<EdgeSpeechAudio>((resolveAudio, rejectAudio) => {
+        let settled = false;
+        let closeSocket = () => {};
+        // Releases the raw socket while the upgrade is still pending.
+        const connecting = new AbortController();
+        const watchdog = inactivityWatchdog(() => {
+          if (settled) return;
+          settled = true;
+          connecting.abort();
+          closeSocket();
+          rejectAudio(new Error('WebSocket timed out waiting for audio.'));
+        });
+        const resolve = (audio: EdgeSpeechAudio) => {
+          watchdog.stop();
+          resolveAudio(audio);
+        };
+        const reject = (error: Error) => {
+          watchdog.stop();
+          rejectAudio(error);
+        };
         (async () => {
           try {
-            // Cloudflare Workers cannot use the `ws` npm package because it
-            // relies on `http.createConnection`. Instead, WebSockets are
-            // opened by calling `fetch()` with an `Upgrade: websocket`
-            // header. The response has status 101 and a `webSocket`
-            // property that must be `accept()`ed before sending data.
-            const upgradeUrl = url.replace(/^wss:\/\//i, 'https://');
-            const upgradeResponse = (await fetch(upgradeUrl, {
-              headers: {
-                ...baseHeaders,
-                Upgrade: 'websocket',
-              },
-            })) as UpgradeResponse;
-
-            if (upgradeResponse.status !== 101 || !upgradeResponse.webSocket) {
-              return reject(
-                new Error(`WebSocket upgrade failed with status ${upgradeResponse.status}`),
-              );
-            }
-
-            const ws = upgradeResponse.webSocket;
+            // Workers' own fetch() upgrade gets a plain HTTP 200 from
+            // api.msedgeservices.com, so speak WebSocket over a raw socket.
+            // Loaded only here so other runtimes never evaluate it.
+            const { connectWorkersWebSocket } = await import('@/libs/workersWebSocket');
+            const ws = await connectWorkersWebSocket(url, baseHeaders, connecting.signal);
+            closeSocket = () => {
+              try {
+                ws.close();
+              } catch {
+                // ignore close failures
+              }
+            };
+            // Timed out while connecting.
+            if (settled) return closeSocket();
             let audioData = new ArrayBuffer(0);
             const boundaries: TTSWordBoundary[] = [];
-            let settled = false;
             // Cloudflare Workers deliver binary WebSocket frames as `Blob`,
             // whose conversion to bytes (`blob.arrayBuffer()`) is async.
             // Chain every binary message through this promise so frames are
@@ -587,6 +714,7 @@ export class EdgeSpeechTTS {
 
             const onMessage = (event: { data: unknown }) => {
               if (settled) return;
+              watchdog.touch();
               const data = event.data;
               if (typeof data === 'string') {
                 const { headers, body } = getHeadersAndData(data);
@@ -662,7 +790,19 @@ export class EdgeSpeechTTS {
         })();
       });
     } else {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolveAudio, rejectAudio) => {
+        const watchdog = inactivityWatchdog(() => {
+          ws.close();
+          rejectAudio(new Error('WebSocket timed out waiting for audio.'));
+        });
+        const resolve = (audio: EdgeSpeechAudio) => {
+          watchdog.stop();
+          resolveAudio(audio);
+        };
+        const reject = (error: Error) => {
+          watchdog.stop();
+          rejectAudio(error);
+        };
         // In browsers isomorphic-ws is the native WebSocket, whose second
         // argument is a subprotocol list — passing an options object throws
         // SyntaxError. Custom headers are only supported (and only needed)
@@ -677,11 +817,13 @@ export class EdgeSpeechTTS {
         const boundaries: TTSWordBoundary[] = [];
 
         ws.addEventListener('open', () => {
+          watchdog.touch();
           ws.send(config);
           ws.send(content);
         });
 
         ws.addEventListener('message', (event: WebSocket.MessageEvent) => {
+          watchdog.touch();
           if (typeof event.data === 'string') {
             const { headers, body } = getHeadersAndData(event.data);
             if (headers['Path'] === 'audio.metadata') {

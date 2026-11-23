@@ -87,6 +87,10 @@ So the rough split is:
 - `apps/readest-app/src/libs`
   Shared library code. Some of it is server-oriented, some client-oriented, some neutral.
 
+- `apps/readest-app/src/plugins`
+  Bundled plugin implementations that run behind the host-owned Worker protocol.
+  The Yomitan implementation is also reused by Node conversion tooling.
+
 - `apps/readest-app/src/helpers`
   General helper code, usually shared.
 
@@ -213,13 +217,18 @@ This is shared infrastructure code, not an HTTP backend directory.
 
 ### `src/services/sync`
 
-Sync clients and replica-sync orchestration.
+Sync clients and orchestration.
 
 - legacy/remote sync client code such as `KOSyncClient.ts`
 - replica sync flow: bootstrap, publish, pull, apply, persistence, cursor storage, encryption, and passphrase handling
 - adapter subdirectory for sync categories such as dictionary, font, texture, OPDS catalog, and settings
+- provider-neutral file sync under `file/`, with WebDAV, Google Drive, S3,
+  OneDrive, and iCloud adapters under `providers/`; it reconciles shared
+  `library.json` metadata, covers, per-book config, and book files
 
-This is mostly client-side sync orchestration talking to backend endpoints like `src/pages/api/sync.ts` and `src/pages/api/sync/replicas.ts`.
+This is mostly client-side sync orchestration talking to backend endpoints like
+`src/pages/api/sync.ts` and `src/pages/api/sync/replicas.ts`, or directly to the
+selected third-party file provider.
 
 ### `src/services/send`
 
@@ -243,11 +252,24 @@ This is shared integration logic. Actual HTTP exposure happens via route handler
 
 Dictionary import, parsing, lookup, and provider registry.
 
-- readers/parsers for StarDict, SLOB, and related formats
+- readers/parsers for StarDict, MDict, DICT, SLOB, BGL, and related formats
 - provider adapters for dictionary/web/wikipedia/wiktionary sources
+- `plugins/`: source integrity, index generations, materialization, provider lifecycle, and semantic rendering for bundled dictionary plugins
 - dictionary service, deduplication, content ID, and lookup candidate generation
 
 This is primarily client/application functionality.
+
+### `src/services/plugins`
+
+Host-owned infrastructure for bundled plugins.
+
+- manifest, request, result, and semantic-content contracts
+- Worker request routing and host capability calls
+- scoped source reads and bounded SQL access through opaque handles
+- bundled plugin discovery and lookup/build worker lifecycles
+
+Plugin implementations live separately under `src/plugins`; currently the
+Yomitan plugin accepts raw `.zip` dictionaries and portable `.rdict` indexes.
 
 ### `src/services/annotation`
 
@@ -283,13 +305,28 @@ Translation provider integration.
 
 Mixed integration code. Some providers are used via server APIs to avoid exposing secrets.
 
+### `src/services/audiobook`
+
+Device-local companion-audiobook support: metadata parsing, chapter mapping,
+preview playback, and copied-file lifecycle. `src/services/tts/pairedAudiobook.ts`
+adapts a saved pairing for the Read Aloud stack.
+
 ### `src/services/tts`
 
-Text-to-speech abstraction and implementations.
+Read Aloud abstraction and implementations.
 
 - `WebSpeechClient.ts`: browser TTS
 - `NativeTTSClient.ts`: native/Tauri TTS
 - `EdgeTTSClient.ts`: remote/provider-backed TTS
+- `mediaOverlay/`: a book's own recorded narration, from embedded EPUB 3 Media
+  Overlays or a device-local audiobook pairing, played in place of synthesis
+- `pairedAudiobook.ts`: turns saved ebook/audio chapter mappings into narration
+  sections consumed by the recorded-audio client — see
+  [read-along-narration.md](read-along-narration.md)
+- `ttsDownloadManager.ts` + `src/store/ttsDownloadStore.ts`: durable per-book
+  Offline Audio queue and progress state
+- `providers/bookCacheStore.ts` + `providers/sqliteCacheStore.ts`: per-book
+  SQLite warm cache, pinned downloads, and compacted section packs
 - controller/data/types/utilities
 
 Mixed runtime code, mostly used by the reader frontend.

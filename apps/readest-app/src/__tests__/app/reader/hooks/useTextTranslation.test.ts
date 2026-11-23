@@ -1,5 +1,199 @@
-import { describe, it, expect } from 'vitest';
-import { createTranslationTargetNode } from '@/app/reader/hooks/useTextTranslation';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { cleanup, renderHook, waitFor } from '@testing-library/react';
+import {
+  createTranslationTargetNode,
+  getTranslationContextNodes,
+  groupTextNodesByDocument,
+  observeTextNodesByDocument,
+  resolveTranslationSourceNodes,
+  setSourceVisibility,
+  useTextTranslation,
+} from '@/app/reader/hooks/useTextTranslation';
+import { walkTextNodes } from '@/utils/walk';
+
+const translate = vi.hoisted(() => vi.fn(async (texts: string[]) => texts.map(() => '我读汉字。')));
+const viewSettings = vi.hoisted(() => ({ translationEnabled: true, translationProvider: 'bing' }));
+const readerState = vi.hoisted(() => ({
+  getViewSettings: () => viewSettings,
+  setIsLoading: () => {},
+}));
+
+vi.mock('@/store/readerStore', () => ({
+  useReaderStore: (selector: (s: typeof readerState) => unknown) => selector(readerState),
+}));
+vi.mock('@/store/bookDataStore', () => ({
+  useBookDataStore: (selector: (s: { getBookData: () => null }) => unknown) =>
+    selector({ getBookData: () => null }),
+}));
+vi.mock('@/store/readerProgressStore', () => ({ useBookProgress: () => null }));
+vi.mock('@/hooks/useTranslator', () => ({ useTranslator: () => ({ translate }) }));
+vi.mock('@/hooks/useTranslation', () => ({ useTranslation: () => (text: string) => text }));
+vi.mock('@/services/translators', () => ({ getTranslators: () => [] }));
+
+describe('groupTextNodesByDocument', () => {
+  it('keeps text nodes from separate iframe documents in separate observer groups', () => {
+    const firstDocument = document.implementation.createHTMLDocument('first');
+    const secondDocument = document.implementation.createHTMLDocument('second');
+    const firstNode = firstDocument.createElement('p');
+    const secondNode = secondDocument.createElement('p');
+    const anotherSecondNode = secondDocument.createElement('p');
+
+    const groups = groupTextNodesByDocument([firstNode, secondNode, anotherSecondNode]);
+
+    expect(groups.size).toBe(2);
+    expect(groups.get(firstDocument)).toEqual([firstNode]);
+    expect(groups.get(secondDocument)).toEqual([secondNode, anotherSecondNode]);
+  });
+});
+
+describe('observeTextNodesByDocument', () => {
+  it('creates one observer per iframe document and observes only that document nodes', () => {
+    const firstDocument = document.implementation.createHTMLDocument('first');
+    const secondDocument = document.implementation.createHTMLDocument('second');
+    const firstNode = firstDocument.createElement('p');
+    const secondNode = secondDocument.createElement('p');
+    const observed = new Map<Document, HTMLElement[]>();
+    const disconnected: Document[] = [];
+
+    const observers = observeTextNodesByDocument([firstNode, secondNode], (ownerDocument) => {
+      observed.set(ownerDocument, []);
+      return {
+        observe: (node: HTMLElement) => observed.get(ownerDocument)!.push(node),
+        disconnect: () => disconnected.push(ownerDocument),
+      } as unknown as IntersectionObserver;
+    });
+
+    expect(observers).toHaveLength(2);
+    expect(observed.get(firstDocument)).toEqual([firstNode]);
+    expect(observed.get(secondDocument)).toEqual([secondNode]);
+    observers.forEach((observer) => observer.disconnect());
+    expect(disconnected).toEqual([firstDocument, secondDocument]);
+  });
+});
+
+describe('resolveTranslationSourceNodes', () => {
+  it('keeps untranslated book text nodes', () => {
+    const paragraph = document.createElement('p');
+    paragraph.textContent = 'Source paragraph';
+
+    expect(resolveTranslationSourceNodes([paragraph])).toEqual([paragraph]);
+  });
+
+  it('drops generated wrappers and folds a hidden original back to its paragraph', () => {
+    const source = document.createElement('p');
+    source.className = 'translation-source';
+    const hiddenSource = document.createElement('font');
+    hiddenSource.className = 'translation-source-hidden';
+    hiddenSource.textContent = 'Source paragraph';
+    const target = document.createElement('font');
+    target.className = 'translation-target translation-target-block';
+    target.textContent = 'Translated paragraph';
+    source.append(hiddenSource, target);
+
+    // one entry per paragraph, and never a generated wrapper
+    expect(resolveTranslationSourceNodes([source, hiddenSource, target])).toEqual([source]);
+  });
+
+  it('keeps an already translated paragraph so the node list stays index-stable', () => {
+    // Regression: dropping translated paragraphs shifts every index after them,
+    // which breaks findNodeIndicesInRange and silently kills the read-ahead.
+    const root = document.createElement('div');
+    root.innerHTML = `<p id="p1">One.</p><p id="p2">Two.</p><p id="p3">Three.</p>`;
+    document.body.appendChild(root);
+
+    const translate = (el: HTMLElement, showSource: boolean) => {
+      el.classList.add('translation-source');
+      setSourceVisibility(el, showSource);
+      el.appendChild(
+        createTranslationTargetNode({
+          translatedText: 'TRANSLATED',
+          lang: 'zh',
+          targetBlockClassName: 'translation-target-block',
+          hidden: false,
+          widthLineBreak: false,
+        }),
+      );
+    };
+    const rewalk = () =>
+      resolveTranslationSourceNodes(walkTextNodes(root, ['pre', 'code', 'math']));
+
+    expect(rewalk().map((node) => node.id)).toEqual(['p1', 'p2', 'p3']);
+
+    // original left visible
+    translate(document.getElementById('p1')!, true);
+    expect(rewalk().map((node) => node.id)).toEqual(['p1', 'p2', 'p3']);
+
+    // original hidden: walkTextNodes descends past the <p> and emits the wrapper
+    translate(document.getElementById('p2')!, false);
+    expect(rewalk().map((node) => node.id)).toEqual(['p1', 'p2', 'p3']);
+
+    root.remove();
+  });
+
+  it('keeps a paragraph whose original is hidden but whose translation was removed', () => {
+    // The state updateTranslation() leaves behind. The hidden wrapper is
+    // display:none, so this paragraph must stay observable or it renders blank.
+    const source = document.createElement('p');
+    source.className = 'translation-source';
+    source.textContent = 'Source paragraph';
+    setSourceVisibility(source, false);
+    const hider = source.querySelector<HTMLElement>('.translation-source-hidden')!;
+
+    expect(resolveTranslationSourceNodes([hider])).toEqual([source]);
+  });
+});
+
+describe('getTranslationContextNodes', () => {
+  it('does not include adjacent context nodes from another document', () => {
+    const firstDocument = document.implementation.createHTMLDocument('first');
+    const secondDocument = document.implementation.createHTMLDocument('second');
+    const firstBefore = firstDocument.createElement('p');
+    const firstVisible = firstDocument.createElement('p');
+    const secondAdjacent = secondDocument.createElement('p');
+    const secondAfter = secondDocument.createElement('p');
+
+    const context = getTranslationContextNodes(
+      [firstBefore, firstVisible, secondAdjacent, secondAfter],
+      firstDocument,
+      new Set([firstVisible]),
+    );
+
+    expect(context).toEqual([firstBefore, firstVisible]);
+    expect(context.every((node) => node.ownerDocument === firstDocument)).toBe(true);
+  });
+
+  it('returns nothing when every visible node belongs to another document', () => {
+    const firstDocument = document.implementation.createHTMLDocument('first');
+    const secondDocument = document.implementation.createHTMLDocument('second');
+    const firstNode = firstDocument.createElement('p');
+    const secondVisible = secondDocument.createElement('p');
+
+    expect(
+      getTranslationContextNodes(
+        [firstNode, secondVisible],
+        firstDocument,
+        new Set([secondVisible]),
+      ),
+    ).toEqual([]);
+  });
+
+  it('spans the same window the pre-refactor loop covered', () => {
+    const ownerDocument = document.implementation.createHTMLDocument('only');
+    const nodes = Array.from({ length: 10 }, () => ownerDocument.createElement('p'));
+
+    // visible = index 4 -> one node before, two after (old: startIdx..endIdx inclusive)
+    expect(getTranslationContextNodes(nodes, ownerDocument, new Set([nodes[4]!]))).toEqual(
+      nodes.slice(3, 7),
+    );
+    // clamps at both ends
+    expect(getTranslationContextNodes(nodes, ownerDocument, new Set([nodes[0]!]))).toEqual(
+      nodes.slice(0, 3),
+    );
+    expect(getTranslationContextNodes(nodes, ownerDocument, new Set([nodes[9]!]))).toEqual(
+      nodes.slice(8, 10),
+    );
+  });
+});
 
 describe('createTranslationTargetNode', () => {
   it('sets dir="rtl" on the wrapper for an RTL target language', () => {
@@ -39,7 +233,7 @@ describe('createTranslationTargetNode', () => {
     expect(wrapper.getAttribute('dir')).toBe('auto');
   });
 
-  it('builds the expected nested structure with the translated text', () => {
+  it('builds a single flat wrapper carrying the translated text', () => {
     const wrapper = createTranslationTargetNode({
       translatedText: 'مرحبا بالعالم',
       lang: 'ar',
@@ -49,11 +243,43 @@ describe('createTranslationTargetNode', () => {
     });
 
     expect(wrapper.classList.contains('translation-target')).toBe(true);
+    expect(wrapper.classList.contains('translation-target-toc')).toBe(true);
     expect(wrapper.getAttribute('translation-element-mark')).toBe('1');
-    const block = wrapper.querySelector('.translation-target-toc');
-    expect(block).not.toBeNull();
-    const inner = wrapper.querySelector('.target-inner');
-    expect(inner?.textContent).toBe('مرحبا بالعالم');
+    expect(wrapper.textContent).toBe('مرحبا بالعالم');
+    // Flattened from three nested <font>s: the CFI path into translated text
+    // is two levels shallower, and no element nests inside the wrapper.
+    expect(wrapper.children.length).toBe(0);
+  });
+
+  it('is a <font>, the one tag book CSS never styles and layout tolerates', () => {
+    const wrapper = createTranslationTargetNode({
+      translatedText: 'hi',
+      lang: 'en',
+      targetBlockClassName: 'translation-target-block',
+      hidden: false,
+      widthLineBreak: false,
+    });
+    expect(wrapper.tagName).toBe('FONT');
+  });
+
+  it('carries sanitized inline markup when given a content fragment', () => {
+    const fragment = document.createDocumentFragment();
+    fragment.appendChild(document.createTextNode('那只'));
+    const bold = document.createElement('b');
+    bold.textContent = '敏捷';
+    fragment.appendChild(bold);
+    fragment.appendChild(document.createTextNode('的狐狸'));
+
+    const wrapper = createTranslationTargetNode({
+      content: fragment,
+      lang: 'zh',
+      targetBlockClassName: 'translation-target-block',
+      hidden: false,
+      widthLineBreak: false,
+    });
+
+    expect(wrapper.textContent).toBe('那只敏捷的狐狸');
+    expect(wrapper.querySelector('b')?.textContent).toBe('敏捷');
   });
 
   it('marks the wrapper hidden when hidden is true', () => {
@@ -78,5 +304,206 @@ describe('createTranslationTargetNode', () => {
     });
 
     expect(wrapper.firstChild?.nodeName).toBe('BR');
+  });
+});
+
+describe('useTextTranslation', () => {
+  // Without vitest globals, Testing Library does not unmount between tests. A
+  // hook left mounted keeps its 50 ms batch timer alive past the file's jsdom
+  // teardown, where it throws `Node is not defined` (#7125).
+  afterEach(cleanup);
+
+  it('sends the translator the base text without the ruby readings', async () => {
+    let onIntersect: IntersectionObserverCallback = () => {};
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          onIntersect = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const view = document.createElement('div');
+    view.innerHTML = '<p>私は<ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>を読む。</p>';
+    const paragraph = view.querySelector('p')!;
+
+    renderHook(() => useTextTranslation('book-1', view));
+    onIntersect(
+      [{ isIntersecting: true, target: paragraph } as unknown as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
+    await waitFor(() => expect(translate).toHaveBeenCalled());
+    expect(translate).toHaveBeenCalledWith(['私は漢字を読む。']);
+    vi.unstubAllGlobals();
+  });
+
+  it('drops the DOM work when a translation resolves after unmount', async () => {
+    let resolveTranslation: ((texts: string[]) => void) | undefined;
+    translate.mockImplementationOnce(
+      () =>
+        new Promise<string[]>((resolve) => {
+          resolveTranslation = resolve;
+        }),
+    );
+    let onIntersect: IntersectionObserverCallback = () => {};
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          onIntersect = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const view = document.createElement('div');
+    view.innerHTML = '<p>Source paragraph.</p>';
+    const paragraph = view.querySelector('p')!;
+    document.body.appendChild(view);
+
+    const { unmount } = renderHook(() => useTextTranslation('book-1', view));
+    onIntersect(
+      [{ isIntersecting: true, target: paragraph } as unknown as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+    await waitFor(() => expect(translate).toHaveBeenCalled());
+
+    unmount();
+    resolveTranslation!(['Translated paragraph.']);
+    // Long enough for a batch timer scheduled after the cleanup to run.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(paragraph.querySelector('.translation-target')).toBeNull();
+    expect(paragraph.classList.contains('translation-source')).toBe(false);
+
+    view.remove();
+    vi.unstubAllGlobals();
+  });
+
+  it('cancels a queued batch on unmount when translation was enabled after mount', async () => {
+    const getViewSettings = readerState.getViewSettings;
+    let settings = { ...viewSettings, translationEnabled: false };
+    readerState.getViewSettings = () => settings;
+    let onIntersect: IntersectionObserverCallback = () => {};
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          onIntersect = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const view = document.createElement('div');
+    view.innerHTML = '<p>Source paragraph.</p>';
+    const paragraph = view.querySelector('p')!;
+    document.body.appendChild(view);
+
+    // Off at mount, so the `[view]` effect registers no cleanup.
+    const { rerender, unmount } = renderHook(() => useTextTranslation('book-1', view));
+    settings = { ...viewSettings, translationEnabled: true };
+    rerender();
+    onIntersect(
+      [{ isIntersecting: true, target: paragraph } as unknown as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+    await waitFor(() => expect(translate).toHaveBeenCalled());
+    // Let the translation resolve and queue its batch, well inside the 50 ms window.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    unmount();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(paragraph.querySelector('.translation-target')).toBeNull();
+
+    view.remove();
+    readerState.getViewSettings = getViewSettings;
+    vi.unstubAllGlobals();
+  });
+
+  it('disconnects its observers on unmount when translation was enabled after mount', () => {
+    const getViewSettings = readerState.getViewSettings;
+    let settings = { ...viewSettings, translationEnabled: false };
+    readerState.getViewSettings = () => settings;
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        observe() {}
+        disconnect = disconnect;
+      },
+    );
+    const view = document.createElement('div');
+    view.innerHTML = '<p>Source paragraph.</p>';
+    document.body.appendChild(view);
+
+    // Off at mount, so the `[view]` effect registers no cleanup.
+    const { rerender, unmount } = renderHook(() => useTextTranslation('book-1', view));
+    settings = { ...viewSettings, translationEnabled: true };
+    rerender();
+    unmount();
+
+    expect(disconnect).toHaveBeenCalled();
+
+    view.remove();
+    readerState.getViewSettings = getViewSettings;
+    vi.unstubAllGlobals();
+  });
+
+  it('starts no queued translations after unmount when translation was enabled after mount', async () => {
+    const getViewSettings = readerState.getViewSettings;
+    let settings = { ...viewSettings, translationEnabled: false };
+    readerState.getViewSettings = () => settings;
+    const original = translate.getMockImplementation()!;
+    const resolvers: Array<() => void> = [];
+    translate.mockImplementation(
+      (texts: string[]) =>
+        new Promise<string[]>((resolve) => {
+          resolvers.push(() => resolve(texts.map(() => 'Translated.')));
+        }),
+    );
+    let onIntersect: IntersectionObserverCallback = () => {};
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          onIntersect = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const view = document.createElement('div');
+    // More paragraphs than the 5 in flight, so some wait in the queue.
+    view.innerHTML = Array.from({ length: 8 }, (_, i) => `<p>Paragraph ${i}.</p>`).join('');
+    document.body.appendChild(view);
+    const before = translate.mock.calls.length;
+
+    // Off at mount, so the `[view]` effect registers no cleanup.
+    const { rerender, unmount } = renderHook(() => useTextTranslation('book-1', view));
+    settings = { ...viewSettings, translationEnabled: true };
+    rerender();
+    onIntersect(
+      Array.from(view.querySelectorAll('p')).map(
+        (target) => ({ isIntersecting: true, target }) as unknown as IntersectionObserverEntry,
+      ),
+      {} as IntersectionObserver,
+    );
+    expect(translate.mock.calls.length - before).toBe(5);
+
+    unmount();
+    resolvers.forEach((resolve) => resolve());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(translate.mock.calls.length - before).toBe(5);
+
+    translate.mockImplementation(original);
+    view.remove();
+    readerState.getViewSettings = getViewSettings;
+    vi.unstubAllGlobals();
   });
 });

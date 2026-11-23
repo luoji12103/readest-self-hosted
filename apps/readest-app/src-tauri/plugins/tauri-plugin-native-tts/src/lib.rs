@@ -7,8 +7,14 @@ pub use models::*;
 
 #[cfg(desktop)]
 mod desktop;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(mobile)]
 mod mobile;
+#[cfg(desktop)]
+mod now_playing;
+#[cfg(target_os = "linux")]
+mod speech_dispatcher;
 
 mod commands;
 mod error;
@@ -34,8 +40,11 @@ impl<R: Runtime, T: Manager<R>> crate::NativeTtsExt<R> for T {
 
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
-    Builder::new("native-tts")
-        .invoke_handler(tauri::generate_handler![
+    // register_listener/remove_listener are Rust commands only on desktop; on
+    // mobile they must fall through to the native plugin.
+    macro_rules! handler {
+        ($($extra:path),*) => {
+            tauri::generate_handler![
             commands::init,
             commands::speak,
             commands::stop,
@@ -48,11 +57,35 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::set_media_session_active,
             commands::update_media_session_state,
             commands::update_media_session_metadata,
+            commands::update_media_library,
             commands::update_carplay_state,
             commands::playout_enqueue,
-            commands::playout_control,
-            commands::playout_position,
-        ])
+            commands::playout_position $(, $extra)*]
+        };
+    }
+    let builder = Builder::new("native-tts");
+    #[cfg(target_os = "linux")]
+    let builder = builder.invoke_handler({
+        let fallback: fn(tauri::ipc::Invoke<R>) -> bool =
+            handler!(commands::register_listener, commands::remove_listener);
+        move |invoke: tauri::ipc::Invoke<R>| {
+            if invoke.message.command() == "playout_control" {
+                commands::playout_control(invoke);
+                true
+            } else {
+                fallback(invoke)
+            }
+        }
+    });
+    #[cfg(all(desktop, not(target_os = "linux")))]
+    let builder = builder.invoke_handler(handler!(
+        commands::playout_control,
+        commands::register_listener,
+        commands::remove_listener
+    ));
+    #[cfg(mobile)]
+    let builder = builder.invoke_handler(handler!(commands::playout_control));
+    builder
         .setup(|app, api| {
             #[cfg(mobile)]
             let native_tts = mobile::init(app, api)?;
@@ -60,6 +93,19 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             let native_tts = desktop::init(app, api)?;
             app.manage(native_tts);
             Ok(())
+        })
+        .on_event(|app, event| {
+            #[cfg(target_os = "linux")]
+            if let tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } = event
+            {
+                app.native_tts().remove_speech_session(label);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (app, event);
         })
         .build()
 }

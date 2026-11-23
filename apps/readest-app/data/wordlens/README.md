@@ -31,6 +31,16 @@ for p in es-en fr-en de-en pt-en it-en ru-en en-es en-fr en-de en-pt en-ru; do c
 
 # Source-language lemmatization lists (michmech) — used to lemmatize X→en source words
 for c in es fr de pt it ru; do curl -sL -o lemmatization-$c.txt https://raw.githubusercontent.com/michmech/lemmatization-lists/master/lemmatization-$c.txt; done
+
+# en→vi, en→hu and en→ar: WikDict publishes none of these, so the glosses come
+# from the kaikki.org raw wiktextract dump of the English Wiktionary (CC-BY-SA-4.0) — ~2.8 GB
+# gzipped. It holds EVERY language section (English is ~1/4 of the lines); the build gunzips
+# it on the fly and keeps only the `lang_code: en` entries, so do not inflate it (~17 GB).
+# Do NOT download the per-language `kaikki.org-dictionary-<Language>.jsonl` files: they are
+# post-processed for the website and DEPRECATED (tatuylonen/wiktextract#1178).
+# One download serves every kaikki-sourced pair; use aria2c, not curl: kaikki throttles a
+# single connection to ~270 KB/s (hours), while 16 parallel ranges finish in a few minutes.
+aria2c -x16 -s16 -o raw-wiktextract-data.jsonl.gz https://kaikki.org/dictionary/raw-wiktextract-data.jsonl.gz
 ```
 
 ## 2. Generate packs (run from `apps/readest-app`)
@@ -71,7 +81,29 @@ done
 for tgt in es fr de pt ru; do
   node scripts/build-wordlens-data.mjs build-wikdict en "$tgt" /tmp/ww-data/en_50k.txt "/tmp/ww-data/en-$tgt.sqlite3" 20000
 done
+
+# en→vi, en→hu, en→ar: no WikDict dictionary exists, so use the kaikki `build` mode instead —
+# it reads the target-language `translations` off each English Wiktionary entry. Same
+# lemmatization (en-en table) and same output shape as the WikDict pairs. Pass the .gz
+# as is; each build streams the whole dump (5 to 7 min). The raw dump keeps Wiktionary page
+# order, so the first translation is the primary sense; the deprecated post-processed file
+# re-sorted senses (it glossed `bear` as "đầu cơ giá xuống" before "gấu"). Romanizations
+# are dropped (the hint is read by a native speaker) and translations tagged as a regional
+# variety ("Egyptian-Arabic") are skipped, so en→ar stays Modern Standard Arabic.
+for tgt in vi hu ar; do
+  node scripts/build-wordlens-data.mjs build en "$tgt" /tmp/ww-data/en_50k.txt /tmp/ww-data/raw-wiktextract-data.jsonl.gz 20000
+done
 ```
+> **vi, hu and ar are en-target only.** Vietnamese words are multi-syllable with spaces *inside*
+> the word ("học sinh"), so the planner's whitespace tokenizer would gloss syllables, not
+> words. Hungarian is agglutinative, so its surface forms ("házaimban") need a lemmatizer,
+> and michmech publishes no Hungarian list. Arabic book text is unvocalized and carries
+> clitics (و/ال/ب) glued to the word, so it needs a morphological analyzer before lookups
+> could hit the vocalized Wiktionary headwords. Each needs that missing piece before a
+> `vi-en`, `hu-en` or `ar-en` pack would gloss anything useful — deferred, like ja/ko/th. (The Vietnamese
+> Wiktionary's own raw dump, https://kaikki.org/viwiktionary/raw-wiktextract-data.jsonl.gz
+> at ~33 MB, could widen `en-vi` from its English section, but its "past participle of X"
+> form-of glosses need a new build mode plus cleanup — also deferred.)
 - Each build writes `data/wordlens/<pair>.json` **and** regenerates `manifest.json`
   (sha256 + bytes + entry count). Rebuild only the manifest with `pnpm wordlens:manifest`.
 - The last CLI arg is `topN` (default 30000 for en-zh, 20000 otherwise).
@@ -79,14 +111,21 @@ done
   `build-wikdict en ja …` — it joins the manifest automatically. (ja/ko/th as a *source*
   language still need a word segmenter — deferred.)
 
-> Max-coverage alternative to WikDict (heavier): the kaikki Wiktionary dump via the
-> `build <src> <tgt> <freq.txt> <wiktionary.jsonl>` mode — see `ATTRIBUTION.md`.
+> Max-coverage alternative to WikDict (heavier): the same kaikki raw dump via the
+> `build <src> <tgt> <freq.txt> <raw-wiktextract-data.jsonl.gz>` mode — an X→en build keeps
+> the `lang_code: <src>` entries of that one file — see `ATTRIBUTION.md`.
 
 ## 3. Sync to R2
 ```bash
-WORDLENS_R2_BUCKET=<cdn-bucket> pnpm wordlens:sync
+WORDLENS_R2_BUCKET=<cdn-bucket> pnpm wordlens:sync           # only what changed
+WORDLENS_R2_BUCKET=<cdn-bucket> pnpm wordlens:sync --force   # re-upload every pack
 ```
-Uploads every pack (immutable cache) + `manifest.json` (5-min cache), manifest last.
+**Incremental:** the sync fetches the manifest already on the CDN and compares each
+pack's `sha256`, so a one-pair refresh uploads that one pack, not all ~20 MB. Packs go
+up first (immutable cache), `manifest.json` LAST (5-min cache) — and it is skipped
+entirely if any pack failed, so the published manifest never references a pack the
+bucket is missing. Use `--force` when the remote manifest is fine but an object was
+deleted from the bucket; an unreachable manifest (first sync) falls back to a full upload.
 
 ## 4. Commit
 ```bash

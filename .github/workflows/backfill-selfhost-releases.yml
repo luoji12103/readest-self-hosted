@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: Maximum number of missing upstream releases to dispatch in this run.
+        description: Maximum number of missing upstream releases to list.
         required: false
         default: '5'
         type: string
@@ -14,32 +14,25 @@ on:
         default: false
         type: boolean
       oldest_first:
-        description: Dispatch older missing releases first.
+        description: List older missing releases first.
         required: false
         default: true
         type: boolean
       dry_run:
-        description: List releases without dispatching builds.
+        description: Kept for compatibility. Both values only list tags for manual release.
         required: false
         default: true
         type: boolean
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 jobs:
-  dispatch:
+  report:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Collect missing upstream releases
-        id: collect
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LIMIT: ${{ inputs.limit }}
@@ -88,7 +81,7 @@ jobs:
             ]).map((release) => release.tagName),
           );
 
-          const missing = upstream
+          const lines = upstream
             .filter((release) => !release.isDraft)
             .filter((release) => includePrerelease || !release.isPrerelease)
             .filter((release) => /^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(release.tagName))
@@ -99,84 +92,16 @@ jobs:
               return oldestFirst ? left - right : right - left;
             })
             .slice(0, limit)
-            .map((release) => ({
-              upstream_tag: release.tagName,
-              selfhost_tag: `selfhost-${release.tagName}`,
-              release_version: release.tagName.replace(/^v/, ''),
-              published_at: release.publishedAt,
-            }));
+            .map(({ tagName }) => '- `selfhost-' + tagName + '`');
 
-          fs.writeFileSync('missing-releases.json', `${JSON.stringify(missing, null, 2)}\n`);
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `count=${missing.length}\n`);
+          const summary = [
+            '## Missing selfhost releases',
+            '',
+            'Review the source commit for each tag, then run Release Selfhost manually.',
+            '',
+            ...(lines.length ? lines : ['No missing releases found.']),
+            '',
+          ].join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          console.log(summary);
           NODE
-          cat missing-releases.json
-
-      - name: Prepare selfhost backport tags
-        if: ${{ inputs.dry_run == false && steps.collect.outputs.count != '0' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/readest/readest.git
-          git fetch upstream main --tags
-          cp "$GITHUB_WORKSPACE/missing-releases.json" "$RUNNER_TEMP/missing-releases.json"
-          : > "$RUNNER_TEMP/prepared-tags.tsv"
-          : > "$RUNNER_TEMP/blocked-tags.tsv"
-          node - <<'NODE'
-          const fs = require('node:fs');
-          const cp = require('node:child_process');
-          const releases = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/missing-releases.json', 'utf8'));
-
-          for (const release of releases) {
-            try {
-              console.log(`Preparing ${release.selfhost_tag} from ${release.upstream_tag}`);
-              cp.execFileSync('bash', ['scripts/prepare-selfhost-backport.sh', release.upstream_tag], {
-                stdio: 'inherit',
-              });
-              cp.execFileSync('git', ['push', 'origin', `refs/heads/selfhost/backport/${release.release_version}`], {
-                stdio: 'inherit',
-              });
-              cp.execFileSync('git', ['push', 'origin', `refs/tags/${release.selfhost_tag}`, '--force'], {
-                stdio: 'inherit',
-              });
-              fs.appendFileSync(
-                process.env.RUNNER_TEMP + '/prepared-tags.tsv',
-                `${release.selfhost_tag}\t${release.release_version}\n`,
-              );
-              cp.execFileSync('git', ['checkout', process.env.GITHUB_REF_NAME], { stdio: 'inherit' });
-            } catch (error) {
-              fs.appendFileSync(
-                process.env.RUNNER_TEMP + '/blocked-tags.tsv',
-                `${release.selfhost_tag}\t${release.upstream_tag}\tpatch-conflict\n`,
-              );
-              cp.execFileSync('git', ['reset', '--hard'], { stdio: 'inherit' });
-              cp.execFileSync('git', ['clean', '-fd'], { stdio: 'inherit' });
-              cp.execFileSync('git', ['checkout', process.env.GITHUB_REF_NAME], { stdio: 'inherit' });
-            }
-          }
-          NODE
-          echo "Prepared tags:"
-          cat "$RUNNER_TEMP/prepared-tags.tsv"
-          echo "Blocked tags:"
-          cat "$RUNNER_TEMP/blocked-tags.tsv"
-
-      - name: Dispatch release workflows
-        if: ${{ inputs.dry_run == false && steps.collect.outputs.count != '0' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ ! -s "$RUNNER_TEMP/prepared-tags.tsv" ]; then
-            echo "No tags were prepared for release dispatch."
-            exit 0
-          fi
-          while IFS=$'\t' read -r selfhost_tag release_version; do
-            echo "Dispatching ${selfhost_tag}"
-            gh workflow run release-selfhost.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              --ref "$selfhost_tag" \
-              -f "tag=${selfhost_tag}" \
-              -f "release_version=${release_version}"
-          done < "$RUNNER_TEMP/prepared-tags.tsv"

@@ -10,6 +10,13 @@ fn main() {
     if target_os == "windows" {
         build_windows_thumbnail();
     }
+    if target_os == "android" {
+        // The APK ships the library stripped (see gen/android/app/build.gradle.kts),
+        // so Sentry symbolicates Rust panics from the debug files CI uploads. It
+        // matches them to the crashing library by build id, and the NDK linker
+        // emits none by default.
+        println!("cargo:rustc-link-arg=-Wl,--build-id=sha1");
+    }
 
     propagate_sentry_dsn();
     propagate_app_version();
@@ -31,25 +38,53 @@ fn main() {
             "upload_file",
             "get_environment_variable",
             "get_executable_dir",
+            "reveal_item_in_dir",
             "set_webview_info",
+            "get_webview_version",
             "is_updater_disabled",
             "allow_paths_in_scopes",
+            "optimize_cover_thumbnails",
+            "get_explorer_thumbnails_enabled",
+            "set_explorer_thumbnails_enabled",
             "read_dir",
+            "write_backup_zip",
+            "extract_backup_zip",
             "parse_epub_metadata",
             "extract_epub_cover_full",
             "parse_epub_full",
+            "get_comic_page_sizes",
             "parse_mobi_metadata",
             "extract_mobi_cover_full",
+            "parse_pdf_metadata",
+            "render_pdf_cover",
             "auth_with_safari",
             "start_apple_sign_in",
             "set_traffic_lights",
+            "set_window_title",
             "show_lookup_popover",
             "update_book_presence",
             "clear_book_presence",
             "clip_url",
+            "open_web_browser",
+            "fetch_web_browser_resource",
+            "get_media_proxy_base",
+            "get_media_file_url",
+            "set_web_browser_status",
+            "extract_web_browser_archive",
             "spawn_fresh_browser",
             "verify_update_signature",
             "install_nightly_update",
+            "localsend_start",
+            "localsend_stop",
+            "localsend_get_status",
+            "localsend_list_devices",
+            "localsend_announce",
+            "localsend_set_discoverable",
+            "localsend_is_alive",
+            "localsend_respond",
+            "localsend_cancel_receive",
+            "localsend_send_files",
+            "localsend_cancel_send",
         ]),
     ))
     .expect("failed to run tauri-build");
@@ -103,6 +138,15 @@ fn read_json_string_field(path: &Path, key: &str) -> Option<String> {
 /// at the app root. Absent everywhere => unset, so reporting stays disabled for
 /// local and fork builds. `rerun-if-*` makes cargo recompile when the value or
 /// the dotenv files change (avoiding a stale baked-in value).
+///
+/// Debug builds never bake a DSN, whatever the environment or the dotenv files
+/// say. `tauri dev` and `tauri ios dev` serve the app from the dev server, which
+/// puts the page on a different origin than Tauri's IPC custom protocol, so every
+/// report the injected `@sentry/browser` sends over that bridge fails -- and each
+/// failure logs an error that Sentry turns into another report, which spins until
+/// the WebView is too busy to render. The DSN is cleared rather than merely left
+/// unset because `option_env!` would otherwise still see a `SENTRY_DSN` exported
+/// in the developer's shell.
 fn propagate_sentry_dsn() {
     println!("cargo:rerun-if-env-changed=SENTRY_DSN");
     let app_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
@@ -110,6 +154,11 @@ fn propagate_sentry_dsn() {
     let env_file = app_dir.join(".env");
     println!("cargo:rerun-if-changed={}", env_local.display());
     println!("cargo:rerun-if-changed={}", env_file.display());
+
+    if env::var("PROFILE").as_deref() != Ok("release") {
+        println!("cargo:rustc-env=SENTRY_DSN=");
+        return;
+    }
 
     let dsn = env::var("SENTRY_DSN")
         .ok()

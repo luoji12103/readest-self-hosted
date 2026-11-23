@@ -1,18 +1,58 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { render, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
+import tinycolor from 'tinycolor2';
+
+const requestCoverThumbnailMock = vi.fn();
+
+vi.mock('@/services/environment', () => ({
+  getInitializedAppService: () => ({
+    supportsCoverThumbnailOptimization: true,
+    requestCoverThumbnail: requestCoverThumbnailMock,
+  }),
+  isTauriAppPlatform: () => true,
+}));
 
 import BookCover from '@/components/BookCover';
 import { Book } from '@/types/book';
+import { SystemSettings } from '@/types/settings';
+import { useLibraryStore } from '@/store/libraryStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { DEFAULT_SYSTEM_SETTINGS } from '@/services/constants';
+
+// When set, the mock image reports `load` while it mounts, like a cached cover
+// that the browser finishes before React flushes the mount's passive effects.
+let loadOnMount = false;
 
 vi.mock('next/image', () => ({
   __esModule: true,
   default: (props: Record<string, unknown>) => {
+    const onLoad = props['onLoad'] as
+      | ((e: { currentTarget: HTMLImageElement }) => void)
+      | undefined;
+    const ref = (img: HTMLImageElement | null) => {
+      if (img && loadOnMount) onLoad?.({ currentTarget: img });
+    };
     // biome-ignore lint/a11y/useAltText: test mock; alt comes from spread props
-    return <img {...props} />;
+    return <img {...props} ref={ref} />;
   },
 }));
 
-afterEach(cleanup);
+beforeEach(() => {
+  loadOnMount = false;
+  requestCoverThumbnailMock.mockClear();
+  useLibraryStore.setState({
+    coverThumbnails: new Map(),
+    library: [],
+    hashIndex: new Map(),
+    visibleLibrary: [],
+  });
+  useSettingsStore.setState({ settings: { ...DEFAULT_SYSTEM_SETTINGS } as SystemSettings });
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const makeBook = (overrides?: Partial<Book>): Book =>
   ({
@@ -25,6 +65,82 @@ const makeBook = (overrides?: Partial<Book>): Book =>
   }) as Book;
 
 describe('BookCover', () => {
+  it.each([
+    'crop',
+    'fit',
+  ] as const)('renders a colored Classic cover without artwork (%s)', (coverFit) => {
+    const { container } = render(
+      <BookCover
+        book={makeBook({ hash: '6e16b9ea78d31201', format: 'TXT', coverImageUrl: null })}
+        coverFit={coverFit}
+      />,
+    );
+    const cover = container.querySelector<HTMLElement>('.fallback-cover')!;
+
+    expect(cover.textContent).toContain('TXT');
+    expect(cover.textContent).toContain('Test Book');
+    expect(cover.textContent).toContain('Test Author');
+    expect(cover.style.backgroundColor).toBe('rgb(161, 85, 67)');
+    expect(container.querySelector('img')).toBeNull();
+  });
+
+  it('keeps the book color across edits, layout changes and remounts', () => {
+    const book = makeBook({ coverImageUrl: null });
+    const { container, rerender, unmount } = render(<BookCover book={book} />);
+    const color = container.querySelector<HTMLElement>('.fallback-cover')!.style.backgroundColor;
+    expect(color).not.toBe('');
+
+    rerender(
+      <BookCover
+        book={{ ...book, title: 'Renamed', author: 'Edited Author', updatedAt: 2 }}
+        mode='list'
+        coverFit='fit'
+      />,
+    );
+    expect(container.querySelector<HTMLElement>('.fallback-cover')!.style.backgroundColor).toBe(
+      color,
+    );
+    expect(container.querySelector('.fallback-cover')?.textContent).toContain('Renamed');
+    unmount();
+
+    const remounted = render(<BookCover book={{ ...book }} isPreview />);
+    expect(
+      remounted.container.querySelector<HTMLElement>('.fallback-cover')!.style.backgroundColor,
+    ).toBe(color);
+  });
+
+  it('provides eight readable cover colors from stable book hashes', () => {
+    const colors = new Set<string>();
+    for (let i = 0; i < 8; i++) {
+      const { container, unmount } = render(
+        <BookCover book={makeBook({ hash: `${i}`, coverImageUrl: null })} />,
+      );
+      const cover = container.querySelector<HTMLElement>('.fallback-cover')!;
+      colors.add(cover.style.backgroundColor);
+      expect(
+        tinycolor.readability(cover.style.backgroundColor, cover.style.color),
+      ).toBeGreaterThanOrEqual(4.5);
+      unmount();
+    }
+    expect(colors.size).toBe(8);
+  });
+
+  it('supports a metadata-source preview without a book hash or file format', () => {
+    const { container } = render(
+      <BookCover book={{ title: 'Metadata result', author: 'Author' } as Book} mode='list' />,
+    );
+    expect(container.querySelector('.fallback-cover')?.textContent).toContain('Metadata result');
+  });
+
+  it.each([
+    'ABS',
+    'OPDSAUDIO',
+    'BOOKORBIT',
+  ] as const)('does not label a streaming source code as a file format (%s)', (format) => {
+    const { container } = render(<BookCover book={makeBook({ format, coverImageUrl: null })} />);
+    expect(container.querySelector('.fallback-cover')?.textContent).not.toContain(format);
+  });
+
   it('passes loading="lazy" to crop-mode Image', () => {
     const { container } = render(<BookCover book={makeBook()} coverFit='crop' />);
     const img = container.querySelector('img.cover-image');
@@ -63,5 +179,244 @@ describe('BookCover', () => {
     const { container } = render(<BookCover book={book} coverFit='crop' />);
     const fallback = container.querySelector('.fallback-cover');
     expect(fallback?.textContent).toContain('Edited Author');
+  });
+
+  it('shows the placeholder and reports an error when the original cover cannot load', () => {
+    const onImageError = vi.fn();
+    const { container } = render(
+      <BookCover book={makeBook()} coverFit='crop' onImageError={onImageError} />,
+    );
+
+    fireEvent.error(container.querySelector('img')!);
+
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(false);
+    expect(container.querySelector<HTMLElement>('.fallback-cover')!.style.backgroundColor).not.toBe(
+      '',
+    );
+    expect(onImageError).toHaveBeenCalledOnce();
+  });
+
+  it('uses an edited metadata cover without scheduling native optimization', () => {
+    const { container } = render(
+      <BookCover
+        book={makeBook({
+          coverImageUrl: 'asset://original.png',
+          metadata: { coverImageUrl: 'blob:edited-cover' } as Book['metadata'],
+        })}
+        coverFit='crop'
+      />,
+    );
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('blob:edited-cover');
+    expect(requestCoverThumbnailMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the original cover visible while requesting its thumbnail', async () => {
+    const book = makeBook({
+      coverHash: 'cover-v1',
+      coverImageUrl: 'https://example.com/full-size-cover.jpg',
+    });
+
+    const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe(
+      'https://example.com/full-size-cover.jpg',
+    );
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
+    await waitFor(() => expect(requestCoverThumbnailMock).toHaveBeenCalledWith(book));
+  });
+
+  it('switches to a matching optimized thumbnail without mutating the original cover URL', () => {
+    const book = makeBook({
+      hash: 'book-1',
+      coverHash: 'cover-v1',
+      coverImageUrl: 'https://example.com/full-size-cover.jpg',
+    });
+    useLibraryStore.setState({
+      library: [book],
+      hashIndex: new Map([['book-1', 0]]),
+      visibleLibrary: [book],
+    });
+    const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+    act(() => {
+      useLibraryStore
+        .getState()
+        .setBookCoverThumbnail('book-1', 'cover-v1', 'asset://thumbnail.jpg');
+    });
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('asset://thumbnail.jpg');
+    expect(book.coverImageUrl).toBe('https://example.com/full-size-cover.jpg');
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
+  });
+
+  it('ignores a thumbnail for an older cover revision and requests the current one', async () => {
+    const book = makeBook({
+      hash: 'book-1',
+      coverHash: 'cover-v2',
+      coverImageUrl: 'asset://original-v2.png',
+    });
+    useLibraryStore.setState({
+      coverThumbnails: new Map([
+        ['book-1', { coverHash: 'cover-v1', url: 'asset://stale-thumbnail.jpg' }],
+      ]),
+    });
+
+    const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('asset://original-v2.png');
+    await waitFor(() => expect(requestCoverThumbnailMock).toHaveBeenCalledWith(book));
+  });
+
+  it('requests a new thumbnail when the cover revision changes without a timestamp change', async () => {
+    const book = makeBook({ hash: 'book-1', coverHash: 'cover-v1', updatedAt: 1 });
+    const { rerender } = render(<BookCover book={book} coverFit='crop' />);
+    await waitFor(() => expect(requestCoverThumbnailMock).toHaveBeenCalledWith(book));
+
+    const revisedBook = { ...book, coverHash: 'cover-v2' };
+    rerender(<BookCover book={revisedBook} coverFit='crop' />);
+
+    await waitFor(() => expect(requestCoverThumbnailMock).toHaveBeenCalledWith(revisedBook));
+  });
+
+  it('falls back to the original image rather than the placeholder if a thumbnail cannot load', () => {
+    const book = makeBook({
+      hash: 'book-1',
+      coverHash: 'cover-v1',
+      coverImageUrl: 'https://example.com/full-size-cover.jpg',
+    });
+    useLibraryStore.setState({
+      library: [book],
+      hashIndex: new Map([['book-1', 0]]),
+      visibleLibrary: [book],
+    });
+    useLibraryStore.getState().setBookCoverThumbnail('book-1', 'cover-v1', 'asset://thumbnail.jpg');
+    const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+    fireEvent.error(container.querySelector('img')!);
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe(
+      'https://example.com/full-size-cover.jpg',
+    );
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
+  });
+
+  it('keeps the spine when a cached cover loads before the mount effects run', () => {
+    loadOnMount = true;
+    const { container } = render(<BookCover book={makeBook()} coverFit='crop' showSpine />);
+
+    expect(container.querySelector('.book-spine')?.classList.contains('visible')).toBe(true);
+  });
+
+  it('waits for the viewport prefetch margin before requesting optimization', () => {
+    let reveal: (() => void) | undefined;
+    const observe = vi.fn();
+    const unobserve = vi.fn();
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          reveal = () =>
+            callback(
+              [
+                {
+                  isIntersecting: true,
+                  target: observe.mock.calls[0]![0],
+                } as IntersectionObserverEntry,
+              ],
+              this as unknown as IntersectionObserver,
+            );
+        }
+        observe = observe;
+        unobserve = unobserve;
+        disconnect = vi.fn();
+        takeRecords = () => [];
+        root = null;
+        rootMargin = '400px';
+        thresholds = [0];
+      },
+    );
+    const book = makeBook({ coverHash: 'cover-v1' });
+
+    const { rerender } = render(<BookCover book={book} coverFit='crop' />);
+
+    expect(observe).toHaveBeenCalledOnce();
+    expect(requestCoverThumbnailMock).not.toHaveBeenCalled();
+    const progressedBook = { ...book, updatedAt: 2 };
+    rerender(<BookCover book={progressedBook} coverFit='crop' />);
+    expect(observe).toHaveBeenCalledOnce();
+    act(() => reveal?.());
+    expect(requestCoverThumbnailMock).toHaveBeenCalledWith(progressedBook);
+    expect(unobserve).toHaveBeenCalledOnce();
+  });
+
+  describe('hide covers', () => {
+    const enableHideCovers = () =>
+      useSettingsStore.setState({
+        settings: {
+          ...DEFAULT_SYSTEM_SETTINGS,
+          libraryHideCovers: true,
+        } as SystemSettings,
+      });
+
+    it('renders the title panel instead of the cover image when enabled', () => {
+      enableHideCovers();
+      const book = makeBook();
+
+      const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+      expect(container.querySelector('img.cover-image')).toBeNull();
+      const fallback = container.querySelector('.fallback-cover');
+      expect(fallback).toBeTruthy();
+      expect(fallback?.classList.contains('invisible')).toBe(false);
+      expect(fallback?.textContent).toContain('Test Book');
+      expect((fallback as HTMLElement).style.backgroundColor).toBe('');
+      expect(fallback?.textContent).not.toContain('EPUB');
+    });
+
+    it('does not request thumbnail optimization when covers are hidden', async () => {
+      enableHideCovers();
+      const book = makeBook({ hash: 'book-1', coverHash: 'cover-v1' });
+
+      render(<BookCover book={book} coverFit='crop' />);
+
+      await waitFor(() => expect(requestCoverThumbnailMock).not.toHaveBeenCalled());
+    });
+
+    it('still renders the real cover when the option is disabled', () => {
+      const book = makeBook();
+
+      const { container } = render(<BookCover book={book} coverFit='crop' />);
+
+      expect(container.querySelector('img.cover-image')).toBeTruthy();
+      expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
+        true,
+      );
+    });
+
+    it('switches an already-mounted cover when the option is toggled', () => {
+      const book = makeBook();
+      const { container } = render(<BookCover book={book} coverFit='crop' />);
+      expect(container.querySelector('img.cover-image')).toBeTruthy();
+
+      act(() => enableHideCovers());
+
+      expect(container.querySelector('img.cover-image')).toBeNull();
+      expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
+        false,
+      );
+    });
+
+    it('hides the spine when covers are hidden even after a cover has loaded', () => {
+      const book = makeBook();
+      const { container } = render(<BookCover book={book} coverFit='crop' showSpine />);
+      const img = container.querySelector('img.cover-image')!;
+      fireEvent.load(img);
+      expect(container.querySelector('.book-spine')?.classList.contains('visible')).toBe(true);
+
+      act(() => enableHideCovers());
+
+      expect(container.querySelector('.book-spine')?.classList.contains('visible')).toBe(false);
+    });
   });
 });

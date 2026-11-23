@@ -58,14 +58,21 @@ export interface ResolvedNightlyUpdate {
   signature: string; // artifact signature
 }
 
+// Android ships one APK per ABI group. osArch() reports the ABI of the loaded
+// native library, so it picks the APK this install can actually run.
+export const getAndroidPlatformKey = (osArchVal: string): string => {
+  if (osArchVal === 'aarch64') return 'android-arm64';
+  if (osArchVal === 'arm') return 'android-armv7';
+  return 'android-legacy';
+};
+
 export const getNightlyPlatformKey = (
   osTypeVal: string,
   osArchVal: string,
   isPortable: boolean,
   isAppImage: boolean,
 ): string | null => {
-  if (osTypeVal === 'android')
-    return osArchVal === 'aarch64' ? 'android-arm64' : 'android-universal';
+  if (osTypeVal === 'android') return getAndroidPlatformKey(osArchVal);
   if (osTypeVal === 'macos') return osArchVal === 'aarch64' ? 'darwin-aarch64' : 'darwin-x86_64';
   // Match the arch explicitly so a 32-bit (or otherwise unknown) arch yields no
   // nightly rather than mis-routing to aarch64.

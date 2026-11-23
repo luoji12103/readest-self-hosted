@@ -22,8 +22,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const PAGE_W = 612;
 const PAGE_H = 792;
 
-// Minimal stand-in for the vendored pdf.js build. foliate-js/pdf.js imports it
-// for the side effect of setting globalThis.pdfjsLib, then reads from that
+// Minimal stand-in for the vendored pdf.js build. foliate-js/pdf.js loads it
+// from makePDF() for the side effect of setting globalThis.pdfjsLib, then reads from that
 // global — so the mock installs a controllable fake there.
 vi.mock('@pdfjs/pdf.min.mjs', () => {
   class PDFDataRangeTransport {
@@ -50,7 +50,9 @@ vi.mock('@pdfjs/pdf.min.mjs', () => {
     numPages: 3,
     getPage: vi.fn(async () => makePage()),
     getMetadata: vi.fn(async () => ({ metadata: undefined, info: {} })),
+    getViewerPreferences: vi.fn(async () => null),
     getOutline: vi.fn(async () => null),
+    getPageLabels: vi.fn(async () => null),
     getDestination: vi.fn(),
     getPageIndex: vi.fn(),
     destroy: vi.fn(),
@@ -119,17 +121,18 @@ describe('PDF spread canvas seam (#4587)', () => {
     const canvas = doc.querySelector('#canvas canvas') as HTMLCanvasElement;
     expect(canvas).toBeTruthy();
 
-    // The over-sampled bitmap width is an integer and is truncated below its
-    // ideal size — this is the truncation that, left to drive layout, produced
-    // the seam.
+    // The over-sampled bitmap width is an integer, so it can't equal the
+    // fractional ideal size. Truncated and left to drive layout, it produced the
+    // seam.
     expect(Number.isInteger(canvas.width)).toBe(true);
-    expect(canvas.width).toBeLessThan(bitmapWidth);
+    expect(canvas.width).toBe(Math.ceil(bitmapWidth));
 
-    // The fix: the canvas CSS box is the un-truncated *display* size (the page
-    // box), independent of the truncated bitmap, so the page fills its box
-    // exactly (displayed width = box width) and the left page reaches the spine —
-    // no white seam. The browser scales the over-sampled bitmap to fill the box.
+    // The fix: the canvas has an explicit CSS box that covers the whole page box
+    // (here rounded up to the next device pixel, so the raster also maps 1:1 onto
+    // the screen, #6928), and the left page reaches the spine: no white seam.
     expect(canvas.style.width).not.toBe('');
-    expect(parseFloat(canvas.style.width)).toBeCloseTo(pageBoxWidth, 3);
+    const cssWidth = parseFloat(canvas.style.width);
+    expect(cssWidth).toBeGreaterThanOrEqual(pageBoxWidth);
+    expect(cssWidth - pageBoxWidth).toBeLessThan(1 / 1.5);
   });
 });

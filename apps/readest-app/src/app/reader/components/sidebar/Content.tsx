@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 import { BookDoc } from '@/libs/document';
 import { useReaderStore } from '@/store/readerStore';
@@ -19,28 +19,37 @@ const SidebarContent: React.FC<{
   sideBarBookKey: string;
 }> = ({ bookDoc, sideBarBookKey }) => {
   const { setHoveredBookKey } = useReaderStore();
-  const { setSideBarVisible } = useSidebarStore();
+  const { setSideBarVisible, setSearchBarVisible } = useSidebarStore();
   const { getConfig, setConfig } = useBookDataStore();
   const { settings } = useSettingsStore();
   const config = getConfig(sideBarBookKey);
   const [activeTab, setActiveTab] = useState(config?.viewSettings?.sideBarTab || 'toc');
   const [fade, setFade] = useState(false);
   const [targetTab, setTargetTab] = useState(activeTab);
+  const transitionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMobile = window.innerWidth < 640 || window.innerHeight < 640;
   const aiEnabled = settings?.aiSettings?.enabled ?? false;
 
+  const configuredTab = config?.viewSettings?.sideBarTab || 'toc';
   useEffect(() => {
-    if (!sideBarBookKey) return;
-    const config = getConfig(sideBarBookKey!)!;
-    setActiveTab(config.viewSettings!.sideBarTab!);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideBarBookKey]);
+    if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
+    transitionTimeoutRef.current = null;
+    setActiveTab(configuredTab);
+    setTargetTab(configuredTab);
+    setFade(false);
+    return () => {
+      if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
+    };
+  }, [sideBarBookKey, configuredTab]);
 
   // reset to toc if history tab was active but AI is now disabled
   useEffect(() => {
     if ((activeTab === 'history' || targetTab === 'history') && !aiEnabled) {
+      if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
+      transitionTimeoutRef.current = null;
       setActiveTab('toc');
       setTargetTab('toc');
+      setFade(false);
     }
   }, [aiEnabled, activeTab, targetTab]);
 
@@ -53,24 +62,30 @@ const SidebarContent: React.FC<{
       return;
     }
 
+    // The header search icon is contextual (annotation search vs in-book
+    // search), so an open search bar never survives a tab switch.
+    setSearchBarVisible(false);
+    if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
     setFade(true);
-    const timeout = setTimeout(() => {
+    setActiveTab(tab);
+    transitionTimeoutRef.current = setTimeout(() => {
+      transitionTimeoutRef.current = null;
       setTargetTab(tab);
       setFade(false);
-      setConfig(sideBarBookKey!, config);
-      clearTimeout(timeout);
+      const latestConfig = getConfig(sideBarBookKey);
+      if (latestConfig) {
+        setConfig(sideBarBookKey, {
+          viewSettings: { ...latestConfig.viewSettings, sideBarTab: tab },
+        });
+      }
     }, 300);
-
-    setActiveTab(tab);
-    const config = getConfig(sideBarBookKey!)!;
-    config.viewSettings!.sideBarTab = tab;
   };
 
   return (
     <>
       <div
         className={clsx(
-          'sidebar-content flex h-full min-h-0 flex-grow flex-col shadow-inner',
+          'sidebar-content flex h-full min-h-0 grow flex-col shadow-inner',
           'font-sans text-base font-normal sm:text-sm',
         )}
       >
@@ -80,6 +95,10 @@ const SidebarContent: React.FC<{
           <OverlayScrollbarsComponent
             className='min-h-0 flex-1'
             options={{
+              // The tab content is width-bound; x stays hidden so oversized
+              // touch-target halos (e.g. the toolbar's dropdown toggle) can't
+              // turn into a horizontal scrollbar.
+              overflow: { x: 'hidden' },
               scrollbars: { autoHide: 'scroll', clickScroll: true },
               showNativeOverlaidScrollbars: false,
             }}
@@ -94,8 +113,8 @@ const SidebarContent: React.FC<{
                 },
               )}
             >
-              {targetTab === 'toc' && bookDoc.toc && (
-                <TOCView toc={bookDoc.toc} bookKey={sideBarBookKey} />
+              {targetTab === 'toc' && (bookDoc.toc || bookDoc.getPageThumbnail) && (
+                <TOCView toc={bookDoc.toc ?? []} bookDoc={bookDoc} bookKey={sideBarBookKey} />
               )}
               {targetTab === 'annotations' && (
                 <BooknoteView type='annotation' toc={bookDoc.toc ?? []} bookKey={sideBarBookKey} />
@@ -108,7 +127,7 @@ const SidebarContent: React.FC<{
         )}
       </div>
       <div
-        className='flex-shrink-0'
+        className='shrink-0'
         style={
           {
             // paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) / 2)',

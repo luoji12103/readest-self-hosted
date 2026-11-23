@@ -11,9 +11,6 @@ on:
         description: Version to package, without a leading v. Defaults to the release tag version.
         required: false
         type: string
-  push:
-    tags:
-      - 'selfhost-v*'
 
 permissions:
   contents: write

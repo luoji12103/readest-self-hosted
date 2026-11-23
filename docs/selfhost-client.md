@@ -133,6 +133,10 @@ For Android, base64-encode the keystore file and store that encoded value in `AN
 
 Stable selfhost releases use tags such as `selfhost-v0.11.20`. The release workflow builds and audits the complete configured Windows, Linux, macOS, and Android matrix before publishing an immutable GitHub Release and updater `latest.json`.
 
+After review, manually run **Release Selfhost** (`release-selfhost.yml`) against the branch or tag that points to the source commit to package. Set `tag` to the desired selfhost tag. The optional `release_version` defaults to the version in that tag. If the tag already exists, it must point to the selected commit. Pushing a selfhost tag does not trigger the release workflow.
+
+**Backfill Selfhost Releases** lists missing tags for maintainers to review. Both values of `dry_run` only list candidates; the workflow does not create tags or start release builds. Review the source for each historical version before manually releasing it.
+
 The `0.11.21-selfhost.1` compatibility build uses a staged exception: the first workflow run builds only a signed Android arm64 APK and keeps it as a 14-day GitHub Actions artifact for real-device validation. It does not create or modify a public Release. The complete affected matrix and stable/latest Release are built only after that APK is confirmed on a real device.
 
 The default updater URL points at this fork's public GitHub Release metadata:
@@ -145,6 +149,8 @@ Android APKs are published by the workflow. Platform-level automatic app update 
 
 ## Syncing Upstream
 
-The `sync-upstream.yml` workflow watches strict stable upstream tags and selects the newest stable version. It does not continuously follow `upstream/main` or prerelease tags.
+The scheduled or manually dispatched **Check Stable Upstream Candidate** workflow (`sync-upstream.yml`) selects the newest upstream tag of the form `vMAJOR.MINOR.PATCH` and checks that its commit is reachable from `upstream/main`. Prerelease tags and untagged upstream commits are excluded. The fork's only sync base is `origin/main`. The retired `selfhost-main` branch remains at its historical commit.
 
-For a new stable tag, the workflow replays the selfhost commit stack onto that tagged upstream commit, runs the client, Lua, release-contract, and safety checks, then atomically updates `main`, `selfhost-main`, and the matching selfhost tag. If rebase or validation fails, the published branches remain unchanged for manual resolution.
+If `origin/main` already contains the stable commit, the job summary reports that there is nothing to merge. Otherwise the workflow merges the tagged commit into a temporary branch on the runner and checks the client, Lua plugin, Rust code, Web build, release contracts, legacy updater compatibility, and public fork safety. The summary shows the fork base, upstream tag and commit, candidate commit and tree when available, and the result. For a conflict or a failed check, open the corresponding step log.
+
+The temporary branch exists only for that run. To propose the update, recreate the merge of the recorded upstream commit into the recorded fork base on a local review branch, compare its tree with the summary, and open a pull request to `main`. If `main` has moved, recheck the merge against the new base before submitting it. The sync workflow never pushes a branch or tag or starts a release.

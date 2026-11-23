@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'vitest';
 
-import { formatCountdown, formatPlaybackTime } from '@/utils/time';
+import {
+  formatCompactTime,
+  formatCountdown,
+  formatPlaybackTime,
+  splitDuration,
+} from '@/utils/time';
 
 describe('formatPlaybackTime', () => {
   test('formats minutes and seconds by default', () => {
@@ -32,6 +37,39 @@ describe('formatPlaybackTime', () => {
   });
 });
 
+describe('formatCompactTime', () => {
+  test('formats minutes and seconds below one hour', () => {
+    expect(formatCompactTime(0)).toBe('0:00');
+    expect(formatCompactTime(5)).toBe('0:05');
+    expect(formatCompactTime(62)).toBe('1:02');
+    expect(formatCompactTime(3599)).toBe('59:59');
+  });
+
+  test('drops the seconds once the value reaches one hour', () => {
+    // The minimal mini player has room for one time; above an hour the
+    // seconds go rather than letting a three-part clock get truncated.
+    expect(formatCompactTime(3600)).toBe('1:00');
+    expect(formatCompactTime(3600 + 61)).toBe('1:01');
+    expect(formatCompactTime(7 * 3600 + 59 * 60 + 59)).toBe('7:59');
+  });
+
+  test('floors rather than rounding up across an hour boundary', () => {
+    // A second short of the boundary still reads as "under", both times.
+    expect(formatCompactTime(3599)).toBe('59:59');
+    expect(formatCompactTime(2 * 3600 - 1)).toBe('1:59');
+  });
+
+  test('clamps negative and non-finite input to zero', () => {
+    expect(formatCompactTime(-5)).toBe('0:00');
+    expect(formatCompactTime(Number.NaN)).toBe('0:00');
+    expect(formatCompactTime(Number.POSITIVE_INFINITY)).toBe('0:00');
+  });
+
+  test('truncates fractional seconds', () => {
+    expect(formatCompactTime(59.9)).toBe('0:59');
+  });
+});
+
 describe('formatCountdown', () => {
   test('formats total minutes and seconds', () => {
     expect(formatCountdown(90_000)).toBe('1:30');
@@ -42,5 +80,26 @@ describe('formatCountdown', () => {
 
   test('clamps negative remaining time to zero', () => {
     expect(formatCountdown(-1_000)).toBe('0:00');
+  });
+});
+
+// `formatCompactTime` renders both 7h55m and 7m55s as "7:55" — fine in the
+// mini player, where the value is a live countdown in a fixed-width row, but
+// misleading on the shelf where books of very different lengths sit side by
+// side. splitDuration gives the caller the parts to label with real units.
+describe('splitDuration', () => {
+  test('splits into hours, minutes and seconds', () => {
+    expect(splitDuration(7 * 3600 + 55 * 60 + 36)).toEqual({
+      hours: 7,
+      minutes: 55,
+      seconds: 36,
+    });
+    expect(splitDuration(35)).toEqual({ hours: 0, minutes: 0, seconds: 35 });
+    expect(splitDuration(7 * 60 + 55)).toEqual({ hours: 0, minutes: 7, seconds: 55 });
+  });
+
+  test('clamps junk to zero rather than emitting NaN', () => {
+    expect(splitDuration(-5)).toEqual({ hours: 0, minutes: 0, seconds: 0 });
+    expect(splitDuration(Number.NaN)).toEqual({ hours: 0, minutes: 0, seconds: 0 });
   });
 });

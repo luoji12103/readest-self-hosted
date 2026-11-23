@@ -1,3 +1,4 @@
+use dispatch2::DispatchQueue;
 use objc::{msg_send, sel, sel_impl};
 use rand::{distributions::Alphanumeric, Rng};
 use tauri::{
@@ -62,6 +63,34 @@ pub fn set_traffic_lights(window: Window, visible: bool, header_height: f64) {
         };
         position_traffic_lights(UnsafeWindowHandle(ns_window), visible);
     }
+}
+
+/// Sets the window title and re-applies the traffic-light layout in the
+/// same main-thread pass.
+///
+/// `-[NSWindow setTitle:]` makes AppKit re-lay out the title bar, which
+/// restores the standard 28pt container: the buttons drop to their default
+/// 6pt below the window top (ours centers them at 14 for the 44pt header),
+/// or come back on screen where the reader had parked them off the top.
+/// Every page sets the title on mount, and any correction issued from the
+/// frontend arrives an IPC round-trip later — after AppKit has already
+/// painted the default — so the buttons visibly flicked between the two
+/// positions on every library <-> reader navigation (#6222). Doing both
+/// here, before control returns to the run loop, means the default layout
+/// is never painted.
+#[command]
+pub fn set_window_title(window: Window, title: String) -> Result<(), String> {
+    let handle = UnsafeWindowHandle(window.ns_window().map_err(|e| e.to_string())?);
+    window
+        .run_on_main_thread(move || unsafe {
+            use cocoa::appkit::NSWindow;
+            use cocoa::foundation::NSString;
+            let ns_window = handle.0 as cocoa::base::id;
+            let ns_title = NSString::alloc(cocoa::base::nil).init_str(&title);
+            ns_window.setTitle_(ns_title);
+            position_traffic_lights(handle, TRAFFIC_LIGHTS_VISIBLE);
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Centers the close button vertically inside `header_height`.
@@ -388,6 +417,22 @@ pub fn setup_traffic_light_positioner<R: Runtime>(window: Window<R>) {
 
                 let super_del: id = *this.get_ivar("super_delegate");
                 let _: () = msg_send![super_del, windowDidExitFullScreen: notification];
+
+                // Tao restores the normal frame in its delegate callback above
+                // and can enqueue a maximize restoration. Defer the defensive
+                // hide on that same serial GCD queue so its frame mutation is
+                // ordered after Tao's style-mask and maximize work.
+                let mut main_window = None;
+                with_window_state(this, |state: &mut WindowState<R>| {
+                    if state.window.label() == "main" {
+                        main_window = Some(state.window.clone());
+                    }
+                });
+                if let Some(main_window) = main_window {
+                    DispatchQueue::main().exec_async(move || {
+                        super::window::finish_pending_fullscreen_hide(&main_window);
+                    });
+                }
             }
         }
         extern "C" fn on_window_will_exit_full_screen<R: Runtime>(
@@ -416,6 +461,17 @@ pub fn setup_traffic_light_positioner<R: Runtime>(window: Window<R>) {
                 let super_del: id = *this.get_ivar("super_delegate");
                 let _: () = msg_send![super_del, windowDidFailToEnterFullScreen: window];
             }
+        }
+        extern "C" fn on_window_did_fail_to_exit_full_screen<R: Runtime>(
+            this: &Object,
+            _cmd: Sel,
+            _window: id,
+        ) {
+            with_window_state(this, |state: &mut WindowState<R>| {
+                if state.window.label() == "main" {
+                    super::window::finish_failed_fullscreen_hide(&state.window);
+                }
+            });
         }
         extern "C" fn on_effective_appearance_did_change(
             this: &Object,
@@ -479,6 +535,7 @@ pub fn setup_traffic_light_positioner<R: Runtime>(window: Window<R>) {
             (windowDidExitFullScreen:) => on_window_did_exit_full_screen::<R> as extern "C" fn(&Object, Sel, id),
             (windowWillExitFullScreen:) => on_window_will_exit_full_screen::<R> as extern "C" fn(&Object, Sel, id),
             (windowDidFailToEnterFullScreen:) => on_window_did_fail_to_enter_full_screen as extern "C" fn(&Object, Sel, id),
+            (windowDidFailToExitFullScreen:) => on_window_did_fail_to_exit_full_screen::<R> as extern "C" fn(&Object, Sel, id),
             (effectiveAppearanceDidChange:) => on_effective_appearance_did_change as extern "C" fn(&Object, Sel, id),
             (effectiveAppearanceDidChangedOnMainThread:) => on_effective_appearance_did_changed_on_main_thread as extern "C" fn(&Object, Sel, id)
         }))

@@ -8,7 +8,9 @@
 // The generalized `build` mode assembles a pack for any (src→tgt) pair where one
 // side is English, from two open datasets:
 //   - FrequencyWords (CC-BY-SA-4.0): `word count` per line, descending → rank.
-//   - kaikki Wiktionary extract (CC-BY-SA-4.0): JSONL, used for the gloss map.
+//   - kaikki.org raw wiktextract dump (CC-BY-SA-4.0): .jsonl or .jsonl.gz, used for
+//     the gloss map. The raw dump holds every language section of the English
+//     Wiktionary, so each build keeps only the entries whose `lang_code` matches.
 //     tgt === 'en'  → foreign headword → English glosses (extractXToEn).
 //     src === 'en'  → English headword → target-language words (extractEnToX).
 //
@@ -32,6 +34,7 @@ import {
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
+import { createGunzip } from 'node:zlib';
 import { execFileSync } from 'node:child_process';
 
 const OUT_DIR = resolve('data/wordlens');
@@ -602,17 +605,29 @@ export function extractXToEn(jsonlText, sourceCode) {
 
 // Merge an English-headword entry's target-language translations into the map.
 // Gathers sense-level translations then top-level ones; keeps t.code === target
-// with a t.word; value = `${word} (${roman})` when a roman field is present.
+// with a t.word. The `roman` transliteration is dropped: the hint is read by a
+// native speaker of the target language. A translation tagged as a regional
+// variety of that language ("Egyptian-Arabic", "Hijazi-Arabic" — Wiktionary
+// nests dialects under the language with the dialect as a tag) is skipped so
+// the gloss stays in the standard written language. A word that mixes Latin
+// letters into another script ("سِلْك m شُعَاع", "Hijazi Arabic وحش") is a
+// translation-template artifact — a gender marker, "or", "imperfective:", an
+// inline dialect label — and is skipped too; a pure-Latin target (vi, hu) never
+// trips this.
+const LATIN = /\p{Script=Latin}/u;
+const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/u;
+const mixesScripts = (word) => LATIN.test(word) && NON_LATIN_LETTER.test(word);
+
 function mergeEnToXEntry(obj, targetCode, glossMap) {
   if (!obj || !obj.word) return;
   if (obj.lang_code !== 'en') return;
   const collected = [];
   const consider = (t) => {
     if (!t || t.code !== targetCode || !t.word) return;
+    if (t.lang && (t.tags ?? []).some((tag) => String(tag).endsWith(`-${t.lang}`))) return;
     const word = String(t.word).trim();
-    if (!word) return;
-    const value = t.roman ? `${word} (${String(t.roman).trim()})` : word;
-    if (!collected.includes(value)) collected.push(value);
+    if (!word || mixesScripts(word)) return;
+    if (!collected.includes(word)) collected.push(word);
   };
   const senses = Array.isArray(obj.senses) ? obj.senses : [];
   for (const sense of senses) {
@@ -630,6 +645,26 @@ function mergeEnToXEntry(obj, targetCode, glossMap) {
   glossMap.set(key, existing);
 }
 
+// Wiktionary files the odd editorial note where a translation belongs ("not
+// known in Arabic lands" under honesty's plant sense). It only reads as a gloss
+// in the wrong script, so once the map's dominant script is non-Latin, every
+// sense without a non-Latin letter is dropped (a headword left with none goes
+// too). A Latin-script target (vi, hu) is left as is — nothing to tell apart.
+export function dropOffScriptSenses(glossMap) {
+  let latin = 0;
+  let other = 0;
+  for (const senses of glossMap.values()) {
+    for (const s of senses) NON_LATIN_LETTER.test(s) ? other++ : latin++;
+  }
+  if (other <= latin) return glossMap;
+  for (const [key, senses] of glossMap) {
+    const kept = senses.filter((s) => NON_LATIN_LETTER.test(s));
+    if (kept.length) glossMap.set(key, kept);
+    else glossMap.delete(key);
+  }
+  return glossMap;
+}
+
 // en→X gloss map from in-memory JSONL text (used by tests). headword → words.
 export function extractEnToX(jsonlText, targetCode) {
   const glossMap = new Map();
@@ -643,7 +678,7 @@ export function extractEnToX(jsonlText, targetCode) {
     }
     mergeEnToXEntry(obj, targetCode, glossMap);
   }
-  return glossMap;
+  return dropOffScriptSenses(glossMap);
 }
 
 // WikDict (DBnary/Wiktionary, CC-BY-SA-3.0): rows from the `simple_translation`
@@ -698,14 +733,16 @@ export function inflectionMapFromPack(jsonText) {
   }
 }
 
-// Stream a (possibly ~1 GB) JSONL file line-by-line, applying `perLine(obj)` to
-// each parsed object. Shared by the streaming extractors so the CLI never holds
-// the whole file in memory; parse errors are skipped silently.
+// Stream a JSONL file line-by-line, applying `perLine(obj)` to each parsed object.
+// `.gz` input is gunzipped on the fly, so the ~2.8 GB kaikki raw dump is read as
+// downloaded instead of being inflated (~17 GB) to disk. Shared by the streaming
+// extractors so the CLI never holds the whole file in memory; parse errors are
+// skipped silently.
 async function streamJsonl(path, perLine) {
-  const rl = createInterface({
-    input: createReadStream(path, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  });
+  const file = createReadStream(path);
+  const input = path.endsWith('.gz') ? file.pipe(createGunzip()) : file;
+  input.setEncoding('utf8');
+  const rl = createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
     let obj;
@@ -729,7 +766,7 @@ export async function extractXToEnStream(path, sourceCode) {
 export async function extractEnToXStream(path, targetCode) {
   const glossMap = new Map();
   await streamJsonl(path, (obj) => mergeEnToXEntry(obj, targetCode, glossMap));
-  return glossMap;
+  return dropOffScriptSenses(glossMap);
 }
 
 // Assemble a pack in the GlossIndexData shape from a frequency list + gloss map.

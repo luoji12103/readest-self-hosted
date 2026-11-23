@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { textWalker } from 'foliate-js/text-walker.js';
-import { TTS } from 'foliate-js/tts.js';
-import { createRejectFilter } from '@/utils/node';
+import { TTS, getSentences } from 'foliate-js/tts.js';
+import { createTTSNodeFilter } from '@/services/tts/nodeFilter';
+import { filterSSMLWithLang, parseSSMLMarks } from '@/utils/ssml';
 
 const createHTMLDoc = (bodyHTML: string, attrs: Record<string, string> = {}): Document => {
   const parser = new DOMParser();
@@ -33,22 +34,69 @@ const stripTags = (ssml: string): string => ssml.replace(/<[^>]+\/?>/g, '').trim
 
 const highlight = vi.fn();
 
-/** Node filter mirroring the footnote rules TTSController passes to TTS. */
-const ttsNodeFilter = createRejectFilter({
-  tags: ['rt', 'canvas', 'br'],
-  classes: [
-    'annotationLayer',
-    'epubtype-footnote',
-    'duokan-footnote-content',
-    'duokan-footnote-item',
-  ],
-  attributeTokens: [
-    { tag: 'aside', attribute: 'epub:type', tokens: ['footnote', 'endnote', 'note', 'rearnote'] },
-  ],
-  contents: [{ tag: 'a', content: /^[\[\(]?[\*\d]+[\)\]]?$/ }],
-});
+/** The exact filter TTSController passes to TTS. */
+const ttsNodeFilter = createTTSNodeFilter();
 
 describe('TTS', () => {
+  describe('flat document', () => {
+    // A single-file book, or a chunk of one (foliate-js section-chunks.js,
+    // which keeps a hidden placeholder for every other top-level element):
+    // thousands of blocks directly under <body>.
+    it('walks each block from where it starts, not from the top of the body', () => {
+      const blocks = 200;
+      const doc = createHTMLDoc(
+        Array.from({ length: blocks }, (_, i) => `<p>Sentence ${i}. Another one.</p>`).join(''),
+      );
+      let calls = 0;
+      const countingFilter = (node: Node) => {
+        calls++;
+        return ttsNodeFilter(node);
+      };
+      const sentences = [...getSentences(doc, textWalker, countingFilter, 'sentence')];
+      expect(sentences).toHaveLength(blocks * 2);
+      expect(sentences[blocks]!.range.toString()).toBe(`Sentence ${blocks / 2}. `);
+      // walking every block from the top visits blocks²/2 nodes
+      expect(calls).toBeLessThan(blocks * 20);
+    });
+
+    it('creates no range for each empty block it passes', () => {
+      // Every live range of a document is updated on each of its mutations,
+      // so a range per placeholder slows every later edit, such as inserting
+      // the SSML marks of each block.
+      const placeholders = (n: number) => '<p data-foliate-chunk="1"></p>'.repeat(n);
+      const doc = createHTMLDoc(
+        `${placeholders(1000)}<p>First block.</p><p>Second block.</p>${placeholders(1000)}`,
+      );
+      const createRange = vi.spyOn(doc, 'createRange');
+      const sentences = [...getSentences(doc, textWalker, ttsNodeFilter, 'sentence')];
+      expect(sentences.map((s) => s.range.toString())).toEqual(['First block.', 'Second block.']);
+      expect(createRange.mock.calls.length).toBeLessThan(10);
+    });
+
+    it('marks a copy that is not part of the section document', () => {
+      // A document updates every one of its live ranges on each mutation, and
+      // the read-aloud timeline keeps a range per sentence of the section:
+      // inserting the SSML marks of each block into nodes of the section's own
+      // document paid for all of them, once per mark.
+      const doc = createHTMLDoc('<p>First sentence. Second sentence.</p><p>Third one.</p>');
+      const owners = new Set<Document | null>();
+      const insertNode = Range.prototype.insertNode;
+      const spy = vi.spyOn(Range.prototype, 'insertNode').mockImplementation(function (
+        this: Range,
+        node: Node,
+      ) {
+        owners.add(this.startContainer.ownerDocument);
+        return insertNode.call(this, node);
+      });
+      const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'sentence');
+      const ssml = tts.start();
+      spy.mockRestore();
+      expect(stripTags(ssml!)).toContain('First sentence.');
+      expect(owners.size).toBeGreaterThan(0);
+      expect(owners.has(doc)).toBe(false);
+    });
+  });
+
   describe('plain HTML document', () => {
     it('should init and generate SSML for a plain HTML doc without doctype or lang', () => {
       const doc = createPlainHTMLDoc(`<html><head></head><body><p>Hello world</p></body></html>`);
@@ -275,6 +323,38 @@ describe('TTS', () => {
       expect(combined).not.toContain('Transformed footnote');
     });
 
+    // #6790: an unlinked note marker such as <sup>17</sup> interrupts the
+    // sentence it sits in, like the linked markers the <a> rule skips.
+    it('should not read a bare superscript note marker', () => {
+      const doc = createHTMLDoc('<p>他停下了脚步<sup>17</sup>，然后转身离开。</p>');
+      const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'word');
+      const combined = collectBlocks(tts).join(' ');
+
+      expect(combined).toContain('他停下了脚步');
+      expect(combined).toContain('然后转身离开');
+      expect(combined).not.toContain('17');
+    });
+
+    it('should not read bracketed or starred superscript note markers', () => {
+      for (const marker of ['[3]', '(12)', '*', '†']) {
+        const doc = createHTMLDoc(`<p>Before the mark<sup>${marker}</sup> and after it.</p>`);
+        const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'word');
+        const combined = collectBlocks(tts).join(' ');
+
+        expect(combined).toContain('Before the mark');
+        expect(combined).toContain('and after it');
+        expect(combined).not.toContain(marker);
+      }
+    });
+
+    it('should still read superscripts that carry words', () => {
+      const doc = createHTMLDoc('<p>It was the 1<sup>st</sup> of May.</p>');
+      const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'word');
+      const combined = collectBlocks(tts).join(' ');
+
+      expect(combined).toContain('st');
+    });
+
     it('should not read duokan footnote content', () => {
       const doc = createHTMLDoc(
         '<p>Real text.</p>' + '<div class="duokan-footnote-content"><p>Duokan footnote.</p></div>',
@@ -359,6 +439,70 @@ describe('TTS', () => {
     });
   });
 
+  describe('ruby (furigana) readings', () => {
+    const speak = (bodyHTML: string): string => {
+      const doc = createHTMLDoc(bodyHTML, { lang: 'ja' });
+      const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'sentence');
+      return stripTags(tts.start()!);
+    };
+
+    it('speaks a kana reading instead of the bare-text ruby base', () => {
+      expect(speak('<p><ruby>数多<rt>あまた</rt></ruby>の星</p>')).toBe('あまたの星');
+    });
+
+    it('speaks a kana reading instead of an <rb> ruby base', () => {
+      expect(speak('<p><ruby><rb>数多</rb><rt>あまた</rt></ruby>の星</p>')).toBe('あまたの星');
+    });
+
+    it('speaks an author-assigned katakana reading', () => {
+      expect(speak('<p><ruby>神聖文字<rt>ヒエログリフ</rt></ruby>を読む</p>')).toBe(
+        'ヒエログリフを読む',
+      );
+    });
+
+    it('speaks a gaiji image base through its reading', () => {
+      expect(
+        speak(
+          '<p><ruby><rb><img class="gaiji" src="00007.gif" alt="喰"/></rb><rt>く</rt></ruby>い殺され</p>',
+        ),
+      ).toBe('くい殺され');
+    });
+
+    it('keeps <rp> fallback parentheses out of the speech', () => {
+      expect(speak('<p><ruby>数多<rp>(</rp><rt>あまた</rt><rp>)</rp></ruby>の星</p>')).toBe(
+        'あまたの星',
+      );
+    });
+
+    it('keeps speaking the base when the ruby is an emphasis dot', () => {
+      expect(speak('<p><ruby>本当<rt>・・</rt></ruby>に読む</p>')).toBe('本当に読む');
+    });
+
+    it('keeps speaking the base for a pinyin ruby', () => {
+      expect(speak('<p><ruby>学生<rt>xuéshēng</rt></ruby></p>')).toBe('学生');
+    });
+
+    it('keeps speaking the base under an injected WordLens gloss', () => {
+      expect(
+        speak(
+          '<p><ruby class="wl-gloss" cfi-skip="">辞書<rt cfi-inert="">じしょ</rt></ruby>を引く</p>',
+        ),
+      ).toBe('辞書を引く');
+    });
+
+    it('anchors the highlight range on the spoken reading', () => {
+      const doc = createHTMLDoc('<p><ruby>数多<rt>あまた</rt></ruby>の星</p>', { lang: 'ja' });
+      const tts = new TTS(doc, textWalker, ttsNodeFilter, highlight, 'sentence');
+      tts.start();
+      // The single sentence mark spans the reading through the trailing text,
+      // never the muted kanji base.
+      const range = tts.getLastRange() ?? tts.setMark('0');
+      expect(range).toBeTruthy();
+      expect(range!.toString()).not.toContain('数多');
+      expect(range!.startContainer.parentElement?.tagName.toLowerCase()).toBe('rt');
+    });
+  });
+
   describe('from() selection start', () => {
     // A paragraph whose whole text is one text node (one <span>), so every
     // sentence after the first is a mid-node sub-range — the case where the
@@ -412,6 +556,41 @@ describe('TTS', () => {
     });
   });
 
+  describe('translations added during playback', () => {
+    it('keeps a mark for the first translated sentence after filtering out source text', () => {
+      const doc = createHTMLDoc(
+        '<p>Source sentence.<font lang="fr">Phrase traduite une. Phrase traduite deux.</font></p>',
+        { lang: 'en' },
+      );
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence');
+
+      const translatedSSML = filterSSMLWithLang(tts.start()!, 'fr');
+      const { plainText, marks } = parseSSMLMarks(translatedSSML);
+
+      expect(plainText).toContain('Phrase traduite une');
+      expect(marks).not.toHaveLength(0);
+      expect(marks[0]?.offset).toBe(0);
+    });
+
+    it('keeps the first sentence when a translated paragraph contains multiple sentences', () => {
+      const doc = createHTMLDoc(
+        '<p>Source sentence.<font lang="ru">О все воинство небесное! О земля! Что дальше?</font></p>',
+        { lang: 'en' },
+      );
+      const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence');
+
+      const translatedSSML = filterSSMLWithLang(tts.start()!, 'ru');
+      const { marks } = parseSSMLMarks(translatedSSML);
+
+      expect(marks.map(({ text }) => text)).toEqual([
+        'О все воинство небесное! ',
+        'О земля! ',
+        'Что дальше?',
+      ]);
+      expect(marks[0]?.offset).toBe(0);
+    });
+  });
+
   describe('SSML output correctness', () => {
     it('should produce valid SSML with speak root element', () => {
       const doc = createHTMLDoc('<p>Test content</p>', { lang: 'en' });
@@ -431,5 +610,40 @@ describe('TTS', () => {
       expect(ssml).toBeTruthy();
       expect(ssml).toContain('<mark');
     });
+  });
+});
+
+describe('sentence segmentation', () => {
+  const sentencesOf = (text: string) => {
+    const doc = createHTMLDoc(`<p>${text}</p>`, { lang: 'en' });
+    return [...getSentences(doc, textWalker, ttsNodeFilter, 'sentence')].map(({ range }) =>
+      range.toString().trim(),
+    );
+  };
+
+  it('ends a sentence after a short word, capitalised or not', () => {
+    expect(
+      sentencesOf(
+        'Into the world of The Hobbit. Tolkien chose not to. I did it. Then he went to Paris. It rained.',
+      ),
+    ).toEqual([
+      'Into the world of The Hobbit.',
+      'Tolkien chose not to.',
+      'I did it.',
+      'Then he went to Paris.',
+      'It rained.',
+    ]);
+  });
+
+  it('keeps abbreviations and initials inside the sentence', () => {
+    expect(
+      sentencesOf(
+        'Mr. Baggins met Dr. Smith on St. James St. today. J. R. R. Tolkien wrote it, e.g. this one. The end.',
+      ),
+    ).toEqual([
+      'Mr. Baggins met Dr. Smith on St. James St. today.',
+      'J. R. R. Tolkien wrote it, e.g. this one.',
+      'The end.',
+    ]);
   });
 });

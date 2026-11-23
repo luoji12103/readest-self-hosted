@@ -1,5 +1,5 @@
 import React from 'react';
-import { MdNightlightRound } from 'react-icons/md';
+import { MdDataObject, MdMenuBook, MdNightlightRound } from 'react-icons/md';
 import { useTranslation } from '@/hooks/useTranslation';
 import { BoxedList, NavigationRow } from '@/components/settings/primitives';
 import Dialog from '@/components/Dialog';
@@ -8,6 +8,8 @@ interface ImportAnnotationsDialogProps {
   isOpen: boolean;
   onClose: () => void;
   onImportMoonReader: () => void;
+  onImportReadEra: () => void;
+  onImportReadest: () => void;
 }
 
 /**
@@ -19,6 +21,8 @@ const ImportAnnotationsDialog: React.FC<ImportAnnotationsDialogProps> = ({
   isOpen,
   onClose,
   onImportMoonReader,
+  onImportReadEra,
+  onImportReadest,
 }) => {
   const _ = useTranslation();
 
@@ -27,18 +31,30 @@ const ImportAnnotationsDialog: React.FC<ImportAnnotationsDialogProps> = ({
       isOpen={isOpen}
       title={_('Import Annotations')}
       onClose={onClose}
-      boxClassName='sm:!h-auto sm:!max-h-[90vh] sm:!w-[420px]'
-      contentClassName='sm:!px-6'
+      boxClassName='sm:h-auto! sm:max-h-[90vh]! sm:w-[420px]!'
+      contentClassName='sm:px-6!'
     >
       <BoxedList
         title={_('Import From')}
-        description={_('Import highlights and notes exported from another reading app.')}
+        description={_('Import highlights and notes exported from Readest or another reading app.')}
       >
+        <NavigationRow
+          icon={MdDataObject}
+          title={_('Readest')}
+          status={_('Readest annotations file (.json)')}
+          onClick={onImportReadest}
+        />
         <NavigationRow
           icon={MdNightlightRound}
           title={_('Moon+ Reader')}
           status={_('Moon+ Reader export file (.mrexpt)')}
           onClick={onImportMoonReader}
+        />
+        <NavigationRow
+          icon={MdMenuBook}
+          title={_('ReadEra')}
+          status={_('ReadEra backup file (.bak)')}
+          onClick={onImportReadEra}
         />
       </BoxedList>
     </Dialog>

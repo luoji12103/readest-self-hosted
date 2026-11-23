@@ -5,7 +5,9 @@ import {
   AppService,
   BaseDir,
   DeleteAction,
+  type DictionaryImportProgressHandler,
   DistChannel,
+  FileInfo,
   FileItem,
   FileSystem,
   OsPlatform,
@@ -18,8 +20,10 @@ import { SchemaType } from '@/services/database/migrate';
 import { Book, BookConfig, BookContent, ImportBookOptions, ViewSettings } from '@/types/book';
 import type { BookNav } from '@/services/nav';
 import { getLibraryFilename, getLibraryBackupFilename } from '@/utils/book';
+import { getDirPath, getFilename } from '@/utils/path';
 
 import { getOSPlatform } from '@/utils/misc';
+import { buildAbsEbookUrl, isAbsEbook, parseAbsFilePath } from '@/utils/audiobook';
 import { isStoragePermissionError, requestStoragePermission } from '@/utils/permission';
 import { ProgressHandler } from '@/utils/transfer';
 import { CustomTextureInfo } from '@/styles/textures';
@@ -44,6 +48,7 @@ export abstract class BaseAppService implements AppService {
   osPlatform: OsPlatform = getOSPlatform();
   appPlatform: AppPlatform = 'tauri';
   localBooksDir = '';
+  unavailableRootDir: string | null = null;
   isMobile = false;
   isMacOSApp = false;
   isLinuxApp = false;
@@ -66,9 +71,11 @@ export abstract class BaseAppService implements AppService {
   hasUpdater = false;
   hasOrientationLock = false;
   hasScreenBrightness = false;
+  hasAmbientLightSensor = false;
   hasIAP = false;
   canCustomizeRootDir = false;
   canReadExternalDir = false;
+  supportsCoverThumbnailOptimization = false;
   supportsCanvasContext2DFilter = true;
   supportsViewTransitionsAPI = false;
   supportsViewTransitionGroup = false;
@@ -107,6 +114,21 @@ export abstract class BaseAppService implements AppService {
     base: BaseDir,
     opts?: DatabaseOpts,
   ): Promise<DatabaseService>;
+  async installDatabase(path: string, base: BaseDir, source: File): Promise<void> {
+    await this.writeFile(path, base, source);
+  }
+
+  // Databases live at the resolved fs path on native and node; the web app
+  // overrides both because its databases live in OPFS under flattened names,
+  // invisible to the IndexedDB-backed fs layer.
+  async databaseExists(path: string, base: BaseDir): Promise<boolean> {
+    return this.fs.exists(path, base);
+  }
+
+  async deleteDatabase(path: string, base: BaseDir): Promise<void> {
+    await this.fs.removeFile(path, base).catch(() => {});
+    await this.fs.removeFile(`${path}-wal`, base).catch(() => {});
+  }
 
   protected async runMigrations(
     lastMigrationVersion: number,
@@ -163,6 +185,25 @@ export abstract class BaseAppService implements AppService {
     this.localBooksDir = await this.fs.getPrefix('Books');
   }
 
+  /**
+   * A user-configured library root is untrusted input: the folder can be
+   * deleted, live on an unplugged drive, or — under the macOS App Sandbox —
+   * be a path the kernel refuses outright. Probe it once at startup so a bad
+   * root is reported rather than thrown deep inside the first library read,
+   * where the rejection had nothing to catch it and left the app on a blank
+   * page. Never throws; the answer is the return value.
+   */
+  async isRootDirUsable(): Promise<boolean> {
+    try {
+      if (!(await this.fs.exists('', 'Books'))) {
+        await this.fs.createDir('', 'Books', true);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async openFile(path: string, base: BaseDir): Promise<File> {
     return await this.fs.openFile(path, base);
   }
@@ -207,8 +248,8 @@ export abstract class BaseAppService implements AppService {
     return prefix ? `${prefix}/${path}` : path;
   }
 
-  async readDirectory(path: string, base: BaseDir): Promise<FileItem[]> {
-    return await this.fs.readDir(path, base);
+  async readDirectory(path: string, base: BaseDir, extensions?: string[]): Promise<FileItem[]> {
+    return await this.fs.readDir(path, base, extensions);
   }
 
   async exists(path: string, base: BaseDir): Promise<boolean> {
@@ -224,6 +265,10 @@ export abstract class BaseAppService implements AppService {
     }
   }
 
+  async stats(path: string, base: BaseDir): Promise<FileInfo> {
+    return await this.fs.stats(path, base);
+  }
+
   async getImageURL(path: string): Promise<string> {
     return await this.fs.getImageURL(path);
   }
@@ -232,6 +277,7 @@ export abstract class BaseAppService implements AppService {
     return {
       fs: this.fs,
       isMobile: this.isMobile,
+      isDesktopApp: this.isDesktopApp,
       isEink: this.isEink,
       isAppDataSandbox: this.isAppDataSandbox,
     };
@@ -295,11 +341,66 @@ export abstract class BaseAppService implements AppService {
   async importDictionaries(
     files: SelectedFile[],
     existingDictionaries: ImportedDictionary[] = [],
+    onProgress?: DictionaryImportProgressHandler,
   ): Promise<DictSvc.ImportDictionariesResult> {
-    return DictSvc.importDictionaries(this.fs, files, existingDictionaries);
+    const { importPluginDictionaries } = await import('./dictionaries/plugins/import');
+    const pluginResult = await importPluginDictionaries(this, files, existingDictionaries, {
+      ...(onProgress ? { onProgress } : {}),
+    });
+    const replacedPluginIds = new Set(
+      pluginResult.replacements.flatMap((replacement) => replacement.oldIds),
+    );
+    const dictionariesForLegacyImport = [
+      ...existingDictionaries.filter((dictionary) => !replacedPluginIds.has(dictionary.id)),
+      ...pluginResult.imported,
+      ...pluginResult.replacements.map((replacement) => replacement.newDict),
+    ];
+    let legacyResult: DictSvc.ImportDictionariesResult;
+    try {
+      legacyResult = await DictSvc.importDictionaries(
+        this.fs,
+        pluginResult.unclaimed,
+        dictionariesForLegacyImport,
+      );
+    } catch (error) {
+      const name =
+        pluginResult.unclaimed
+          .map(
+            (selected) =>
+              selected.file?.name ??
+              selected.name ??
+              (selected.path ? getFilename(selected.path) : undefined),
+          )
+          .filter((value): value is string => Boolean(value))
+          .join(', ') || 'Selected dictionaries';
+      return {
+        imported: pluginResult.imported,
+        replacements: pluginResult.replacements,
+        orphanFiles: [],
+        importErrors: [
+          ...pluginResult.failures,
+          { name, message: error instanceof Error ? error.message : String(error) },
+        ],
+      };
+    }
+    return {
+      imported: [...pluginResult.imported, ...legacyResult.imported],
+      replacements: [...pluginResult.replacements, ...legacyResult.replacements],
+      orphanFiles: legacyResult.orphanFiles,
+      ...(pluginResult.failures.length === 0 ? {} : { importErrors: pluginResult.failures }),
+    };
   }
 
   async deleteDictionary(dict: ImportedDictionary): Promise<void> {
+    if (dict.kind === 'plugin') {
+      const [{ evictProvider }, { getDictionaryPluginControlStore }] = await Promise.all([
+        import('./dictionaries/registry'),
+        import('./dictionaries/plugins/controlService'),
+      ]);
+      evictProvider(dict.id);
+      const controlStore = await getDictionaryPluginControlStore(this);
+      await controlStore.removeDictionary(dict.id);
+    }
     return DictSvc.deleteDictionary(this.fs, dict);
   }
 
@@ -320,7 +421,45 @@ export abstract class BaseAppService implements AppService {
   }
 
   async deleteBook(book: Book, deleteAction: DeleteAction): Promise<void> {
-    return CloudSvc.deleteBook(this.fs, book, deleteAction);
+    const loadTTSCleanup = async () => {
+      const [downloads, cache, sessions] = await Promise.all([
+        import('@/services/tts/ttsDownloadManager'),
+        import('@/services/tts/providers/bookCacheStore'),
+        import('@/services/tts/TTSSessionManager'),
+      ]);
+      return {
+        downloadManager: downloads.ttsDownloadManager,
+        clearDownloads: cache.clearBookTTSDownloads,
+        sessionManager: sessions.ttsSessionManager,
+      };
+    };
+    let ttsCleanup: Awaited<ReturnType<typeof loadTTSCleanup>> | undefined;
+
+    // Purge recursively removes the cache directory, so its open TTS database
+    // must be quiesced before the filesystem delete. Other local actions keep
+    // failure semantics unchanged and clean up only after their delete lands.
+    if (deleteAction === 'purge') {
+      ttsCleanup = await loadTTSCleanup();
+      await ttsCleanup.downloadManager.removeBook(book.hash);
+      await ttsCleanup.sessionManager.stopBook(book.hash, 'deleted');
+    }
+    await CloudSvc.deleteBook(this.fs, book, deleteAction);
+    if (deleteAction === 'cloud') return;
+    ttsCleanup ??= await loadTTSCleanup();
+
+    // Keep cleanup at the shared local-deletion boundary so library actions,
+    // sync-driven removal, and account purge all follow the same contract.
+    // The book deletion has already succeeded; cache housekeeping is
+    // best-effort and must not turn that success into a failed delete.
+    if (deleteAction !== 'purge') {
+      await ttsCleanup.downloadManager.removeBook(book.hash);
+      await ttsCleanup.sessionManager.stopBook(book.hash, 'deleted');
+    }
+    try {
+      await ttsCleanup.clearDownloads(this, book.hash);
+    } catch (err) {
+      console.warn('Failed to clear downloaded TTS audio for deleted book', err);
+    }
   }
 
   async uploadFileToCloud(
@@ -330,6 +469,7 @@ export abstract class BaseAppService implements AppService {
     handleProgress: ProgressHandler,
     hash: string,
     temp: boolean = false,
+    media?: string,
   ) {
     return CloudSvc.uploadFileToCloud(
       this.fs,
@@ -340,6 +480,7 @@ export abstract class BaseAppService implements AppService {
       handleProgress,
       hash,
       temp,
+      media,
     );
   }
 
@@ -369,6 +510,19 @@ export abstract class BaseAppService implements AppService {
     base: BaseDir,
     onProgress?: ProgressHandler,
   ) {
+    // The native downloader writes with `File::create`, which does not create
+    // parent directories, so a missing bundle dir fails as an opaque
+    // "No such file or directory (os error 2)" (issue #5675). The pull path
+    // only mkdirs when it MINTS a bundle dir for a record it has never seen —
+    // a record whose directory was lost afterwards (custom root dir changed,
+    // external storage cleared), a transfer replayed from the persisted queue,
+    // and Retry All all arrive here with nothing on disk. Book downloads have
+    // always guarded this (see cloudService.downloadBook); do the same here.
+    // `createDir` is recursive, so this is a no-op when the dir exists.
+    const bundleDir = getDirPath(lfp);
+    if (bundleDir) {
+      await this.fs.createDir(bundleDir, base, true);
+    }
     // Resolve the relative `<bundleDir>/<filename>` lfp against the
     // replica's base dir before downloading. Mirrors how upload uses
     // `resolveFilePath(opts.lfp, opts.base)`. Without this, the writer
@@ -444,6 +598,19 @@ export abstract class BaseAppService implements AppService {
   }
 
   async loadBookContent(book: Book): Promise<BookContent> {
+    if (isAbsEbook(book)) {
+      const parsed = parseAbsFilePath(book.filePath);
+      if (parsed) {
+        const { findABSServerById } = await import('@/store/absServerStore');
+        const server = findABSServerById(parsed.serverId);
+        if (server) {
+          return BookSvc.loadBookContent(this.fs, {
+            ...book,
+            url: buildAbsEbookUrl(server, parsed.itemId),
+          });
+        }
+      }
+    }
     return BookSvc.loadBookContent(this.fs, book);
   }
 
@@ -481,6 +648,11 @@ export abstract class BaseAppService implements AppService {
 
   async loadLibraryBooks(): Promise<Book[]> {
     return LibrarySvc.loadLibraryBooks(this.fs, this.generateCoverImageUrl.bind(this));
+  }
+
+  requestCoverThumbnail(_book: Book): void {
+    // Native apps override this. Web and Node already load appropriately sized
+    // cover sources and do not have the Tauri thumbnail worker.
   }
 
   // Prompt for storage permission at most once per session (see saveLibraryBooks).

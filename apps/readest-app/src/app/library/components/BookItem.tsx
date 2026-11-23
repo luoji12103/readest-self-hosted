@@ -1,9 +1,10 @@
 import clsx from 'clsx';
-import { useEffect, useState } from 'react';
-import { MdCheckCircle, MdCheckCircleOutline } from 'react-icons/md';
+import { useState } from 'react';
+import { MdCheckCircle, MdCheckCircleOutline, MdOutlineOfflinePin } from 'react-icons/md';
 import {
   LiaCloudUploadAltSolid,
   LiaCloudDownloadAltSolid,
+  LiaHeadphonesSolid,
   LiaInfoCircleSolid,
 } from 'react-icons/lia';
 
@@ -17,7 +18,12 @@ import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { LibraryCoverFitType, LibraryViewModeType } from '@/types/settings';
 import { navigateToLogin } from '@/utils/nav';
 import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { isFeedBook } from '@/services/rss/feedBookUrl';
+import { isAudiobook } from '@/utils/audiobook';
 import { formatAuthors, formatDescription, formatSeries } from '@/utils/book';
+import { splitDuration } from '@/utils/time';
+import { INDETERMINATE_PROGRESS } from '@/utils/transfer';
+import { getBookTags } from '../utils/libraryUtils';
 import ReadingProgress from './ReadingProgress';
 import BookCover from '@/components/BookCover';
 
@@ -25,6 +31,7 @@ interface BookItemProps {
   book: Book;
   mode: LibraryViewModeType;
   coverFit: LibraryCoverFitType;
+  skeuomorphicCovers?: boolean;
   isSelectMode: boolean;
   bookSelected: boolean;
   transferProgress: number | null;
@@ -32,12 +39,17 @@ interface BookItemProps {
   handleBookDownload: (book: Book, options?: { redownload?: boolean; queued?: boolean }) => void;
   showBookDetailsModal: (book: Book) => void;
   showTimeRemaining: boolean;
+  /** Badged on the cover inside a series group, where the breadcrumb names the series. */
+  seriesIndex?: number;
+  /** Shown under the title when the shelf shows page counts. */
+  pageCount?: number;
 }
 
 const BookItem: React.FC<BookItemProps> = ({
   book,
   mode,
   coverFit,
+  skeuomorphicCovers,
   isSelectMode,
   bookSelected,
   transferProgress,
@@ -45,18 +57,28 @@ const BookItem: React.FC<BookItemProps> = ({
   handleBookDownload,
   showBookDetailsModal,
   showTimeRemaining,
+  seriesIndex,
+  pageCount,
 }) => {
   const _ = useTranslation();
   const router = useRouter();
   const { user } = useAuth();
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
+  const showSpine = skeuomorphicCovers ?? settings.librarySkeuomorphicCovers;
   const iconSize15 = useResponsiveSize(15);
 
+  // Reset during render, not in an effect: a cached cover reports its size
+  // before a mount effect runs, and the effect would then drop it, leaving the
+  // fit cover in a full-height cell with the spine and selection wash spilling
+  // past the image (a carousel remounts covers as they scroll back into view).
   const [coverAspect, setCoverAspect] = useState<number | null>(null);
-  useEffect(() => {
+  const coverKey = `${book.hash}|${book.metadata?.coverImageUrl}|${book.coverImageUrl}`;
+  const [prevCoverKey, setPrevCoverKey] = useState(coverKey);
+  if (coverKey !== prevCoverKey) {
+    setPrevCoverKey(coverKey);
     setCoverAspect(null);
-  }, [book.hash, book.metadata?.coverImageUrl, book.coverImageUrl]);
+  }
 
   const CELL_ASPECT_RATIO = 28 / 41;
   const fitCoverInGrid = mode === 'grid' && coverFit === 'fit' && coverAspect !== null;
@@ -69,6 +91,41 @@ const BookItem: React.FC<BookItemProps> = ({
     : undefined;
 
   const seriesText = formatSeries(book.metadata?.series, book.metadata?.seriesIndex);
+  // Synced rows may carry untrimmed or duplicate tags; show each tag once.
+  const tags = getBookTags(book);
+
+  // One condition drives both the cover overlay and the hiding of the row's
+  // transfer buttons, so the cover can never end up showing neither. The
+  // entry is removed once the transfer settles, including at 100%.
+  const isTransferring = transferProgress !== null;
+  const isIndeterminate = transferProgress === INDETERMINATE_PROGRESS;
+
+  // ABS books track progress in seconds, not pages, so the row shows a
+  // duration/remaining-time label instead of ReadingProgress's page percent:
+  // total length when unplayed, remaining time once started (mirrors the
+  // scrubber's "-remaining" convention).
+  const isAbsBook = isAudiobook(book);
+  const isPodcastShow = book.absMediaType === 'podcast';
+  const absDuration = book.duration ?? 0;
+  const absCurrentTime = book.progress?.[0] ?? 0;
+  // Units rather than a bare clock: `formatCompactTime` renders 7h55m and
+  // 7m55s both as "7:55", which reads fine as a live countdown in the mini
+  // player but not on a shelf where a 10-hour book sits beside a 35-second
+  // one. Here there is room to say which is which.
+  const formatLength = (seconds: number): string => {
+    const { hours, minutes, seconds: secs } = splitDuration(seconds);
+    if (hours > 0) return _('{{hours}}h {{minutes}}m', { hours, minutes });
+    if (minutes > 0) return _('{{minutes}}m', { minutes });
+    return _('{{seconds}}s', { seconds: secs });
+  };
+  const absTimeLabel =
+    absCurrentTime > 0
+      ? `-${formatLength(Math.max(absDuration - absCurrentTime, 0))}`
+      : formatLength(absDuration);
+  // A podcast show has no total duration or resume position of its own (those
+  // live per-episode, a later task), so the row badges its episode count
+  // instead of the duration/remaining-time label audiobooks get.
+  const episodeCountLabel = _('{{count}} episodes', { count: book.episodeCount ?? 0 });
 
   return (
     <div
@@ -84,8 +141,8 @@ const BookItem: React.FC<BookItemProps> = ({
     >
       <div
         className={clsx(
-          'bookitem-main relative flex justify-center overflow-hidden rounded',
-          !fitCoverInGrid && 'aspect-[28/41]',
+          'bookitem-main relative flex justify-center overflow-hidden rounded-sm',
+          !fitCoverInGrid && 'aspect-28/41',
           coverFit === 'crop' && 'shadow-md',
           mode === 'grid' && 'items-end',
           mode === 'list' && 'min-w-20 items-center',
@@ -96,10 +153,36 @@ const BookItem: React.FC<BookItemProps> = ({
           mode={mode}
           book={book}
           coverFit={coverFit}
-          showSpine={false}
-          imageClassName='rounded shadow-md'
+          showSpine={showSpine}
+          imageClassName={clsx('shadow-md', showSpine ? 'rounded-none' : 'rounded-sm')}
           onAspectRatioChange={setCoverAspect}
         />
+        {isTransferring && (
+          // E-ink cannot render a translucent wash — it dithers over the cover
+          // art — and has no shadows, so the scrim becomes a solid base-100
+          // panel with a 1px base-content border and ink-colored content.
+          <div
+            className='absolute inset-0 flex items-center justify-center bg-black/40 eink:border eink:border-base-content eink:bg-base-100'
+            role='progressbar'
+            aria-label={_('Downloading {{title}}', { title: book.title })}
+            aria-valuenow={isIndeterminate ? undefined : Math.round(transferProgress)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            {isIndeterminate ? (
+              <span className='loading loading-spinner loading-sm text-white eink:text-base-content' />
+            ) : (
+              <span className='eink:text-base-content text-sm font-semibold text-white not-eink:drop-shadow-xs'>
+                {Math.round(transferProgress)}%
+              </span>
+            )}
+          </div>
+        )}
+        {seriesIndex !== undefined && (
+          <span className='eink-bordered bg-base-100/90 text-base-content absolute end-1 top-1 rounded-sm px-1 text-[10px] font-semibold leading-4 shadow-sm'>
+            #{seriesIndex}
+          </span>
+        )}
         {bookSelected && (
           <div className='absolute inset-0 bg-black opacity-30 transition-opacity duration-300'></div>
         )}
@@ -108,7 +191,7 @@ const BookItem: React.FC<BookItemProps> = ({
             {bookSelected ? (
               <MdCheckCircle className='fill-blue-500' />
             ) : (
-              <MdCheckCircleOutline className='fill-gray-300 drop-shadow-sm' />
+              <MdCheckCircleOutline className='fill-gray-300 drop-shadow-xs' />
             )}
           </div>
         )}
@@ -122,9 +205,10 @@ const BookItem: React.FC<BookItemProps> = ({
       >
         <div className={clsx('min-w-0 flex-1', mode === 'list' && 'flex flex-col gap-1')}>
           <h4
+            title={book.title}
             className={clsx(
               'overflow-hidden text-ellipsis font-semibold',
-              mode === 'grid' && 'block whitespace-nowrap text-[0.6em] text-xs',
+              mode === 'grid' && 'block whitespace-nowrap text-xs',
               mode === 'list' && 'line-clamp-1 text-base',
             )}
           >
@@ -147,15 +231,58 @@ const BookItem: React.FC<BookItemProps> = ({
         <div
           className={clsx(
             'flex items-center',
-            book.progress || book.readingStatus ? 'justify-between' : 'justify-end',
+            book.progress || book.readingStatus || isAbsBook || pageCount
+              ? 'justify-between'
+              : 'justify-end',
           )}
           style={{
             height: `${iconSize15}px`,
             minHeight: `${iconSize15}px`,
           }}
         >
-          {(book.progress || book.readingStatus) && (
-            <ReadingProgress book={book} showTimeRemaining={showTimeRemaining} />
+          {isAbsBook && book.readingStatus !== 'finished' ? (
+            <div
+              className='text-neutral-content/70 flex min-w-0 justify-between text-xs'
+              role='status'
+            >
+              <span className='truncate tabular-nums'>
+                {isPodcastShow ? episodeCountLabel : absTimeLabel}
+              </span>
+            </div>
+          ) : (
+            (book.progress || book.readingStatus || pageCount) && (
+              <ReadingProgress
+                book={book}
+                showTimeRemaining={showTimeRemaining}
+                pageCount={pageCount}
+              />
+            )
+          )}
+          {mode === 'list' && tags.length > 0 && (
+            // The tags only take the space left between the progress and the
+            // icons, and clip (fading out) when it runs out. `w-0` zeroes their
+            // min-content contribution, else a long tag list widens the whole
+            // text column and pushes the icons out of the row.
+            <div
+              aria-label={_('Tags')}
+              className={clsx(
+                'me-2 flex w-0 min-w-0 flex-1 items-center gap-1.5 overflow-hidden',
+                // Space from the progress only when it shows something.
+                '[:not(:empty)+&]:ms-1.5',
+                '[mask-image:linear-gradient(to_right,black_calc(100%-12px),transparent)]',
+                'rtl:[mask-image:linear-gradient(to_left,black_calc(100%-12px),transparent)]',
+                'eink:[mask-image:none]',
+              )}
+            >
+              {tags.map((tag) => (
+                <span
+                  key={tag}
+                  className='eink-bordered text-neutral-content/70 border-base-content/15 inline-flex h-3.5 shrink-0 items-center whitespace-nowrap rounded-sm border px-1 text-[10px] leading-none'
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
           )}
           <div className='flex shrink-0 items-center justify-center gap-x-2'>
             {!appService?.isMobile && (
@@ -167,54 +294,66 @@ const BookItem: React.FC<BookItemProps> = ({
                   showBookDetailsModal(book);
                 }}
               >
-                <div className='pt-[2px] sm:pt-[1px]'>
+                <div className='pt-0.5 sm:pt-px'>
                   <LiaInfoCircleSolid size={iconSize15} />
                 </div>
               </button>
             )}
-            {transferProgress !== null ? (
-              transferProgress === 100 ? null : (
-                <div
-                  className='radial-progress'
-                  style={
-                    {
-                      '--value': transferProgress,
-                      '--size': `${iconSize15}px`,
-                      '--thickness': '2px',
-                    } as React.CSSProperties
-                  }
-                  role='progressbar'
-                ></div>
-              )
-            ) : (
-              (!book.uploadedAt || (book.uploadedAt && !book.downloadedAt)) && (
-                <button
-                  aria-label={!book.uploadedAt ? _('Upload Book') : _('Download Book')}
-                  className='show-cloud-button -m-2 p-2'
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={() => {
-                    if (!user) {
-                      navigateToLogin(router);
-                      return;
-                    }
-                    if (!book.uploadedAt) {
-                      handleBookUpload(book);
-                    } else if (!book.downloadedAt) {
-                      handleBookDownload(book, { queued: true });
-                    }
-                  }}
-                >
-                  {!book.uploadedAt &&
-                    settings.autoUpload &&
-                    isReadestCloudStorageActive(settings) && (
+            {(book.hasNarration || isAbsBook) && (
+              <div
+                className='pt-0.5 sm:pt-px'
+                title={isAbsBook ? _('Audiobook') : _('Includes narration')}
+                aria-label={isAbsBook ? _('Audiobook') : _('Includes narration')}
+              >
+                <LiaHeadphonesSolid size={iconSize15} />
+              </div>
+            )}
+            {book.absDownloadedAt && (
+              <div
+                className='pt-0.5 sm:pt-px'
+                title={_('Available Offline')}
+                aria-label={_('Available Offline')}
+              >
+                <MdOutlineOfflinePin size={iconSize15} />
+              </div>
+            )}
+            {isTransferring
+              ? // Progress is rendered as a cover overlay; keep the row's action
+                // buttons hidden while a transfer is active. Same condition as
+                // the overlay, so a book can never show neither.
+                null
+              : // A feed book has no file to move either way, so it never gets a
+                // cloud badge — it would only queue a transfer that fails (#5307).
+                // Same for an ABS book: it streams from the server and never has
+                // uploadedAt/downloadedAt set, so without this check the badge
+                // would render forever and Upload would always fail.
+                !isFeedBook(book) &&
+                !isAudiobook(book) &&
+                (!book.uploadedAt || (book.uploadedAt && !book.downloadedAt)) && (
+                  <button
+                    aria-label={!book.uploadedAt ? _('Upload Book') : _('Download Book')}
+                    className='show-cloud-button -m-2 p-2'
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => {
+                      if (!user) {
+                        navigateToLogin(router);
+                        return;
+                      }
+                      if (!book.uploadedAt) {
+                        handleBookUpload(book);
+                      } else if (!book.downloadedAt) {
+                        handleBookDownload(book, { queued: true });
+                      }
+                    }}
+                  >
+                    {!book.uploadedAt && isReadestCloudStorageActive(settings) && (
                       <LiaCloudUploadAltSolid size={iconSize15} />
                     )}
-                  {book.uploadedAt && !book.downloadedAt && (
-                    <LiaCloudDownloadAltSolid size={iconSize15} />
-                  )}
-                </button>
-              )
-            )}
+                    {book.uploadedAt && !book.downloadedAt && (
+                      <LiaCloudDownloadAltSolid size={iconSize15} />
+                    )}
+                  </button>
+                )}
           </div>
         </div>
       </div>

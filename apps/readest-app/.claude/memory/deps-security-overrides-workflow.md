@@ -5,6 +5,7 @@ metadata:
   node_type: memory
   type: reference
   originSessionId: c61e7dd2-4033-4bd1-8f32-22056e4ef322
+  modified: 2026-10-02T18:00:36.444Z
 ---
 
 Fixing transitive npm Dependabot security alerts (manifest `pnpm-lock.yaml`).
@@ -18,9 +19,13 @@ Dependabot scans; alerts report manifest `pnpm-lock.yaml` = this root lockfile.
 **`packages/tauri-plugins` is a SEPARATE project**, not part of the main pnpm
 workspace. It's a git submodule (`tauri-plugins-workspace`) with its OWN
 `pnpm-lock.yaml` and its own `package.json` `pnpm.overrides` +
-`minimumReleaseAge: 4320`. The `minimumReleaseAge` (3-day age gate) applies ONLY
-there — the main monorepo has NO age gate, so `^X` specs resolve to the very
-latest matching version. Dependabot does not scan the tauri-plugins lockfile.
+`minimumReleaseAge: 4320` (3 days). The main monorepo sets none, BUT pnpm 11's
+BUILT-IN default is `minimum-release-age: 24*60` (1 day, non-strict; seen in
+pnpm/dist/pnpm.mjs 2026-10-02). So a range resolves to the newest version >1 day
+old, while a direct spec only a <1-day-old release satisfies is still allowed
+(non-strict). Result: `"ai": "^6.0.300"` (22h old) locked 6.0.300 for the app
+but 6.0.299 for a transitive `^6.0.42` = duplicate copies. Target versions >1 day
+old. Dependabot does not scan the tauri-plugins lockfile.
 `pnpm-workspace.yaml` `packages:` = `apps/*`, send-email worker, extensions,
 `packages/foliate-js` (NOT tauri-plugins).
 
@@ -36,6 +41,72 @@ latest matching version. Dependabot does not scan the tauri-plugins lockfile.
    confirm no vulnerable versions remain.
 4. Verify: `pnpm test` + `pnpm lint` + `pnpm build-web` (the last exercises
    esbuild in the OpenNext/Cloudflare bundle path).
+
+**2026-07-26 sweep — MERGED PR #5335 (a9e50e284):** cleared 32 of 36 open alerts.
+next 16.2.6->16.2.11, react/react-dom 19.2.5->19.2.8, react-server-dom-webpack 19.2.8,
+vitest family ^4.1.10, sharp 0.34.5->0.35.3, brace-expansion 1.1.16/2.1.2/5.0.8,
+fast-uri 3.1.4, shell-quote 1.10.0, js-yaml 4.3.0, body-parser 2.3.0, protobufjs 7.6.5,
+dompurify 3.4.12, postcss 8.5.18.
+
+**2026-08-05 sweep — MERGED PR #5518 (e9ee43e88):** cleared all 13 open npm alerts. undici 7.28.0->7.29.0,
+brace-expansion 1.1.18/2.1.4/5.0.9, fast-uri 3.1.5, postcss 8.5.18->8.5.25 (exact pin ->
+`'>=8.5.23 <9'`), and a NEW `ip-address: '>=10.3.1 <11'` (10.2.0->10.4.0). `ip-address`
+enters via `socks@2.8.9` (`^10.1.1`) under the wdio/puppeteer proxy-agent chain, so the
+override lands inside the parent's own range. Whole sweep is lockfile+workspace only, no
+source changes; only extra churn was `nanoid` 3.3.12->3.3.17 (postcss's own dep) plus
+peer-hash rewrites of postcss consumers.
+
+**Version-keyed overrides (multi-major transitive pins):** when several majors of one
+package coexist and each has its own patched release, use pnpm's `<pkg>@<range>` selector
+keys instead of one flat pin — a flat `brace-expansion: '>=5.0.8'` would force 5.x onto
+`minimatch@3` which declares `^1.1.7`. Done 2026-07-26:
+```yaml
+  'brace-expansion@1': '>=1.1.16 <2'
+  'brace-expansion@2': '>=2.1.2 <3'
+  'brace-expansion@5': '>=5.0.8 <6'
+```
+**Always bound `>=X` overrides with `<nextMajor` when a newer major exists on npm.** The
+lockfile makes existing pins look safe (an already-locked version that still satisfies
+`>=X` is kept), but a *raised* floor forces re-resolution to the highest match — e.g.
+`js-yaml: '>=4.3.0'` would have jumped to 5.x. Bounded it to `'>=4.3.0 <5'`.
+
+**Lockstep bumps:** `react-server-dom-webpack@19.2.8` peers on `react`/`react-dom`
+`^19.2.8`, so it drags react + react-dom with it. `next` is an exact pin in
+`apps/readest-app/package.json` (not an override). The vitest family
+(`vitest`, `@vitest/browser-playwright`, `@vitest/browser-webdriverio`,
+`@vitest/coverage-v8`) still moves together.
+
+**Verify the DEPLOY build, not just `build-web`:** `pnpm build-web` is turbopack and skips
+Next's page-export type check. The Cloudflare path is
+`pnpm patch-build-webpack && NEXT_PUBLIC_APP_PLATFORM=web opennextjs-cloudflare build && pnpm restore-build-original`.
+Running it on 2026-07-26 surfaced a break that predated the bump — see
+[[nextjs-page-export-webpack-only-check]].
+
+**2026-10-02 sweep — MERGED PR #6573 (306940369), 29 alerts -> 0 open:** next 16.3.3->16.3.8 (critical next/og RCE),
+dompurify 3.4.16, vitest family 4.1.11, raised overrides (undici, brace-expansion 1/2/5,
+sharp, js-yaml, fast-uri) + NEW `baseline-browser-mapping`. `@ai-sdk/provider-utils` 4.x
+is EXACT-pinned by `ai` / `@ai-sdk/react` / `@ai-sdk/openai-compatible`, so fix it by
+bumping those three to releases sharing one provider-utils (ai 6.0.299, react 3.0.302,
+openai-compatible 2.0.81 -> 4.0.57), then RENAME + REGENERATE
+`patches/@ai-sdk__provider-utils@<v>.patch` (iOS lookbehind; old line offsets don't carry
+over; build it with `git diff --no-index` on the unpacked tarball) + the
+`patchedDependencies` key. Then run `pnpm build && pnpm check:all` (lookbehind scan of the
+Tauri bundle).
+**Stale nested copies trap:** after bumping direct deps, `@assistant-ui/react-ai-sdk` and
+`ai-sdk-ollama` kept the OLD ai/react/provider-utils even though their ranges accepted the
+new ones. `pnpm update -r --depth Infinity <pkgs>`, `--fix-lockfile`, `--resolution-only`
+all no-op ("Already up to date"), and deleting snapshot entries by hand is ignored too.
+`pnpm dedupe` fixes it but churns dozens of unrelated packages. WORKS: add TEMPORARY exact
+overrides (`'ai@6': 6.0.299`, `'@ai-sdk/react@3': 3.0.302`, provider-utils, provider,
+gateway), `pnpm install`, remove them, `pnpm install` again: the deduped versions stick
+and `--frozen-lockfile` passes.
+Earlier (2026-08-05) the 3.x provider-utils copy was unfixable; gone now that
+react-ai-sdk 1.2.0 uses ai@6. Cargo.lock alerts #12 glib 0.18.5 (gtk-rs 0.18 stack under
+webkit2gtk/wry), #94/#95 nix 0.19.1 (via third-party `tauri-plugin-device-info` ->
+`battery`), #173 rand 0.7.3 (via `kuchikiki@0.8.8-speedreader` -> `selectors@0.24` ->
+`phf_generator@0.8`) are all transitive through crates we do not control. Verify dependents
+by parsing `[[package]]` blocks in the root `Cargo.lock` (NOT `src-tauri/Cargo.lock` — the
+workspace lockfile lives at the monorepo root).
 
 **Override applicability:** an override forces a transitive version regardless
 of the parent's declared range ONLY when the package is a regular dep (no peer

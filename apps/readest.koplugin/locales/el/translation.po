@@ -17,6 +17,36 @@ msgstr "Readest"
 msgid "Keeps your KOReader and Readest devices in sync."
 msgstr "Διατηρεί τις συσκευές KOReader και Readest συγχρονισμένες."
 
+msgid "Downloading %1 of %2…"
+msgstr "Γίνεται λήψη %1 από %2…"
+
+msgid "%1 MB downloaded"
+msgstr "Έγινε λήψη %1 MB"
+
+msgid "No downloads in progress."
+msgstr "Δεν υπάρχουν λήψεις σε εξέλιξη."
+
+msgid "Run in background"
+msgstr "Εκτέλεση στο παρασκήνιο"
+
+msgid "Cancel download"
+msgstr "Ακύρωση λήψης"
+
+msgid "Download cancelled. %1 of %2 downloaded."
+msgstr "Η λήψη ακυρώθηκε. Έγινε λήψη %1 από %2."
+
+msgid "Downloaded %1 of %2 (skipped %3)."
+msgstr "Έγινε λήψη %1 από %2 (παραλείφθηκαν %3)."
+
+msgid "Downloaded %1 of %2."
+msgstr "Έγινε λήψη %1 από %2."
+
+msgid "Set Home folder in File Manager first to enable downloads."
+msgstr "Πρώτα ορίστε τον αρχικό φάκελο στη διαχείριση αρχείων για να ενεργοποιήσετε τις λήψεις."
+
+msgid "No books to download."
+msgstr "Δεν υπάρχουν βιβλία για λήψη."
+
 msgid "Library view"
 msgstr "Προβολή βιβλιοθήκης"
 
@@ -68,8 +98,14 @@ msgstr "Αύξουσα"
 msgid "Actions"
 msgstr "Ενέργειες"
 
+msgid "Sync now"
+msgstr "Συγχρονισμός τώρα"
+
 msgid "Download all books"
 msgstr "Λήψη όλων των βιβλίων"
+
+msgid "Download progress"
+msgstr "Πρόοδος λήψης"
 
 msgid "Rescan library"
 msgstr "Επανασάρωση βιβλιοθήκης"
@@ -104,6 +140,12 @@ msgstr "Αναζήτηση στη βιβλιοθήκη"
 msgid "Search title or author"
 msgstr "Αναζήτηση τίτλου ή συγγραφέα"
 
+msgid "Books synced"
+msgstr "Τα βιβλία συγχρονίστηκαν"
+
+msgid "Books sync failed"
+msgstr "Αποτυχία συγχρονισμού βιβλίων"
+
 msgid "Cover Browser plugin required for full Library rendering. Falling back to plain list."
 msgstr "Το πρόσθετο Cover Browser απαιτείται για πλήρη απόδοση βιβλιοθήκης. Επιστροφή σε απλή λίστα."
 
@@ -116,18 +158,6 @@ msgstr "Λήψη αυτού του βιβλίου από το Readest;"
 msgid "Download"
 msgstr "Λήψη"
 
-msgid "Set Home folder in File Manager first to enable downloads."
-msgstr "Πρώτα ορίστε τον αρχικό φάκελο στη διαχείριση αρχείων για να ενεργοποιήσετε τις λήψεις."
-
-msgid "Downloading…"
-msgstr "Γίνεται λήψη…"
-
-msgid "Cloud copy unavailable."
-msgstr "Το αντίγραφο στο cloud δεν είναι διαθέσιμο."
-
-msgid "Download failed."
-msgstr "Η λήψη απέτυχε."
-
 msgid "No cover available on Readest."
 msgstr "Δεν υπάρχει εξώφυλλο διαθέσιμο στο Readest."
 
@@ -137,20 +167,8 @@ msgstr "Αποτυχία λήψης εξωφύλλου."
 msgid "Could not delete the file."
 msgstr "Δεν ήταν δυνατή η διαγραφή του αρχείου."
 
-msgid "No books to download."
-msgstr "Δεν υπάρχουν βιβλία για λήψη."
-
-msgid "Downloading %1 of %2…"
-msgstr "Γίνεται λήψη %1 από %2…"
-
-msgid "Download cancelled. %1 of %2 downloaded."
-msgstr "Η λήψη ακυρώθηκε. Έγινε λήψη %1 από %2."
-
-msgid "Downloaded %1 of %2 (skipped %3)."
-msgstr "Έγινε λήψη %1 από %2 (παραλείφθηκαν %3)."
-
-msgid "Downloaded %1 of %2."
-msgstr "Έγινε λήψη %1 από %2."
+msgid "Download group"
+msgstr "Λήψη ομάδας"
 
 msgid "Removing from cloud…"
 msgstr "Αφαίρεση από το cloud…"
@@ -166,6 +184,12 @@ msgstr "Αφαίρεση αυτού του βιβλίου από cloud και σ
 
 msgid "Remove"
 msgstr "Αφαίρεση"
+
+msgid "Remove from Library, Keep File"
+msgstr "Αφαίρεση από τη βιβλιοθήκη, διατήρηση αρχείου"
+
+msgid "Remove this book from your library and the cloud? The file stays on this device."
+msgstr "Αφαίρεση αυτού του βιβλίου από τη βιβλιοθήκη και το cloud; Το αρχείο παραμένει σε αυτήν τη συσκευή."
 
 msgid "Remove from Cloud Only"
 msgstr "Αφαίρεση μόνο από cloud"
@@ -190,6 +214,9 @@ msgstr "Υπέρβαση ορίου αποθήκευσης."
 
 msgid "Upload failed."
 msgstr "Η μεταφόρτωση απέτυχε."
+
+msgid "Send to nearby Readest devices"
+msgstr "Αποστολή σε κοντινές συσκευές Readest"
 
 msgid "Download Book"
 msgstr "Λήψη βιβλίου"
@@ -236,8 +263,8 @@ msgstr "Λήψη σχολίων Readest από άλλες συσκευές"
 msgid "Full sync all readest annotations"
 msgstr "Πλήρης συγχρονισμός όλων των σχολίων Readest"
 
-msgid "Add to Readest"
-msgstr "Προσθήκη στο Readest"
+msgid "Add to Readest library"
+msgstr "Προσθήκη στη βιβλιοθήκη Readest"
 
 msgid "Sign in to Readest first."
 msgstr "Συνδεθείτε πρώτα στο Readest."
@@ -266,14 +293,14 @@ msgstr "Δεν υπάρχει ανοιχτό βιβλίο"
 msgid "Uploaded to Readest:"
 msgstr "Μεταφορτώθηκε στο Readest:"
 
+msgid "Auto sync"
+msgstr "Αυτόματος συγχρονισμός"
+
 msgid "Log in Readest Account"
 msgstr "Σύνδεση στον λογαριασμό Readest"
 
 msgid "Log out as %1"
 msgstr "Αποσύνδεση ως %1"
-
-msgid "Auto sync"
-msgstr "Αυτόματος συγχρονισμός"
 
 msgid "Readest library"
 msgstr "Βιβλιοθήκη Readest"
@@ -284,20 +311,14 @@ msgstr "Αποστολή στατιστικών τώρα"
 msgid "Pull stats now"
 msgstr "Λήψη στατιστικών τώρα"
 
-msgid "Push books now"
-msgstr "Αποστολή βιβλίων τώρα"
-
-msgid "Pull books now"
-msgstr "Λήψη βιβλίων τώρα"
-
-msgid "Upload current book to Readest"
-msgstr "Μεταφόρτωση τρέχοντος βιβλίου στο Readest"
-
 msgid "Push reading progress now"
 msgstr "Αποστολή προόδου ανάγνωσης τώρα"
 
 msgid "Pull reading progress now"
 msgstr "Λήψη προόδου ανάγνωσης τώρα"
+
+msgid "Upload current book to Readest"
+msgstr "Μεταφόρτωση τρέχοντος βιβλίου στο Readest"
 
 msgid "Push annotations now"
 msgstr "Αποστολή σχολίων τώρα"
@@ -311,6 +332,9 @@ msgstr "Πλήρης συγχρονισμός όλων των σχολίων"
 msgid "Sync info"
 msgstr "Πληροφορίες συγχρονισμού"
 
+msgid "Receive via Nearby BookDrop"
+msgstr "Λήψη μέσω Nearby BookDrop"
+
 msgid "Check for update (v%1)"
 msgstr "Έλεγχος για ενημέρωση (v%1)"
 
@@ -319,9 +343,6 @@ msgstr "Έλεγχος για ενημέρωση"
 
 msgid "Please login first"
 msgstr "Συνδεθείτε πρώτα"
-
-msgid "Please configure Readest settings first"
-msgstr "Διαμορφώστε πρώτα τις ρυθμίσεις Readest"
 
 msgid "(none)"
 msgstr "(κανένα)"
@@ -344,11 +365,89 @@ msgstr "Πληροφορίες συγχρονισμού"
 msgid "Library not initialized"
 msgstr "Η βιβλιοθήκη δεν αρχικοποιήθηκε"
 
-msgid "Books synced"
-msgstr "Τα βιβλία συγχρονίστηκαν"
+msgid "Set a Readest download folder or a KOReader home folder first."
+msgstr "Ορίστε πρώτα έναν φάκελο λήψεων Readest ή έναν αρχικό φάκελο KOReader."
 
-msgid "Books sync failed"
-msgstr "Αποτυχία συγχρονισμού βιβλίων"
+msgid "Nearby BookDrop error: could not find a free port."
+msgstr "Σφάλμα Nearby BookDrop: δεν βρέθηκε ελεύθερη θύρα."
+
+msgid "Nearby BookDrop failed to start."
+msgstr "Η εκκίνηση του Nearby BookDrop απέτυχε."
+
+msgid "Starting Nearby BookDrop…"
+msgstr "Εκκίνηση Nearby BookDrop…"
+
+msgid "Nearby BookDrop will start when Wi-Fi connects."
+msgstr "Το Nearby BookDrop θα ξεκινήσει μόλις συνδεθεί το Wi-Fi."
+
+msgid "… and %1 more"
+msgstr "… και %1 ακόμη"
+
+msgid "%1 wants to send you %2 file(s) (%3):"
+msgstr "Ο/Η %1 θέλει να σας στείλει %2 αρχείο(α) (%3):"
+
+msgid "Accept"
+msgstr "Αποδοχή"
+
+msgid "Decline"
+msgstr "Απόρριψη"
+
+msgid "Receiving %1 file(s) from %2…"
+msgstr "Λήψη %1 αρχείου(ων) από %2…"
+
+msgid "Nearby BookDrop: received %1 file(s), %2 failed."
+msgstr "Nearby BookDrop: ελήφθησαν %1 αρχείο(α), %2 απέτυχαν."
+
+msgid "Nearby BookDrop transfer cancelled."
+msgstr "Η μεταφορά Nearby BookDrop ακυρώθηκε."
+
+msgid "Nearby BookDrop: received %1 file(s)."
+msgstr "Nearby BookDrop: ελήφθησαν %1 αρχείο(α)."
+
+msgid "Nearby BookDrop not available on this device"
+msgstr "Το Nearby BookDrop δεν είναι διαθέσιμο σε αυτή τη συσκευή"
+
+msgid "Scanning for nearby devices…"
+msgstr "Αναζήτηση κοντινών συσκευών…"
+
+msgid "No nearby devices found. Make sure the other device has Nearby BookDrop or LocalSend open."
+msgstr "Δεν βρέθηκαν κοντινές συσκευές. Βεβαιωθείτε ότι η άλλη συσκευή έχει ανοιχτό το Nearby BookDrop ή το LocalSend."
+
+msgid "Rescan"
+msgstr "Νέα σάρωση"
+
+msgid "Send to…"
+msgstr "Αποστολή σε…"
+
+msgid "Sending…"
+msgstr "Αποστολή…"
+
+msgid "Sending… %1%"
+msgstr "Αποστολή… %1%"
+
+msgid "Sent %1 file(s)."
+msgstr "Στάλθηκαν %1 αρχείο(α)."
+
+msgid "The other device declined the transfer."
+msgstr "Η άλλη συσκευή απέρριψε τη μεταφορά."
+
+msgid "Transfer cancelled."
+msgstr "Η μεταφορά ακυρώθηκε."
+
+msgid "Send failed: %1"
+msgstr "Η αποστολή απέτυχε: %1"
+
+msgid "Nearby BookDrop error: %1"
+msgstr "Σφάλμα Nearby BookDrop: %1"
+
+msgid "Nearby BookDrop off"
+msgstr "Nearby BookDrop ανενεργό"
+
+msgid "Visible as %1"
+msgstr "Ορατό ως %1"
+
+msgid "(limited discovery)"
+msgstr "(περιορισμένη ανίχνευση)"
 
 msgid "Checking for update…"
 msgstr "Έλεγχος για ενημέρωση…"
@@ -410,9 +509,6 @@ msgstr "Πλήρης συγχρονισμός: λήψη όλων των σχολ
 msgid "Pulling annotations..."
 msgstr "Λήψη σχολίων…"
 
-msgid "Authentication failed, please login again"
-msgstr "Αποτυχία ταυτοποίησης, συνδεθείτε ξανά"
-
 msgid "Failed to pull annotations"
 msgstr "Η λήψη των σχολίων απέτυχε"
 
@@ -422,11 +518,20 @@ msgstr "Δεν βρέθηκαν νέα σχόλια"
 msgid "%1 annotations pulled"
 msgstr "Ελήφθησαν %1 σχόλια"
 
+msgid "Your Readest session has expired. Please log in again."
+msgstr "Η συνεδρία Readest έληξε. Συνδεθείτε ξανά."
+
+msgid "Authentication failed, please login again"
+msgstr "Αποτυχία ταυτοποίησης, συνδεθείτε ξανά"
+
 msgid "Login"
 msgstr "Σύνδεση"
 
 msgid "Please enter both email and password"
 msgstr "Εισαγάγετε email και κωδικό πρόσβασης"
+
+msgid "Sign in with a code"
+msgstr "Σύνδεση με κωδικό"
 
 msgid "Please configure Supabase URL and API key first"
 msgstr "Διαμορφώστε πρώτα το URL Supabase και το κλειδί API"
@@ -434,11 +539,17 @@ msgstr "Διαμορφώστε πρώτα το URL Supabase και το κλει
 msgid "Logging in..."
 msgstr "Σύνδεση…"
 
+msgid "Login failed: %1"
+msgstr "Η σύνδεση απέτυχε: %1"
+
 msgid "Successfully logged in to Readest"
 msgstr "Συνδεθήκατε στο Readest"
 
-msgid "Login failed: %1"
-msgstr "Η σύνδεση απέτυχε: %1"
+msgid "Scan the QR code with a phone signed in to Readest, or open %1 and enter this code:\n\n%2"
+msgstr "Σαρώστε τον κωδικό QR με ένα τηλέφωνο συνδεδεμένο στο Readest ή ανοίξτε το %1 και εισαγάγετε αυτόν τον κωδικό:\n\n%2"
+
+msgid "The code expired. Please try again."
+msgstr "Ο κωδικός έληξε. Δοκιμάστε ξανά."
 
 msgid "Logged out from Readest"
 msgstr "Αποσυνδεθήκατε από το Readest"
@@ -467,8 +578,65 @@ msgstr "Η λήψη της προόδου ανάγνωσης απέτυχε"
 msgid "Reading progress synchronized"
 msgstr "Η πρόοδος ανάγνωσης συγχρονίστηκε"
 
+msgid "Saved reading position cannot be used with this copy of the book"
+msgstr "Η αποθηκευμένη θέση ανάγνωσης δεν μπορεί να χρησιμοποιηθεί με αυτό το αντίγραφο του βιβλίου"
+
 msgid "No saved reading progress found for this book"
 msgstr "Δεν βρέθηκε αποθηκευμένη πρόοδος ανάγνωσης για αυτό το βιβλίο"
+
+msgid "Sync was cancelled."
+msgstr "Ο συγχρονισμός ακυρώθηκε."
+
+msgid "The connection timed out. Please try again."
+msgstr "Λήξη χρόνου σύνδεσης. Δοκιμάστε ξανά."
+
+msgid "The network is unreachable. Please check the internet connection."
+msgstr "Το δίκτυο δεν είναι προσβάσιμο. Ελέγξτε τη σύνδεση στο διαδίκτυο."
+
+msgid "The server could not be found. Please check the internet connection."
+msgstr "Ο διακομιστής δεν βρέθηκε. Ελέγξτε τη σύνδεση στο διαδίκτυο."
+
+msgid "The server refused the connection. Please try again later."
+msgstr "Ο διακομιστής απέρριψε τη σύνδεση. Δοκιμάστε ξανά αργότερα."
+
+msgid "The connection was interrupted. Please try again."
+msgstr "Η σύνδεση διακόπηκε. Δοκιμάστε ξανά."
+
+msgid "A secure connection to the server could not be established."
+msgstr "Δεν ήταν δυνατή η δημιουργία ασφαλούς σύνδεσης με τον διακομιστή."
+
+msgid "Authentication failed. Please log in again."
+msgstr "Η ταυτοποίηση απέτυχε. Συνδεθείτε ξανά."
+
+msgid "The account changed during sync."
+msgstr "Ο λογαριασμός άλλαξε κατά τον συγχρονισμό."
+
+msgid "The file was not found in the cloud."
+msgstr "Το αρχείο δεν βρέθηκε στο cloud."
+
+msgid "The local file is missing."
+msgstr "Το τοπικό αρχείο λείπει."
+
+msgid "An internal error occurred. Please try again."
+msgstr "Παρουσιάστηκε εσωτερικό σφάλμα. Δοκιμάστε ξανά."
+
+msgid "Access denied."
+msgstr "Δεν επιτρέπεται η πρόσβαση."
+
+msgid "Not found on the server."
+msgstr "Δεν βρέθηκε στον διακομιστή."
+
+msgid "The file is too large."
+msgstr "Το αρχείο είναι πολύ μεγάλο."
+
+msgid "Too many requests. Please try again later."
+msgstr "Πάρα πολλά αιτήματα. Δοκιμάστε ξανά αργότερα."
+
+msgid "The server is temporarily unavailable. Please try again later."
+msgstr "Ο διακομιστής δεν είναι προσωρινά διαθέσιμος. Δοκιμάστε ξανά αργότερα."
+
+msgid "The request failed. Please try again."
+msgstr "Το αίτημα απέτυχε. Δοκιμάστε ξανά."
 
 msgid "Reading statistics are up to date"
 msgstr "Τα στατιστικά ανάγνωσης είναι ενημερωμένα"

@@ -1,15 +1,116 @@
 import { DOUBLE_CLICK_INTERVAL_THRESHOLD_MS, LONG_HOLD_THRESHOLD } from '@/services/constants';
 import { eventDispatcher } from '@/utils/event';
+import type { ImageViewerGesture, ViewSettings } from '@/types/book';
 import { findGlossWord } from '@/app/reader/utils/wordlensRuby';
+import { TURN_GESTURE_LEFT_INSET_ATTRIBUTE } from './brightnessGesture';
+import { hasScrollRoomY } from './wheelGesture';
+import { toParentViewportPoint } from './annotatorUtil';
+import { isTextAtPoint } from './crossDocSelection';
+import {
+  createTurnGestureIntent,
+  NATIVE_CAPTURED_TURN_ATTRIBUTE,
+  NATIVE_PROGRAMMATIC_TURN_ATTRIBUTE,
+  shouldClaimTurnGesture,
+  TURN_EDGE_ZONE_RATIO,
+  type TurnGestureIntent,
+} from './turnGestureArena';
 
 let lastClickTime = 0;
 let longHoldTimeout: ReturnType<typeof setTimeout> | null = null;
 let isMouseDown = false;
-const touchGestures = new Map<string, { startX: number; startY: number; moved: boolean }>();
+interface NativeTurnHost extends HTMLElement {
+  scrollLocked?: boolean;
+}
+interface TouchGesture {
+  startX: number;
+  startY: number;
+  startTime: number;
+  moved: boolean;
+  turnHost?: NativeTurnHost;
+  turnIntent?: TurnGestureIntent;
+}
+const touchGestures = new Map<string, TouchGesture>();
+
+// Each open book's gesture for the image viewer, kept in step by the reader.
+const imageViewerGestures = new Map<string, ImageViewerGesture>();
+export const setImageViewerGesture = (bookKey: string, gesture: ImageViewerGesture) => {
+  imageViewerGestures.set(bookKey, gesture);
+};
+export const getImageViewerGesture = (bookKey: string) => imageViewerGestures.get(bookKey) ?? 'tap';
+
+// A comic or PDF page is all image, so a tap there turns the page or shows the
+// toolbar unless the book is set to open its images on a tap (#7145).
+export const resolveImageViewerGesture = (
+  viewSettings: Pick<ViewSettings, 'imageViewerGesture'>,
+  isFixedLayout: boolean,
+): ImageViewerGesture => viewSettings.imageViewerGesture ?? (isFixedLayout ? 'longPress' : 'tap');
+
+const imageHoldClicks = new Map<string, { target: EventTarget; until: number }>();
+export const setImageHoldClick = (bookKey: string, target: EventTarget | null) => {
+  if (target)
+    imageHoldClicks.set(bookKey, { target, until: Date.now() + SYNTHESIZED_CLICK_SUPPRESSION_MS });
+  else imageHoldClicks.delete(bookKey);
+};
+export const releaseImageHoldClick = (bookKey: string) => {
+  const hold = imageHoldClicks.get(bookKey);
+  if (hold) hold.until = Date.now() + SYNTHESIZED_CLICK_SUPPRESSION_MS;
+};
+
 const suppressedSwipeClicks = new Map<string, { until: number; endX: number; endY: number }>();
+interface LayeredTurnTouchClaim {
+  claimed: boolean;
+  ended: boolean;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+}
+const layeredTurnTouchClaims = new Map<string, LayeredTurnTouchClaim>();
 const SYNTHESIZED_CLICK_SWIPE_DISTANCE_PX = 15;
 const SYNTHESIZED_CLICK_SUPPRESSION_MS = 750;
 const SYNTHESIZED_CLICK_POSITION_SLOP_PX = 15;
+
+const getNativeTurnHost = (event: TouchEvent): NativeTurnHost | null => {
+  const currentTarget = event.currentTarget as Document | null;
+  if (currentTarget?.nodeType !== 9) return null;
+  const frame = currentTarget.defaultView?.frameElement;
+  const root = frame?.getRootNode();
+  const host = root && 'host' in root ? (root.host as NativeTurnHost) : null;
+  if (
+    host?.localName !== 'foliate-paginator' ||
+    !host.hasAttribute(NATIVE_CAPTURED_TURN_ATTRIBUTE) ||
+    host.hasAttribute(NATIVE_PROGRAMMATIC_TURN_ATTRIBUTE)
+  ) {
+    return null;
+  }
+  return host;
+};
+
+const createNativeTurnIntent = (
+  event: TouchEvent,
+  touch: { screenX: number },
+): { host: NativeTurnHost; intent: TurnGestureIntent } | null => {
+  const host = getNativeTurnHost(event);
+  if (!host?.getBoundingClientRect) return null;
+  const currentTarget = event.currentTarget as Document;
+  const selection = currentTarget.getSelection?.();
+  if (selection && !selection.isCollapsed) return null;
+
+  const rect = host.getBoundingClientRect();
+  if (rect.width <= 0) return null;
+  const windowScreenX = Number.isFinite(window.screenX) ? window.screenX : 0;
+  const localStartX = touch.screenX - windowScreenX - rect.left;
+  const inset = Number(host.getAttribute(TURN_GESTURE_LEFT_INSET_ATTRIBUTE));
+  const reservedLeftRatio = Number.isFinite(inset) ? Math.max(0, Math.min(0.5, inset)) : 0;
+  const earlyClaimBlocked = localStartX <= rect.width * reservedLeftRatio;
+  let edgeDirection: -1 | 0 | 1 = 0;
+  if (!earlyClaimBlocked && localStartX >= 0 && localStartX <= rect.width * TURN_EDGE_ZONE_RATIO) {
+    edgeDirection = 1;
+  } else if (localStartX <= rect.width && localStartX >= rect.width * (1 - TURN_EDGE_ZONE_RATIO)) {
+    edgeDirection = -1;
+  }
+  return {
+    host,
+    intent: createTurnGestureIntent(edgeDirection, earlyClaimBlocked, 0),
+  };
+};
 
 // Middle-click autoscroll (#4951). Books where the feature is armed (desktop
 // app, scrolled mode, setting on) get the middle button's defaults suppressed,
@@ -28,6 +129,125 @@ export const setAutoscrollArmed = (bookKey: string, armed: boolean) => {
 
 export const setAutoscrollTracking = (tracking: boolean) => {
   autoscrollTracking = tracking;
+};
+
+// A layered turn can now claim below the generic 15px swipe threshold. Keep
+// synthesized-click suppression tied to the authoritative gesture claim so a
+// valid early turn cannot be replayed as a toolbar click after touchend.
+export const setLayeredTurnTouchClaimed = (bookKey: string, claimed: boolean) => {
+  if (!claimed) {
+    const previous = layeredTurnTouchClaims.get(bookKey);
+    if (previous?.cleanupTimer) clearTimeout(previous.cleanupTimer);
+    layeredTurnTouchClaims.delete(bookKey);
+    return;
+  }
+  const state = layeredTurnTouchClaims.get(bookKey) ?? { claimed: false, ended: false };
+  state.claimed = true;
+  layeredTurnTouchClaims.set(bookKey, state);
+};
+
+/** Start a fresh raw/direct touch lifetime for layered-turn ownership. */
+export const beginLayeredTurnTouch = (bookKey: string) => {
+  const previous = layeredTurnTouchClaims.get(bookKey);
+  if (previous?.cleanupTimer) clearTimeout(previous.cleanupTimer);
+  layeredTurnTouchClaims.set(bookKey, { claimed: false, ended: false });
+};
+
+/**
+ * Seal a completed touch while retaining a claimed gesture briefly enough to
+ * suppress the browser's delayed compatibility click. This is idempotent
+ * because iframe events and the parent React surface can observe the same
+ * physical release.
+ */
+export const endLayeredTurnTouch = (bookKey: string) => {
+  const state = layeredTurnTouchClaims.get(bookKey);
+  if (!state || state.ended) return;
+  state.ended = true;
+  state.cleanupTimer = setTimeout(() => {
+    if (layeredTurnTouchClaims.get(bookKey) === state) {
+      layeredTurnTouchClaims.delete(bookKey);
+    }
+  }, SYNTHESIZED_CLICK_SUPPRESSION_MS);
+};
+
+/** Cancel a touch without retaining synthesized-click suppression state. */
+export const cancelLayeredTurnTouch = (bookKey: string) => {
+  setLayeredTurnTouchClaimed(bookKey, false);
+};
+
+// The forwarded iframe lifecycle is independent of app-interceptor priority,
+// so it is more reliable than any one interceptor's local start/end state for
+// ordinary page-turn candidates. A capture-phase owner may still suppress a
+// later forwarded event; the next touchstart always replaces stale state.
+export const isLayeredTurnTouchActive = (bookKey: string) => {
+  const state = layeredTurnTouchClaims.get(bookKey);
+  return !!state && !state.ended;
+};
+
+const clearLayeredTurnTouchClaim = (bookKey: string) => {
+  cancelLayeredTurnTouch(bookKey);
+};
+
+const suppressDomClick = (event: MouseEvent) => {
+  event.preventDefault();
+  event.stopImmediatePropagation();
+};
+
+const consumeSuppressedDomClick = (bookKey: string, event: MouseEvent, now: number) => {
+  const imageHold = imageHoldClicks.get(bookKey);
+  if (imageHold) {
+    imageHoldClicks.delete(bookKey);
+    if (now <= imageHold.until && event.target === imageHold.target) {
+      suppressDomClick(event);
+      return true;
+    }
+  }
+  const suppressedSwipe = suppressedSwipeClicks.get(bookKey);
+  if (suppressedSwipe) {
+    if (now > suppressedSwipe.until) {
+      suppressedSwipeClicks.delete(bookKey);
+    } else {
+      const nearEnd =
+        Math.hypot(event.screenX - suppressedSwipe.endX, event.screenY - suppressedSwipe.endY) <=
+        SYNTHESIZED_CLICK_POSITION_SLOP_PX;
+      if (nearEnd) {
+        suppressedSwipeClicks.delete(bookKey);
+        clearLayeredTurnTouchClaim(bookKey);
+        suppressDomClick(event);
+        return true;
+      }
+    }
+  }
+  const layeredClaim = layeredTurnTouchClaims.get(bookKey);
+  if (layeredClaim?.claimed && layeredClaim.ended) {
+    clearLayeredTurnTouchClaim(bookKey);
+    suppressDomClick(event);
+    return true;
+  }
+  return false;
+};
+
+// Runs before Foliate's bubble-phase link handler, so a held linked image can
+// open the viewer without also following its link.
+export const handleClickCapture = (bookKey: string, event: MouseEvent, isFixedLayout = false) => {
+  if (consumeSuppressedDomClick(bookKey, event, Date.now())) return;
+  const element = event.target as HTMLElement | null;
+  if (
+    isFixedLayout ||
+    isMouseDown ||
+    longHoldTimeout ||
+    getImageViewerGesture(bookKey) !== 'longPress' ||
+    !element?.closest('a[href]') ||
+    opensNote(element) ||
+    element.closest(
+      '.js_readerFooterNote, .zhangyue-footnote, .duokan-footnote, .qqreader-footnote',
+    )
+  )
+    return;
+  const media = detectMediaTarget(element);
+  if (media?.elementType !== 'image') return;
+  suppressDomClick(event);
+  window.postMessage({ type: 'iframe-open-media', bookKey, ...media }, '*');
 };
 
 // The event's position in main-window viewport coordinates: iframe client
@@ -73,6 +293,30 @@ const getKeyStatus = (event?: MouseEvent | WheelEvent | TouchEvent) => {
 };
 
 export const handleKeydown = (bookKey: string, event: KeyboardEvent) => {
+  const target = event.target as HTMLElement | null;
+  const interactiveTarget =
+    !!target?.isContentEditable ||
+    /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '') ||
+    (/^(A|BUTTON)$/.test(target?.tagName ?? '') && (event.key === 'Enter' || event.key === ' '));
+  const postKeydown = (handled: boolean) => {
+    window.postMessage(
+      {
+        type: 'iframe-keydown',
+        bookKey,
+        key: event.key,
+        code: event.code,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+        altGraphKey: event.getModifierState('AltGraph'),
+        repeat: event.repeat,
+        interactiveTarget,
+        handled,
+      },
+      '*',
+    );
+  };
   keyboardState = {
     key: event.key,
     code: event.code,
@@ -89,19 +333,23 @@ export const handleKeydown = (bookKey: string, event: KeyboardEvent) => {
     event.preventDefault();
   }
 
-  window.postMessage(
-    {
-      type: 'iframe-keydown',
-      bookKey,
-      key: event.key,
-      code: event.code,
-      ctrlKey: event.ctrlKey,
-      shiftKey: event.shiftKey,
-      altKey: event.altKey,
-      metaKey: event.metaKey,
-    },
-    '*',
-  );
+  // The original iframe KeyboardEvent must be consumed synchronously. A later
+  // postMessage handler cannot cancel browser defaults such as Ctrl+End.
+  if (eventDispatcher.dispatchSync('iframe-page-turn-keydown', { bookKey, event })) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    postKeydown(true);
+    return;
+  }
+
+  if (eventDispatcher.dispatchSync('iframe-shortcut-keydown', { bookKey, event })) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    postKeydown(true);
+    return;
+  }
+
+  postKeydown(false);
 };
 
 export const handleKeyup = (bookKey: string, event: KeyboardEvent) => {
@@ -131,6 +379,7 @@ export const handleKeyup = (bookKey: string, event: KeyboardEvent) => {
 
 export const handleMousedown = (bookKey: string, event: MouseEvent) => {
   isMouseDown = true;
+  if (longHoldTimeout) clearTimeout(longHoldTimeout);
   longHoldTimeout = setTimeout(() => {
     longHoldTimeout = null;
   }, LONG_HOLD_THRESHOLD);
@@ -138,6 +387,7 @@ export const handleMousedown = (bookKey: string, event: MouseEvent) => {
   if (event.button === 1 && autoscrollArmedBooks.has(bookKey)) {
     event.preventDefault();
   }
+  if (event.button === 3 || event.button === 4) event.preventDefault();
 
   window.postMessage(
     {
@@ -164,6 +414,7 @@ export const handleAuxclick = (bookKey: string, event: MouseEvent) => {
   if (event.button === 1 && autoscrollArmedBooks.has(bookKey)) {
     event.preventDefault();
   }
+  if (event.button === 3 || event.button === 4) event.preventDefault();
 };
 
 export const handleMousemove = (bookKey: string, event: MouseEvent) => {
@@ -184,6 +435,10 @@ export const handleMouseup = (bookKey: string, event: MouseEvent) => {
   // we will handle mouse back and forward buttons ourselves
   if ([3, 4].includes(event.button)) {
     event.preventDefault();
+    if (eventDispatcher.dispatchSync('iframe-shortcut-mouseup', { bookKey, event })) {
+      event.stopImmediatePropagation();
+      return;
+    }
   }
   window.postMessage(
     {
@@ -202,11 +457,33 @@ export const handleMouseup = (bookKey: string, event: MouseEvent) => {
   );
 };
 
+const lastWheelScrollTop = new WeakMap<Element, number>();
+
+// Whether this tick scrolls the page natively: the fixed-layout host scrolls a
+// fit-width or zoomed page within itself. Chromium scrolls a passive wheel
+// before dispatching it, so the host may show this tick's scroll already — a
+// page that moved since the previous tick counts as still scrolling, too, and
+// so does the first tick on a page that can scroll at all.
+const isFixedLayoutScrollingY = (event: WheelEvent) => {
+  const doc = event.currentTarget as Document | null;
+  const root = doc?.defaultView?.frameElement?.getRootNode();
+  const host = root && 'host' in root ? (root.host as HTMLElement) : null;
+  if (host?.localName !== 'foliate-fxl') return false;
+  const last = lastWheelScrollTop.get(host);
+  lastWheelScrollTop.set(host, host.scrollTop);
+  const moved =
+    last === undefined
+      ? host.scrollHeight - host.clientHeight > 1
+      : Math.abs(host.scrollTop - last) > 1;
+  return hasScrollRoomY(host, event.deltaY) || moved;
+};
+
 export const handleWheel = (bookKey: string, event: WheelEvent) => {
   window.postMessage(
     {
       type: 'iframe-wheel',
       bookKey,
+      nativeScrollY: isFixedLayoutScrollingY(event),
       deltaMode: event.deltaMode,
       deltaX: event.deltaX,
       deltaY: event.deltaY,
@@ -227,47 +504,140 @@ export const handleWheel = (bookKey: string, event: WheelEvent) => {
 // gallery / table zoom viewers consume.
 type MediaTarget = { elementType: 'image'; src: string } | { elementType: 'table'; html: string };
 
-const detectMediaTarget = (target: HTMLElement | null): MediaTarget | null => {
+// How many pages an element's box covers. foliate publishes the page's content
+// box on the root element; fixed-layout pages have none, so this is NaN there.
+const pagesCovered = (element: Element) => {
+  const style = element.ownerDocument.documentElement?.style;
+  const pageArea =
+    parseFloat(style?.getPropertyValue('--available-width') ?? '') *
+    parseFloat(style?.getPropertyValue('--available-height') ?? '');
+  const { width, height } = element.getBoundingClientRect();
+  return (width * height) / pageArea;
+};
+
+export const detectMediaTarget = (target: HTMLElement | null): MediaTarget | null => {
   if (!target) return null;
   if (target.localName === 'img') {
     return { elementType: 'image', src: (target as HTMLImageElement).src };
   }
-  const svgImage = target.closest('svg')?.querySelector('image');
+  // The <image> under the pointer, else the one an SVG page wraps.
+  const svgImage = target.closest('image') ?? target.closest('svg')?.querySelector('image');
   if (svgImage) {
     const href =
       svgImage.getAttribute('href') ||
       svgImage.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
-    if (href) return { elementType: 'image', src: href };
+    if (href) return { elementType: 'image', src: new URL(href, svgImage.baseURI).href };
   }
   const table = target.localName === 'table' ? target : target.closest('table');
-  if (table) return { elementType: 'table', html: (table as HTMLElement).outerHTML };
+  // A link inside a table is followed; the table zooms from anywhere else
+  // (#6856). A table running past two pages lays out the text itself (some
+  // annotated classics set a whole chapter in one), so it is not media.
+  if (table && !table.contains(target.closest('a')) && !(pagesCovered(table) >= 2)) {
+    return { elementType: 'table', html: (table as HTMLElement).outerHTML };
+  }
   return null;
+};
+
+// A PDF page document: foliate-js records where the page paints its images.
+type PDFPageDocument = Document & {
+  getImageAt?: (x: number, y: number) => (() => Promise<Blob>) | null;
+};
+
+// The image a right-click or long press lands on, as a loader for its file. A
+// PDF page is a canvas under its text layer, so foliate-js finds its images by
+// position and renders the one asked for on demand.
+export const getContextMenuImage = (
+  event: Pick<MouseEvent, 'target' | 'clientX' | 'clientY'>,
+): (() => Promise<Blob>) | null => {
+  const target = event.target as HTMLElement;
+  const media = detectMediaTarget(target);
+  if (media?.elementType === 'image') return () => fetch(media.src).then((res) => res.blob());
+  const doc = target.ownerDocument as PDFPageDocument;
+  return doc.getImageAt?.(event.clientX, event.clientY) ?? null;
+};
+
+// A hold on blank table space, with no text selected in the section.
+const isBlankTableHold = (event: MouseEvent) => {
+  const doc = (event.target as Node | null)?.ownerDocument;
+  return (
+    !!doc &&
+    doc.getSelection()?.isCollapsed !== false &&
+    !isTextAtPoint(doc, event.clientX, event.clientY)
+  );
+};
+
+// A full-bleed cover or full-page illustration spans the page-turn zones, so
+// tapping it has to stay a page turn (#6424). Half a page separates such pages
+// from inline figures.
+const fillsPage = (target: HTMLElement) => {
+  const element = target.closest('img, svg, table');
+  return !!element && pagesCovered(element) >= 0.5;
+};
+
+// An XHTML section keeps `epub:type` namespaced, an HTML one as a plain attribute.
+const linkTypeSelector = (types: string[]) =>
+  types
+    .flatMap((type) => [
+      `a[href][*|type~="${type}"]`,
+      `a[href][epub\\:type~="${type}"]`,
+      `a[href][role~="doc-${type}"]`,
+    ])
+    .join(', ');
+const noteRefSelector = `${linkTypeSelector(['noteref', 'biblioref', 'glossref'])}, a[href].footnote, a[href].footnote-link`;
+const backlinkSelector = linkTypeSelector(['backlink']);
+
+const isSuper = (el: Element | null) =>
+  !!el &&
+  (el.matches('sup') ||
+    /^(super|top|text-top)$|^\d/.test(
+      el.ownerDocument.defaultView?.getComputedStyle(el).verticalAlign ?? '',
+    ));
+
+// Whether the footnote popup opens for the link holding the element. Its image
+// is then a marker, like the 「註」 glyph some annotated classics put on every
+// note. Mirrors foliate's `isFootnoteReference` (a note reference, or any link
+// but a backlink set as superscript) plus the classes FootnotePopup follows.
+const opensNote = (element: HTMLElement | null) => {
+  const a = element?.closest('a[href]');
+  if (!a) return false;
+  if (a.matches(noteRefSelector)) return true;
+  return (
+    !a.matches(backlinkSelector) &&
+    (isSuper(a) ||
+      (a.children.length === 1 && isSuper(a.firstElementChild)) ||
+      isSuper(a.parentElement))
+  );
 };
 
 export const handleClick = (
   bookKey: string,
   doubleClickDisabled: React.MutableRefObject<boolean>,
   isFixedLayout: boolean,
+  isComicBook: boolean,
   event: MouseEvent,
 ) => {
   const now = Date.now();
-  const suppressedSwipe = suppressedSwipeClicks.get(bookKey);
-  if (suppressedSwipe) {
-    if (now > suppressedSwipe.until) {
-      suppressedSwipeClicks.delete(bookKey);
-    } else {
-      const nearEnd =
-        Math.hypot(event.screenX - suppressedSwipe.endX, event.screenY - suppressedSwipe.endY) <=
-        SYNTHESIZED_CLICK_POSITION_SLOP_PX;
-      if (nearEnd) {
-        suppressedSwipeClicks.delete(bookKey);
-        return;
-      }
-    }
-  }
+  if (consumeSuppressedDomClick(bookKey, event, now)) return;
+  // Decide at release; waiting for a possible double-click must not extend a hold.
+  const isLongHold = !longHoldTimeout;
 
   if (!doubleClickDisabled.current && now - lastClickTime < DOUBLE_CLICK_INTERVAL_THRESHOLD_MS) {
     lastClickTime = now;
+    // A comic page is one full-bleed image with no text on it, so the
+    // double-click that starts a word selection everywhere else is free to do
+    // what a single tap does in a reflowable book: open the page in the image
+    // viewer, the only surface that can zoom past page-fit and save/share the
+    // image. Single tap cannot be used here - in fixed layout it is the
+    // page-turn / toolbar gesture.
+    const comicPage = isComicBook ? detectMediaTarget(event.target as HTMLElement | null) : null;
+    if (comicPage?.elementType === 'image') {
+      window.postMessage({ type: 'iframe-open-media', bookKey, ...comicPage }, '*');
+      return;
+    }
+    // In scroll mode several sections are on screen, each in its own iframe;
+    // the window point tells the reader which one was double-clicked (#6583).
+    const doc = (event.target as Node).ownerDocument!;
+    const windowPoint = toParentViewportPoint(doc, event.clientX, event.clientY);
     window.postMessage(
       {
         type: 'iframe-double-click',
@@ -276,6 +646,8 @@ export const handleClick = (
         screenY: event.screenY,
         clientX: event.clientX,
         clientY: event.clientY,
+        windowX: windowPoint.x,
+        windowY: windowPoint.y,
         offsetX: event.offsetX,
         offsetY: event.offsetY,
         ...getKeyStatus(event),
@@ -288,6 +660,15 @@ export const handleClick = (
   lastClickTime = now;
 
   const postSingleClick = () => {
+    // Native captured-turn recognition is delivered through postMessage and
+    // can land one task after the iframe touchend/click. Re-check ownership at
+    // dispatch time so an early 1–6px claim cannot slip through that gap.
+    const lateLayeredClaim = layeredTurnTouchClaims.get(bookKey);
+    if (lateLayeredClaim?.claimed && lateLayeredClaim.ended) {
+      clearLayeredTurnTouchClaim(bookKey);
+      if (lastClickTime === now) lastClickTime = 0;
+      return;
+    }
     const element = event.target as HTMLElement | null;
     const footnoteSelector = [
       '.js_readerFooterNote',
@@ -299,11 +680,25 @@ export const handleClick = (
     // In reflowable books a single tap on an image/table opens the media
     // viewer. A media element wrapped in a plain link (e.g. a figure linking to
     // its full-resolution image) should still zoom rather than follow the link
-    // (#4757). Footnotes are excluded so footnote links keep their
-    // popup/navigation behavior.
-    const media = !isFixedLayout && !footnote ? detectMediaTarget(element) : null;
+    // (#4757). Footnotes and note references are excluded so they keep their
+    // popup/navigation behavior. Fixed-layout pages (comics/manga) keep
+    // tap-to-turn, so their media rides along on the single click like media
+    // filling a reflowable page, and a linked image there stays a link.
+    const target =
+      !footnote && !opensNote(element) && !(isFixedLayout && element?.closest('a'))
+        ? detectMediaTarget(element)
+        : null;
+    // A book whose images and tables open on a long press taps through them
+    // (#7145, #6872). A hold on a table's text, or a drag selecting it, is
+    // left to text selection.
+    const longPressMedia = getImageViewerGesture(bookKey) === 'longPress' ? target : null;
+    const heldMedia =
+      longPressMedia?.elementType === 'table' && !isBlankTableHold(event) ? null : longPressMedia;
+    const media = longPressMedia ? null : target;
+    const pageMedia = media && element && (isFixedLayout || fillsPage(element)) ? media : null;
     if (
       !media &&
+      !(heldMedia && isLongHold) &&
       element?.closest('sup, a, audio, video') &&
       !element?.closest('a.duokan-footnote:not([href])')
     ) {
@@ -331,8 +726,10 @@ export const handleClick = (
       return;
     }
 
-    // if long hold is detected, we don't want to send single click event
-    if (!longHoldTimeout) {
+    // if long hold is detected, we don't want to send single click event; a
+    // mouse held on an image or table is the long press that opens the viewer.
+    if (isLongHold) {
+      if (heldMedia) window.postMessage({ type: 'iframe-open-media', bookKey, ...heldMedia }, '*');
       return;
     }
 
@@ -347,10 +744,10 @@ export const handleClick = (
 
     // In reflowable books a single tap on an image/table opens the image gallery
     // / table zoom (#4584) — it is the only gesture that does, since long-press
-    // fired mid-scroll and was removed (#5069). Fixed-layout books
-    // (PDF/comics/manga) keep tap-to-turn, since there the tap is the page-turn
-    // gesture (media is null there).
-    if (media) {
+    // fired mid-scroll and was removed (#5069). Media filling the page, and any
+    // media in a fixed-layout book, rides along on the single click instead, so
+    // the tap zone picks between turning the page and opening the viewer.
+    if (media && !pageMedia) {
       window.postMessage({ type: 'iframe-open-media', bookKey, ...media }, '*');
       return;
     }
@@ -365,7 +762,9 @@ export const handleClick = (
         clientY: event.clientY,
         offsetX: event.offsetX,
         offsetY: event.offsetY,
+        ...getWindowPoint(event),
         ...getKeyStatus(event),
+        ...(pageMedia && { media: pageMedia }),
       },
       '*',
     );
@@ -377,7 +776,10 @@ export const handleClick = (
       }
     }, DOUBLE_CLICK_INTERVAL_THRESHOLD_MS);
   } else {
-    postSingleClick();
+    // Mouse clicks remain synchronous. A touch-synthesized click waits one
+    // task so the parent realm can publish a native captured-turn claim.
+    if (layeredTurnTouchClaims.get(bookKey)?.ended) setTimeout(postSingleClick, 0);
+    else postSingleClick();
   }
 };
 
@@ -403,9 +805,18 @@ const handleTouchEv = (bookKey: string, event: TouchEvent, type: string) => {
   const targetTouches = serializeTouches(event.touches);
   const changedTouches = serializeTouches(event.changedTouches);
   if (type === 'iframe-touchstart') {
+    beginLayeredTurnTouch(bookKey);
     const touch = targetTouches[0];
     if (touch) {
-      touchGestures.set(bookKey, { startX: touch.screenX, startY: touch.screenY, moved: false });
+      const nativeTurn = event.touches.length === 1 ? createNativeTurnIntent(event, touch) : null;
+      touchGestures.set(bookKey, {
+        startX: touch.screenX,
+        startY: touch.screenY,
+        startTime: event.timeStamp,
+        moved: false,
+        turnHost: nativeTurn?.host,
+        turnIntent: nativeTurn?.intent,
+      });
     }
   } else if (type === 'iframe-touchmove') {
     const gesture = touchGestures.get(bookKey);
@@ -413,6 +824,39 @@ const handleTouchEv = (bookKey: string, event: TouchEvent, type: string) => {
     if (gesture && touch) {
       const distance = Math.hypot(touch.screenX - gesture.startX, touch.screenY - gesture.startY);
       if (distance >= SYNTHESIZED_CLICK_SWIPE_DISTANCE_PX) gesture.moved = true;
+      const { turnHost, turnIntent } = gesture;
+      if (turnHost && turnIntent) {
+        const currentTarget = event.currentTarget as Document | null;
+        const selection = currentTarget?.getSelection?.();
+        const invalid =
+          event.touches.length !== 1 ||
+          !turnHost.hasAttribute(NATIVE_CAPTURED_TURN_ATTRIBUTE) ||
+          turnHost.hasAttribute(NATIVE_PROGRAMMATIC_TURN_ATTRIBUTE) ||
+          !!turnHost.scrollLocked ||
+          !!(selection && !selection.isCollapsed);
+        if (invalid) {
+          gesture.turnHost = undefined;
+          gesture.turnIntent = undefined;
+        } else if (
+          shouldClaimTurnGesture(
+            turnIntent,
+            {
+              deltaX: touch.screenX - gesture.startX,
+              deltaY: touch.screenY - gesture.startY,
+              deltaT: event.timeStamp - gesture.startTime,
+            },
+            SYNTHESIZED_CLICK_SWIPE_DISTANCE_PX,
+          )
+        ) {
+          gesture.turnIntent = undefined;
+          setLayeredTurnTouchClaimed(bookKey, true);
+          // Native capture recognition reaches the React interceptor through
+          // postMessage. Claim the browser gesture synchronously here as well,
+          // so a 1–6px page turn cannot generate a compatibility/link click in
+          // the gap before that message is handled.
+          event.preventDefault();
+        }
+      }
     }
   } else if (type === 'iframe-touchend' || type === 'iframe-touchcancel') {
     const gesture = touchGestures.get(bookKey);
@@ -420,7 +864,10 @@ const handleTouchEv = (bookKey: string, event: TouchEvent, type: string) => {
     // touchmove event. Include the released finger when deciding whether the
     // browser-generated click belongs to a swipe.
     const releasedTouch = changedTouches[0];
+    const layeredClaim = layeredTurnTouchClaims.get(bookKey);
+    if (type === 'iframe-touchend' && layeredClaim?.claimed) event.preventDefault();
     const moved =
+      layeredClaim?.claimed ||
       gesture?.moved ||
       (gesture &&
         releasedTouch &&
@@ -436,6 +883,11 @@ const handleTouchEv = (bookKey: string, event: TouchEvent, type: string) => {
       });
     }
     touchGestures.delete(bookKey);
+    if (type === 'iframe-touchcancel') {
+      cancelLayeredTurnTouch(bookKey);
+    } else {
+      endLayeredTurnTouch(bookKey);
+    }
   }
   window.postMessage(
     {
@@ -452,6 +904,27 @@ const handleTouchEv = (bookKey: string, event: TouchEvent, type: string) => {
 
 export const handleTouchStart = (bookKey: string, event: TouchEvent) => {
   handleTouchEv(bookKey, event, 'iframe-touchstart');
+  // A zoom change mid-gesture (an edge turn resets a zoomed PDF page) rebuilds
+  // the pdf.js text layer. A touch that began on one of its spans keeps
+  // targeting the detached span, so its later events never reach the
+  // document. Forward them from the span, only once it is detached.
+  const target = event.target as Node | null;
+  if (!target?.addEventListener || target === event.currentTarget) return;
+  const forward = (type: string) => (e: Event) => {
+    if (!target.isConnected) handleTouchEv(bookKey, e as TouchEvent, type);
+  };
+  const onMove = forward('iframe-touchmove');
+  const onEnd = forward('iframe-touchend');
+  const onCancel = forward('iframe-touchcancel');
+  const release = (e: Event) => {
+    target.removeEventListener('touchmove', onMove);
+    target.removeEventListener('touchend', release);
+    target.removeEventListener('touchcancel', release);
+    (e.type === 'touchend' ? onEnd : onCancel)(e);
+  };
+  target.addEventListener('touchmove', onMove, { passive: false });
+  target.addEventListener('touchend', release, { passive: false });
+  target.addEventListener('touchcancel', release);
 };
 
 export const handleTouchMove = (bookKey: string, event: TouchEvent) => {

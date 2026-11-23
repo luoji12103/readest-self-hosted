@@ -5,6 +5,13 @@ import { eventDispatcher } from '@/utils/event';
 import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '@/services/constants';
 import { createWheelGestureDetector } from '@/app/reader/utils/wheelGesture';
 import {
+  beginLayeredTurnTouch,
+  cancelLayeredTurnTouch,
+  endLayeredTurnTouch,
+} from '@/app/reader/utils/iframeEventHandlers';
+import { NATIVE_CAPTURED_TURN_ATTRIBUTE } from '@/app/reader/utils/turnGestureArena';
+import { getCapturedTurnStyle } from '@/app/reader/hooks/useCapturedTurn';
+import {
   dispatchTouchInterceptors,
   isLayeredTurnGestureActive,
   TOUCH_TAP_SLOP_PX,
@@ -46,6 +53,11 @@ export const useMouseEvent = (
             } else if (msg.data.deltaY < 0) {
               eventDispatcher.dispatch('zoom-in', { factor: Math.abs(msg.data.deltaY) / 100 });
             }
+          } else if (msg.data.nativeScrollY) {
+            // The page scrolls within itself (fit-width or zoomed PDF): this
+            // gesture belongs to the scroll, and only a fresh one at the edge
+            // turns the page.
+            wheelDetectorRef.current!.suppress(Date.now());
           } else {
             const flip = wheelDetectorRef.current!.feed({
               deltaX: msg.data.deltaX ?? 0,
@@ -93,6 +105,9 @@ export const useOpenMediaEvent = (
   handleTablePress: (html: string) => void,
 ) => {
   const handleOpenMedia = (msg: MessageEvent) => {
+    // The producers post from the app window itself; the table viewer renders
+    // the markup it is handed, so a message from any other window is ignored.
+    if (msg.source !== window) return;
     if (msg.data && msg.data.bookKey === bookKey && msg.data.type === 'iframe-open-media') {
       if (msg.data.elementType === 'image') {
         handleImagePress(msg.data.src);
@@ -149,14 +164,27 @@ export const useTouchEvent = (bookKey: string) => {
   // see whether they spread/converge (pinch) or slide together (scroll) before
   // committing. isPinchingRef only flips true once a pinch is confirmed.
   const pinchPendingRef = useRef(false);
+  // Reflowable books do not pinch-zoom, but a second finger must still end the
+  // single-finger arena. Keep the whole multi-touch sequence latched out until
+  // every finger is up so the remaining finger cannot inherit the old start.
+  const reflowableMultiTouchRef = useRef(false);
 
   const isLifecycleManagedLayeredTurn = () => isLayeredTurnGestureActive(bookKey);
   const isLayeredTurnCandidate = () => {
     const viewSettings = getViewSettings(bookKey);
-    if (!viewSettings || getBookData(bookKey)?.isFixedLayout) return false;
-    const turnStyle = getView(bookKey)?.renderer.getAttribute?.('turn-style');
+    if (!viewSettings) return false;
+    // `fixed-layout.js` animates nothing of its own and ignores `turn-style`,
+    // so a fixed-layout book is only a candidate where the Tauri captured
+    // pipeline drives its turn — and not while it pans (readest#6239).
+    if (getBookData(bookKey)?.isFixedLayout && !getCapturedTurnStyle(viewSettings, true)) {
+      return false;
+    }
+    const renderer = getView(bookKey)?.renderer;
+    const turnStyle =
+      renderer?.getAttribute?.('turn-style') ??
+      renderer?.getAttribute?.(NATIVE_CAPTURED_TURN_ATTRIBUTE);
     return (
-      (turnStyle === 'slide' || turnStyle === 'curl') &&
+      (turnStyle === 'slide' || turnStyle === 'curl' || turnStyle === 'push') &&
       viewSettings.animated &&
       !viewSettings.scrolled &&
       !viewSettings.isEink &&
@@ -191,30 +219,101 @@ export const useTouchEvent = (bookKey: string) => {
     touchStart: { screenX: touchStart.screenX, screenY: touchStart.screenY },
     deltaX: touch.screenX - touchStart.screenX,
     deltaY: touch.screenY - touchStart.screenY,
-    deltaT: endTime && startTime ? endTime - startTime : 0,
+    deltaT: endTime !== null && startTime !== null ? endTime - startTime : 0,
   });
+
+  const clearSingleTouchState = () => {
+    touchStartRef.current = null;
+    touchEndRef.current = null;
+    touchStartTimeRef.current = null;
+    touchEndTimeRef.current = null;
+    touchConsumedRef.current = false;
+    layeredTurnOwnedRef.current = false;
+    layeredTurnCandidateRef.current = false;
+  };
+
+  const preventDirectTouchDefault = (e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>) => {
+    // Forwarded iframe messages are plain data. React events originate on the
+    // paginator's parent surface (header/footer/margins) and must explicitly
+    // suppress the compatibility click once a layered turn owns the touch.
+    if ('preventDefault' in e) e.preventDefault();
+  };
+
+  // A native captured turn has already claimed only when its move was consumed.
+  // Cancel it exactly once before a second finger discards the single-finger
+  // baseline; unclaimed starts need no synthetic lifecycle event.
+  const cancelClaimedSingleTouch = (
+    e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
+    fallbackTouch: IframeTouch,
+  ) => {
+    const touchStart = touchStartRef.current;
+    if (!touchConsumedRef.current || !touchStart) return;
+    const touch = touchEndRef.current ?? fallbackTouch;
+    const endTime = 'timeStamp' in e ? e.timeStamp : Date.now();
+    dispatchTouchInterceptors(
+      bookKey,
+      buildTouchDetail('cancel', touch, touchStart, touchStartTimeRef.current, endTime),
+    );
+  };
+
+  const latchReflowableMultiTouch = (
+    e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
+    t0: IframeTouch | undefined,
+    t1: IframeTouch | undefined,
+  ) => {
+    if (!t0 || !t1 || getBookData(bookKey)?.isFixedLayout) return false;
+    cancelLayeredTurnTouch(bookKey);
+    if (!reflowableMultiTouchRef.current) {
+      reflowableMultiTouchRef.current = true;
+      cancelClaimedSingleTouch(e, t0);
+    }
+    clearSingleTouchState();
+    return true;
+  };
+
+  const startFixedLayoutPinch = (
+    e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>,
+    t0: IframeTouch,
+    t1: IframeTouch,
+  ) => {
+    if (!getBookData(bookKey)?.isFixedLayout) return false;
+    cancelLayeredTurnTouch(bookKey);
+    // The pinch branch owns the gesture from here. A captured curl the
+    // first finger already claimed would otherwise sit frozen over the
+    // page until the next touchstart (readest#6239).
+    cancelClaimedSingleTouch(e, t0);
+    pinchPendingRef.current = true;
+    isPinchingRef.current = false;
+    initialTouch0Ref.current = t0;
+    initialTouch1Ref.current = t1;
+    initialPinchDistRef.current = getTouchDistance(t0, t1);
+    initialZoomRef.current = getViewSettings(bookKey)?.zoomLevel ?? 100;
+    lastPinchRatioRef.current = 1;
+    clearSingleTouchState();
+    return true;
+  };
 
   const onTouchStart = (e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>) => {
     layeredTurnOwnedRef.current = false;
     layeredTurnCandidateRef.current = false;
     const t0 = e.targetTouches[0] as IframeTouch | undefined;
     const t1 = e.targetTouches[1] as IframeTouch | undefined;
-    if (t0 && t1) {
-      const bookData = getBookData(bookKey);
-      if (bookData?.isFixedLayout) {
-        pinchPendingRef.current = true;
-        isPinchingRef.current = false;
-        initialTouch0Ref.current = t0;
-        initialTouch1Ref.current = t1;
-        initialPinchDistRef.current = getTouchDistance(t0, t1);
-        initialZoomRef.current = getViewSettings(bookKey)?.zoomLevel ?? 100;
-        lastPinchRatioRef.current = 1;
-        touchStartRef.current = null;
-        touchEndRef.current = null;
-        return;
-      }
+    if (reflowableMultiTouchRef.current) {
+      cancelLayeredTurnTouch(bookKey);
+      return;
     }
-    if (!t0) return;
+    // iframeEventHandlers owns the lifecycle for forwarded iframe messages.
+    // Starting it again after postMessage delivery could erase a claim made by
+    // a raw move that arrived while the start message was still queued.
+    if ('preventDefault' in e) beginLayeredTurnTouch(bookKey);
+    if (t0 && t1) {
+      if (!startFixedLayoutPinch(e, t0, t1)) latchReflowableMultiTouch(e, t0, t1);
+      return;
+    }
+    if (!t0) {
+      cancelLayeredTurnTouch(bookKey);
+      return;
+    }
     layeredTurnCandidateRef.current = isLayeredTurnCandidate();
     touchStartRef.current = t0;
     touchStartTimeRef.current = 'timeStamp' in e ? e.timeStamp : Date.now();
@@ -232,6 +331,7 @@ export const useTouchEvent = (bookKey: string) => {
   const onTouchMove = (e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>) => {
     const t0 = e.targetTouches[0] as IframeTouch | undefined;
     const t1 = e.targetTouches[1] as IframeTouch | undefined;
+    if (reflowableMultiTouchRef.current || latchReflowableMultiTouch(e, t0, t1)) return;
     if ((pinchPendingRef.current || isPinchingRef.current) && t0 && t1) {
       if (pinchPendingRef.current) {
         const init0 = initialTouch0Ref.current;
@@ -262,13 +362,24 @@ export const useTouchEvent = (bookKey: string) => {
       }
       const currentDist = getTouchDistance(t0, t1);
       if (initialPinchDistRef.current > 0) {
-        const ratio = currentDist / initialPinchDistRef.current;
+        const rawRatio = currentDist / initialPinchDistRef.current;
+        // Clamp the live preview to the same bounds the release commits, so the
+        // page never previews past the zoom limit.
+        const committed = Math.max(
+          MIN_ZOOM_LEVEL,
+          Math.min(MAX_ZOOM_LEVEL, Math.round(initialZoomRef.current * rawRatio)),
+        );
+        const ratio = committed / initialZoomRef.current;
         lastPinchRatioRef.current = ratio;
         const renderer = getView(bookKey)?.renderer;
         renderer?.pinchZoom?.(ratio);
       }
       return;
     }
+    // Each page of a spread is its own iframe, and the browser sends a touch
+    // sequence only to its first finger's frame: a second finger on the other
+    // page gets no touchstart and first shows up here.
+    if (t0 && t1 && touchStartRef.current && startFixedLayoutPinch(e, t0, t1)) return;
     if (!touchStartRef.current) return;
     const touch = t0;
     if (touch) {
@@ -283,6 +394,7 @@ export const useTouchEvent = (bookKey: string) => {
       );
       if (dispatchTouchInterceptors(bookKey, detail)) {
         touchConsumedRef.current = true;
+        preventDirectTouchDefault(e);
         return;
       }
     }
@@ -297,10 +409,10 @@ export const useTouchEvent = (bookKey: string) => {
     if (layeredTurnCandidateRef.current && touchEnd) {
       const deltaX = touchEnd.screenX - touchStart.screenX;
       const deltaY = touchEnd.screenY - touchStart.screenY;
-      // Browser layered turns use a stricter, direction-aware paginator gate
-      // than native captured turns. Do not hide the toolbar in the gap before
-      // `before-capture`: if the paginator claims later, its snapshot lifecycle
-      // takes over; if it never claims, touchend runs the generic behavior.
+      // The paginator's direction-aware arena may still claim this gesture.
+      // Do not hide the toolbar while ownership is pending: if it claims later,
+      // its snapshot lifecycle takes over; otherwise touchend runs the generic
+      // behavior.
       if (Math.abs(deltaX) > Math.abs(deltaY)) return;
     }
     if (hoveredBookKey && touchEnd) {
@@ -308,7 +420,10 @@ export const useTouchEvent = (bookKey: string) => {
       const deltaY = touchEnd.screenY - touchStart.screenY;
       const deltaX = touchEnd.screenX - touchStart.screenX;
       if (Math.hypot(deltaX, deltaY) < TOUCH_TAP_SLOP_PX) return;
-      if (!viewSettings!.scrolled && !viewSettings!.vertical) {
+      // Paginated books turn pages with horizontal swipes in every writing mode
+      // (vertical ones included, readest#624), so only that hides the bars; a
+      // vertical swipe is left to the swipe-up toggle on touchend.
+      if (!viewSettings!.scrolled) {
         if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) >= TOUCH_SWIPE_THRESHOLD_PX) {
           setHoveredBookKey(null);
         }
@@ -320,6 +435,14 @@ export const useTouchEvent = (bookKey: string) => {
 
   const onTouchEnd = (e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>) => {
     layeredTurnCandidateRef.current = false;
+    if (reflowableMultiTouchRef.current) {
+      if (e.targetTouches.length === 0) {
+        reflowableMultiTouchRef.current = false;
+        cancelLayeredTurnTouch(bookKey);
+        clearSingleTouchState();
+      }
+      return;
+    }
     if (isPinchingRef.current || pinchPendingRef.current) {
       const t0 = e.targetTouches[0] as IframeTouch | undefined;
       const t1 = e.targetTouches[1] as IframeTouch | undefined;
@@ -341,8 +464,10 @@ export const useTouchEvent = (bookKey: string) => {
       touchStartRef.current = null;
       touchEndRef.current = null;
       layeredTurnOwnedRef.current = false;
+      cancelLayeredTurnTouch(bookKey);
       return;
     }
+    if (e.targetTouches.length === 0) endLayeredTurnTouch(bookKey);
     if (!touchStartRef.current) {
       layeredTurnOwnedRef.current = false;
       return;
@@ -361,6 +486,7 @@ export const useTouchEvent = (bookKey: string) => {
     const { current: touchEnd } = touchEndRef;
 
     // Dispatch end to interceptors, then check if the gesture was consumed
+    let endConsumed = false;
     if (touchEnd && touchStart) {
       const detail = buildTouchDetail(
         'end',
@@ -369,10 +495,11 @@ export const useTouchEvent = (bookKey: string) => {
         touchStartTimeRef.current,
         touchEndTimeRef.current,
       );
-      dispatchTouchInterceptors(bookKey, detail);
+      endConsumed = dispatchTouchInterceptors(bookKey, detail);
     }
 
-    if (touchConsumedRef.current) {
+    if (touchConsumedRef.current || endConsumed) {
+      preventDirectTouchDefault(e);
       touchConsumedRef.current = false;
       touchStartRef.current = null;
       touchEndRef.current = null;
@@ -381,6 +508,7 @@ export const useTouchEvent = (bookKey: string) => {
     }
 
     if (layeredTurnOwnedRef.current) {
+      preventDirectTouchDefault(e);
       touchStartRef.current = null;
       touchEndRef.current = null;
       layeredTurnOwnedRef.current = false;
@@ -430,7 +558,6 @@ export const useTouchEvent = (bookKey: string) => {
         // is a pan, not a toggle-the-bars gesture (#5142).
         if (
           !viewSettings!.scrolled &&
-          !viewSettings!.vertical &&
           (!bookData.isFixedLayout || !hasVerticalPanning(getView(bookKey), viewSettings))
         ) {
           setHoveredBookKey(hoveredBookKey ? null : bookKey);
@@ -450,6 +577,14 @@ export const useTouchEvent = (bookKey: string) => {
 
   const onTouchCancel = (e: IframeTouchEvent | React.TouchEvent<HTMLDivElement>) => {
     layeredTurnCandidateRef.current = false;
+    const preventCompatibilityClick = touchConsumedRef.current || layeredTurnOwnedRef.current;
+    cancelLayeredTurnTouch(bookKey);
+    if (preventCompatibilityClick) preventDirectTouchDefault(e);
+    if (reflowableMultiTouchRef.current) {
+      if (e.targetTouches.length === 0) reflowableMultiTouchRef.current = false;
+      clearSingleTouchState();
+      return;
+    }
     if (isPinchingRef.current || pinchPendingRef.current) {
       getView(bookKey)?.renderer.pinchEnd?.();
       isPinchingRef.current = false;

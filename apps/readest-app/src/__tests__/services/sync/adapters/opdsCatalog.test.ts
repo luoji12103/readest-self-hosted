@@ -45,6 +45,19 @@ const makeRow = (overrides: Partial<ReplicaRow> = {}): ReplicaRow => ({
 });
 
 describe('opdsCatalogAdapter', () => {
+  test('syncs the self-signed certificate choice, including an explicit false', () => {
+    for (const allowSelfSignedCert of [true, false]) {
+      const fields = opdsCatalogAdapter.pack({ ...sample, allowSelfSignedCert });
+      expect(fields['allowSelfSignedCert']).toBe(allowSelfSignedCert);
+      expect(opdsCatalogAdapter.unpack(fields).allowSelfSignedCert).toBe(allowSelfSignedCert);
+      const row = makeRow();
+      row.fields_jsonb['allowSelfSignedCert'] = env(allowSelfSignedCert);
+      expect(opdsCatalogAdapter.unpackRow(row, '')?.allowSelfSignedCert).toBe(allowSelfSignedCert);
+    }
+    // A row published before the option existed leaves it unset (legacy = lenient).
+    expect(opdsCatalogAdapter.unpackRow(makeRow(), '')?.allowSelfSignedCert).toBeUndefined();
+  });
+
   test('kind + schemaVersion are stable constants', () => {
     expect(opdsCatalogAdapter.kind).toBe('opds_catalog');
     expect(opdsCatalogAdapter.schemaVersion).toBe(1);
@@ -107,6 +120,32 @@ describe('opdsCatalogAdapter', () => {
 
     const noUrl = makeRow({ fields_jsonb: { name: env('x') } });
     expect(opdsCatalogAdapter.unpackRow(noUrl, '')).toBeNull();
+  });
+
+  test('round-trips sortOrder so a manual drag order syncs cross-device', () => {
+    const fields = opdsCatalogAdapter.pack({ ...sample, sortOrder: 2 });
+    expect(opdsCatalogAdapter.unpack(fields).sortOrder).toBe(2);
+
+    const row = makeRow({
+      fields_jsonb: { ...makeRow().fields_jsonb, sortOrder: env(2) },
+    });
+    expect(opdsCatalogAdapter.unpackRow(row, '')!.sortOrder).toBe(2);
+  });
+
+  test('sortOrder 0 survives the round trip', () => {
+    // Guards against a truthiness check swallowing the first slot.
+    const fields = opdsCatalogAdapter.pack({ ...sample, sortOrder: 0 });
+    expect(opdsCatalogAdapter.unpack(fields).sortOrder).toBe(0);
+
+    const row = makeRow({
+      fields_jsonb: { ...makeRow().fields_jsonb, sortOrder: env(0) },
+    });
+    expect(opdsCatalogAdapter.unpackRow(row, '')!.sortOrder).toBe(0);
+  });
+
+  test('omits sortOrder entirely for never-dragged catalogs', () => {
+    expect(opdsCatalogAdapter.pack(sample)).not.toHaveProperty('sortOrder');
+    expect(opdsCatalogAdapter.unpackRow(makeRow(), '')!.sortOrder).toBeUndefined();
   });
 
   test('unpackRow surfaces the reincarnation token', () => {

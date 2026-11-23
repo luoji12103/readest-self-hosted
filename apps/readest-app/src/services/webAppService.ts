@@ -3,6 +3,7 @@ import { DatabaseOpts, DatabaseService } from '@/types/database';
 import { SchemaType } from '@/services/database/migrate';
 import { getOSPlatform, isValidURL } from '@/utils/misc';
 import { isSafariBrowser } from '@/utils/ua';
+import { getPathFilename, getURLFilename } from '@/utils/path';
 import { RemoteFile } from '@/utils/file';
 import { detectViewTransitionGroup, detectViewTransitionsAPI } from '@/utils/viewTransition';
 import { isPWA } from './environment';
@@ -81,12 +82,18 @@ const indexedDBFileSystem: FileSystem = {
   async getImageURL(path: string) {
     return await this.getBlobURL(path, 'None');
   },
-  async openFile(path: string, base: BaseDir, filename?: string) {
+  async openFile(path: string, base: BaseDir, filename?: string, fetcher?: typeof fetch) {
     if (isValidURL(path)) {
-      return await new RemoteFile(path, filename).open();
+      return await new RemoteFile(
+        path,
+        filename || getURLFilename(path),
+        '',
+        Date.now(),
+        fetcher,
+      ).open();
     } else {
       const content = await this.readFile(path, base, 'binary');
-      return new File([content], filename || path);
+      return new File([content], filename || getPathFilename(path));
     }
   },
   async copyFile(srcPath: string, srcBase: BaseDir, dstPath: string, dstBase: BaseDir) {
@@ -124,8 +131,15 @@ const indexedDBFileSystem: FileSystem = {
       request.onsuccess = async () => {
         if (request.result) {
           const content = request.result.content;
-          if (mode === 'text') resolve(content);
-          else {
+          if (mode === 'text') {
+            if (content instanceof Blob) {
+              resolve(await content.text());
+            } else if (content instanceof ArrayBuffer) {
+              resolve(new TextDecoder().decode(content));
+            } else {
+              resolve(content);
+            }
+          } else {
             if (content instanceof Blob) {
               const arrayBuffer = await content.arrayBuffer();
               resolve(arrayBuffer);
@@ -209,7 +223,10 @@ const indexedDBFileSystem: FileSystem = {
     return new Promise<FileItem[]>((resolve, reject) => {
       const transaction = db.transaction('files', 'readonly');
       const store = transaction.objectStore('files');
-      const request = store.getAll();
+      // Keys are file paths: constrain to the directory prefix instead of
+      // materializing the whole store (every book blob) per listing — an
+      // unbounded getAll() here cost seconds per call on large libraries.
+      const request = store.getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`, false, true));
 
       request.onsuccess = () => {
         const files = request.result as { path: string; content: string | ArrayBuffer | Blob }[];
@@ -425,5 +442,36 @@ export class WebAppService extends BaseAppService {
     const { getMigrations } = await import('./database/migrations');
     await migrate(db, getMigrations(schema));
     return db;
+  }
+
+  override async installDatabase(path: string, base: BaseDir, source: File): Promise<void> {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(await this.opfsDatabaseName(path, base), {
+      create: true,
+    });
+    const writable = await handle.createWritable();
+    await source.stream().pipeTo(writable);
+  }
+
+  private async opfsDatabaseName(path: string, base: BaseDir): Promise<string> {
+    const fullPath = await this.resolveFilePath(path, base);
+    return fullPath.replace(/[/\\]+/g, '_').replace(/^_+/, '');
+  }
+
+  override async databaseExists(path: string, base: BaseDir): Promise<boolean> {
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.getFileHandle(await this.opfsDatabaseName(path, base));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  override async deleteDatabase(path: string, base: BaseDir): Promise<void> {
+    const name = await this.opfsDatabaseName(path, base);
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(name).catch(() => {});
+    await root.removeEntry(`${name}-wal`).catch(() => {});
   }
 }

@@ -7,9 +7,10 @@ import { useAuth } from '@/context/AuthContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useAppRouter } from '@/hooks/useAppRouter';
 import { navigateToLogin } from '@/utils/nav';
+import LibraryImportButton from './LibraryImportButton';
 
 interface LibraryEmptyStateProps {
-  onImport: () => void;
+  onImport: (anchor: HTMLElement) => void;
 }
 
 const LibraryEmptyState: React.FC<LibraryEmptyStateProps> = ({ onImport }) => {
@@ -32,13 +33,7 @@ const LibraryEmptyState: React.FC<LibraryEmptyStateProps> = ({ onImport }) => {
             : _('Drop a book anywhere on this window, or pick one from your computer.')}
         </p>
         <div className='flex w-full max-w-xs flex-col gap-3'>
-          <button
-            type='button'
-            className='btn btn-primary h-11 min-h-11 rounded-lg'
-            onClick={onImport}
-          >
-            {_('Import Books')}
-          </button>
+          <LibraryImportButton onImport={onImport} primary />
           {/* TODO: add a 'Browse free catalogs' secondary action that opens the
               OPDS dialog (handleShowOPDSDialog) once we settle on placement. */}
           {!user && (
@@ -47,7 +42,7 @@ const LibraryEmptyState: React.FC<LibraryEmptyStateProps> = ({ onImport }) => {
               className={clsx(
                 'text-base-content/70 hover:text-base-content mt-1 py-2 text-sm font-medium',
                 'underline underline-offset-4',
-                'focus-visible:text-base-content focus-visible:outline-none',
+                'focus-visible:text-base-content focus-visible:outline-hidden',
               )}
               onClick={() => navigateToLogin(router)}
             >

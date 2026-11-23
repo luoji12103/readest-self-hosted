@@ -38,6 +38,12 @@ pub struct SpeakResponse {
     pub utterance_id: String,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopArgs {
+    pub utterance_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetRateArgs {
@@ -66,6 +72,12 @@ pub struct GetVoicesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SetMediaSessionActiveRequest {
     pub active: bool,
+    pub session_id: Option<String>,
+    // Android: whether the media service should hold the app's audio focus for
+    // this session. False when the session's audio plays through a WebView
+    // media element, which Chromium already requests focus for (see
+    // MediaPlaybackService.ownsAudioFocus). Defaults to true when absent.
+    pub owns_audio_focus: Option<bool>,
     pub notification_title: Option<String>,
     pub notification_text: Option<String>,
     pub foreground_service_title: Option<String>,
@@ -81,6 +93,7 @@ pub struct SetMediaSessionActiveRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateMediaSessionStateRequest {
     pub playing: bool,
+    pub session_id: Option<String>,
     pub position: Option<f64>,
     pub duration: Option<f64>,
 }
@@ -88,10 +101,17 @@ pub struct UpdateMediaSessionStateRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateMediaSessionMetadataRequest {
+    pub session_id: Option<String>,
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
     pub artwork: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMediaLibraryRequest {
+    pub books_json: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,6 +142,18 @@ pub struct PlayoutEnqueueResponse {
 pub struct PlayoutControlRequest {
     pub action: String,
     pub rate: Option<f64>,
+    // Absolute file path for action "load" (Media Overlay continuous playout).
+    pub path: Option<String>,
+    // Seek target for actions "load" and "seek", in milliseconds.
+    pub position_ms: Option<f64>,
+    // Byte window [start, end) of `path` to play as the whole track: a stored
+    // audio entry inside the book's zip. iOS also needs its MIME type, since
+    // the file's own extension names the book.
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+    pub content_type: Option<String>,
+    // Linux reads compressed narration directly from this ZIP entry.
+    pub entry: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,4 +169,7 @@ pub struct PlayoutPositionResponse {
     pub index: i32,
     pub position_ms: f64,
     pub playing: bool,
+    // Android: the item the playlist ended on, once nothing is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_index: Option<i32>,
 }

@@ -104,11 +104,13 @@ Self-host releases use tags such as:
 selfhost-v0.11.4
 ```
 
-Pushing a self-host tag triggers GitHub Actions to build and publish:
+Maintainers run **Release Selfhost** manually from a reviewed ref. Pushing a self-host tag does not start a release. The release publishes:
 
-- Windows x64 installer and signature
+- Windows, Linux, and macOS packages and updater signatures
 - Android split APKs and signatures
 - `latest.json` updater metadata
+
+See [releasing and syncing the fork](./docs/selfhost-client.md#releasing-a-self-host-client) for the maintainer steps.
 
 The updater endpoint defaults to:
 
@@ -119,6 +121,8 @@ https://github.com/luoji12103/readest-self-hosted/releases/latest/download/lates
 ## Relationship to Upstream Readest
 
 Readest is developed upstream at [readest/readest](https://github.com/readest/readest). This fork is downstream packaging for self-host users and should stay close to upstream where possible.
+
+The scheduled sync checks a merge candidate against the fork's `main` and reports the result in GitHub Actions. A maintainer reviews and merges upstream changes separately.
 
 When updating this fork, avoid rebuilding older upstream releases with unrelated current source code. Prefer source-equivalent backports for historical self-host releases.
 

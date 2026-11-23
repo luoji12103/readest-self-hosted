@@ -1,3 +1,4 @@
+import { bookshelfReplicaSchema, bookshelfFieldsSchema } from '@/services/bookshelves/replica';
 import { z } from 'zod';
 import type { ReplicaRow } from '@/types/replica';
 import type { SyncErrorCode } from '@/libs/errors';
@@ -61,12 +62,71 @@ const opdsCatalogFieldsSchema = z
     customHeaders: fieldEnvelopeSchema.optional(),
     autoDownload: fieldEnvelopeSchema.optional(),
     disabled: fieldEnvelopeSchema.optional(),
+    allowSelfSignedCert: fieldEnvelopeSchema.optional(),
     addedAt: fieldEnvelopeSchema.optional(),
+    sortOrder: fieldEnvelopeSchema.optional(),
     // Encrypted-credential fields. The CRDT envelope wraps a cipher
     // envelope as `v` when the publishing device had its CryptoSession
     // unlocked; otherwise the field is omitted from the row.
     username: fieldEnvelopeWithCipher.optional(),
     password: fieldEnvelopeWithCipher.optional(),
+  })
+  .catchall(fieldEnvelopeWithCipher);
+
+const absServerFieldsSchema = z
+  .object({
+    name: fieldEnvelopeSchema.optional(),
+    url: fieldEnvelopeSchema.optional(),
+    addedAt: fieldEnvelopeSchema.optional(),
+    libraryIds: fieldEnvelopeSchema.optional(),
+    disabled: fieldEnvelopeSchema.optional(),
+    allowSelfSignedCert: fieldEnvelopeSchema.optional(),
+    serverVersion: fieldEnvelopeSchema.optional(),
+    // Encrypted-credential fields. The CRDT envelope wraps a cipher
+    // envelope as `v` when the publishing device had its CryptoSession
+    // unlocked; otherwise the field is omitted from the row.
+    username: fieldEnvelopeWithCipher.optional(),
+    password: fieldEnvelopeWithCipher.optional(),
+    accessToken: fieldEnvelopeWithCipher.optional(),
+    refreshToken: fieldEnvelopeWithCipher.optional(),
+  })
+  .catchall(fieldEnvelopeWithCipher);
+
+const customTranslatorFieldsSchema = z
+  .object({
+    type: fieldEnvelopeSchema.optional(),
+    name: fieldEnvelopeSchema.optional(),
+    baseUrl: fieldEnvelopeSchema.optional(),
+    model: fieldEnvelopeSchema.optional(),
+    temperature: fieldEnvelopeSchema.optional(),
+    disabled: fieldEnvelopeSchema.optional(),
+    addedAt: fieldEnvelopeSchema.optional(),
+    updatedAt: fieldEnvelopeSchema.optional(),
+    // Encrypted-credential field, omitted when the publisher was locked.
+    apiKey: fieldEnvelopeWithCipher.optional(),
+  })
+  .catchall(fieldEnvelopeWithCipher);
+
+const customTTSFieldsSchema = z
+  .object({
+    name: fieldEnvelopeSchema.optional(),
+    baseUrl: fieldEnvelopeSchema.optional(),
+    model: fieldEnvelopeSchema.optional(),
+    instructions: fieldEnvelopeSchema.optional(),
+    disabled: fieldEnvelopeSchema.optional(),
+    addedAt: fieldEnvelopeSchema.optional(),
+    updatedAt: fieldEnvelopeSchema.optional(),
+    // Encrypted-credential field, omitted when the publisher was locked.
+    apiKey: fieldEnvelopeWithCipher.optional(),
+  })
+  .catchall(fieldEnvelopeWithCipher);
+
+const translationPromptFieldsSchema = z
+  .object({
+    name: fieldEnvelopeSchema.optional(),
+    systemPrompt: fieldEnvelopeSchema.optional(),
+    addedAt: fieldEnvelopeSchema.optional(),
+    updatedAt: fieldEnvelopeSchema.optional(),
   })
   .catchall(fieldEnvelopeWithCipher);
 
@@ -87,6 +147,13 @@ interface KindSpec {
 }
 
 export const KIND_ALLOWLIST: Record<string, KindSpec> = {
+  bookshelf: {
+    minSchemaVersion: 1,
+    maxSchemaVersion: 1,
+    maxRowsPerUser: 200,
+    binary: false,
+    fields: bookshelfFieldsSchema,
+  },
   dictionary: {
     minSchemaVersion: 1,
     maxSchemaVersion: 1,
@@ -113,6 +180,34 @@ export const KIND_ALLOWLIST: Record<string, KindSpec> = {
     maxSchemaVersion: 1,
     maxRowsPerUser: 50,
     fields: opdsCatalogFieldsSchema,
+    binary: false,
+  },
+  abs_server: {
+    minSchemaVersion: 1,
+    maxSchemaVersion: 1,
+    maxRowsPerUser: 50,
+    fields: absServerFieldsSchema,
+    binary: false,
+  },
+  custom_translator: {
+    minSchemaVersion: 1,
+    maxSchemaVersion: 1,
+    maxRowsPerUser: 50,
+    fields: customTranslatorFieldsSchema,
+    binary: false,
+  },
+  translation_prompt: {
+    minSchemaVersion: 1,
+    maxSchemaVersion: 1,
+    maxRowsPerUser: 100,
+    fields: translationPromptFieldsSchema,
+    binary: false,
+  },
+  custom_tts: {
+    minSchemaVersion: 1,
+    maxSchemaVersion: 1,
+    maxRowsPerUser: 50,
+    fields: customTTSFieldsSchema,
     binary: false,
   },
   settings: {
@@ -163,6 +258,10 @@ const manifestFileSchema = z.object({
   filename: z.string(),
   byteSize: z.number().int().nonnegative(),
   partialMd5: z.string(),
+  sha256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/u)
+    .optional(),
   mtime: z.number().optional(),
 });
 
@@ -223,6 +322,9 @@ export const validateRow = (row: ReplicaRow): ValidationResult => {
     };
   }
 
+  if (row.kind === 'bookshelf' && !bookshelfReplicaSchema.safeParse(row).success) {
+    return { ok: false, code: 'VALIDATION', message: 'Invalid bookshelf replica' };
+  }
   if (row.manifest_jsonb !== null) {
     const manifestParse = manifestSchema.safeParse(row.manifest_jsonb);
     if (!manifestParse.success) {

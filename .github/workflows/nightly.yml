@@ -1,6 +1,6 @@
 # Nightly builds. Mirrors the build matrix and build/signing steps of
 # release.yml — keep cert/NDK/toolchain bumps, secret names, and the
-# truly-portable AppImage + portable-Windows steps in sync between the two.
+# Linux CEF + portable-Windows steps in sync between the two.
 #
 # Differences from release.yml: this workflow (1) stamps a nightly version
 # `<base>-<YYYYMMDDHH>` (Asia/Shanghai), (2) publishes to Cloudflare R2 only (no
@@ -29,7 +29,7 @@ jobs:
     outputs:
       nightly_version: ${{ steps.v.outputs.nightly_version }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           persist-credentials: false
@@ -52,9 +52,23 @@ jobs:
       fail-fast: false
       matrix:
         config:
+          # One APK per ABI group; `arch` names the APK and its updater key
+          # (android-<arch>, see src/helpers/updater.ts::getAndroidPlatformKey).
           - os: ubuntu-latest
             release: android
-            rust_target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+            arch: arm64
+            rust_target: aarch64-linux-android
+            android_args: '-t aarch64'
+          - os: ubuntu-latest
+            release: android
+            arch: armv7
+            rust_target: armv7-linux-androideabi
+            android_args: '-t armv7'
+          - os: ubuntu-latest
+            release: android
+            arch: legacy
+            rust_target: i686-linux-android,x86_64-linux-android
+            android_args: '-t i686 -t x86_64'
           - os: ubuntu-22.04
             release: linux
             arch: x86_64
@@ -67,7 +81,10 @@ jobs:
             release: macos
             arch: aarch64
             rust_target: x86_64-apple-darwin,aarch64-apple-darwin
-            args: '--target universal-apple-darwin'
+            # --config layers the iCloud overlay (Developer ID provisioning
+            # profile + entitlements) onto the direct-distribution build; see
+            # src-tauri/tauri.macos-nonestore.conf.json.
+            args: '--target universal-apple-darwin --config src-tauri/tauri.macos-nonestore.conf.json'
           - os: windows-latest
             release: windows
             arch: x86_64
@@ -82,9 +99,9 @@ jobs:
     runs-on: ${{ matrix.config.os }}
     # Backstop only — must stay ABOVE setup time + the per-step timeouts below,
     # because a job-level timeout reports `cancelled` and skips assemble-manifest.
-    timeout-minutes: 75
+    timeout-minutes: ${{ matrix.config.release == 'android' && 110 || 90 }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           persist-credentials: false
@@ -93,24 +110,28 @@ jobs:
         run: git submodule update --init --recursive
 
       - name: setup pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       - name: setup node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: 24
           cache: pnpm
 
       - name: setup Java (for Android build only)
         if: matrix.config.release == 'android'
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: 'zulu'
           java-version: '17'
 
       - name: setup Android SDK (for Android build only)
         if: matrix.config.release == 'android'
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          # The legacy `tools` package (part of the action's default) no longer
+          # exists in the SDK repository and makes sdkmanager fail.
+          packages: 'platform-tools'
 
       - name: install NDK (for Android build only)
         if: matrix.config.release == 'android'
@@ -127,15 +148,66 @@ jobs:
         with:
           targets: ${{ matrix.config.rust_target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: nightly-${{ matrix.config.os }}-${{ matrix.config.release }}-${{ matrix.config.arch }}-cargo
+
+      # The npm cli-cef bundles the AppImage with a broken quick-sharun fork
+      # and cannot be pointed elsewhere. Build the CLI from readest/tauri
+      # instead: its sharun_cef.rs pins pkgforge's deployment-array quoting
+      # fix (Anylinux-AppImages#855) and runs the tooling with bash and
+      # streamed output. Rev-pinned; the marker skips the rebuild while
+      # rust-cache keeps ~/.cargo/bin. scripts/tauri.mjs runs `cargo tauri`
+      # when TAURI_CEF_CARGO=1.
+      - name: install the CEF tauri CLI from readest/tauri (linux only)
+        if: matrix.config.release == 'linux'
+        run: |
+          set -euo pipefail
+          rev=6beeb209b5514f597a26f48b7a5b9fe4c59b5f12
+          marker="$HOME/.cargo/bin/.cargo-tauri-rev"
+          if [ -x "$HOME/.cargo/bin/cargo-tauri" ] && [ "$(cat "$marker" 2>/dev/null)" = "$rev" ]; then
+            echo "cargo-tauri at $rev already installed"
+            exit 0
+          fi
+          cargo install tauri-cli --git https://github.com/readest/tauri --rev "$rev" --locked --force
+          echo "$rev" > "$marker"
 
       - name: install dependencies (ubuntu only)
         if: contains(matrix.config.os, 'ubuntu') && matrix.config.release != 'android'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y pkg-config libasound2-dev libclang-dev g++ libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      # Chromium dlopens NSS, libpulse and libspeechd by soname; whatever the
+      # bundle lacks comes from the host at run time and fails against the
+      # bundled glibc on any newer distro (NSS: FATAL crypto/nss_util.cc).
+      # quick-sharun's DEPLOY_CHROMIUM deploys NSS and, via DEPLOY_PIPEWIRE,
+      # pulse — with the pinned pkgforge script the CLI above uses. Three gaps
+      # remain, passed as appimage.files under /usr/lib, which the bundler
+      # hands to quick-sharun as arguments: Debian keeps the NSS modules in
+      # <triple>/nss/ where the Arch-layout globs miss them, and nothing
+      # deploys libspeechd. winit dlopens libxkbcommon-x11 by soname when it
+      # opens its X11 event loop (the CEF runtime forces X11 even on Wayland),
+      # and quick-sharun's Chromium rule would deploy it, but the runner image
+      # has no copy to deploy; without it every launch panics before the first
+      # log line (#6144). The npm cli-cef could do none of this: its
+      # quick-sharun fork drops the `eval` that rebuilds the deploy array
+      # (FabianLars/Anylinux-AppImages@3e280d1b), so every DEPLOY_* extra is
+      # silently skipped.
+      - name: stage CEF AppImage runtime libraries (linux only)
+        if: matrix.config.release == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y libnss3 libpulse0 libspeechd2 libxkbcommon-x11-0
+          nss_dir=$(dirname "$(ls /usr/lib/*-linux-gnu/nss/libsoftokn3.so)")
+          lib_dir=${nss_dir%/nss}
+          sudo cp -f --remove-destination "$nss_dir"/*.so "$lib_dir/"
+          # +=: tauri.conf.json already ships the AppRun hook entry.
+          conf=apps/readest-app/src-tauri/tauri.conf.json
+          jq --arg d "$lib_dir" '.bundle.linux.appimage.files += {
+              "/usr/lib/libspeechd.so.2": ($d + "/libspeechd.so.2"),
+              "/usr/lib/libxkbcommon-x11.so.0": ($d + "/libxkbcommon-x11.so.0")
+            }' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
 
       - name: create .env.local file for Next.js
         run: |
@@ -158,7 +230,7 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             brew install rclone
           else
-            choco install rclone -y
+            choco install rclone --version=1.75.0 --require-checksums -y
           fi
 
       - name: configure rclone
@@ -178,15 +250,17 @@ jobs:
       # `pnpm tauri android init` + `git checkout .` reverts tracked files
       # (including package.json), so the nightly version MUST be patched AFTER
       # the checkout. Mirrors release.yml's android build/signing steps.
-      - name: build and sign Android apks
+      - name: build and sign Android apk
         if: matrix.config.release == 'android'
         shell: bash
-        timeout-minutes: 55
+        # Stays under the job backstop above.
+        timeout-minutes: 90
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
           version="${{ needs.compute-version.outputs.nightly_version }}"
           cd apps/readest-app/
@@ -204,40 +278,26 @@ jobs:
           echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
           popd
 
-          apk_path=src-tauri/gen/android/app/build/outputs/apk/universal/release
-          universal_apk=Readest_${version}_universal.apk
-          arm64_apk=Readest_${version}_arm64.apk
-          pnpm tauri android build
-          cp ${apk_path}/app-universal-release.apk $universal_apk
-          pnpm tauri android build -t aarch64
-          cp ${apk_path}/app-universal-release.apk $arm64_apk
-          pnpm tauri signer sign $universal_apk
-          pnpm tauri signer sign $arm64_apk
+          apk=Readest_${version}_${{ matrix.config.arch }}.apk
+          pnpm tauri android build ${{ matrix.config.android_args }}
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk $apk
+
+          # Sentry symbolicates Rust panics from these: the APK ships the
+          # library stripped (see gen/android/app/build.gradle.kts), while
+          # `target/` keeps the unstripped copy. Crash reporting must never
+          # fail a build, and forks have no token.
+          if [ -n "$SENTRY_AUTH_TOKEN" ]; then
+            pnpm exec sentry-cli debug-files upload --org readest --project readest \
+              ../../target/*/release/libreadestlib.so || echo "::warning::Sentry debug file upload failed"
+          fi
+
+          pnpm tauri signer sign $apk
 
       # ──────────────────────────── DESKTOP ────────────────────────────
-      # Linux uses the truly-portable AppImage tauri CLI fork (mirrors
-      # release.yml). The nightly version is patched BEFORE `tauri build` so the
-      # bundle filenames carry the stamp.
-      - name: Override tauri-cli with custom AppImage format (Linux)
-        if: matrix.config.release == 'linux'
-        run: cargo install tauri-cli --git https://github.com/tauri-apps/tauri --branch feat/truly-portable-appimage --force
-
-      # The truly-portable AppImage bundler downloads quick-sharun.sh from
-      # Anylinux-AppImages@main ONLY when it is not already in the tauri tools
-      # cache. An upstream strace-mode change (2026-06-29) made bundling launch
-      # the app under Xvfb and hang forever, timing out the Linux legs (#4906).
-      # Seed the cache with the last known-good revision so the bundler never
-      # fetches the moving main-branch script.
-      - name: pin quick-sharun.sh for AppImage bundling (Linux)
-        if: matrix.config.release == 'linux'
-        run: |
-          set -euo pipefail
-          cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
-          mkdir -p "$cache_dir"
-          curl -fsSL --retry 3 -o "$cache_dir/quick-sharun.sh" \
-            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/b3a9e985cdedf7efa81d172f182cd13983743147/useful-tools/quick-sharun.sh"
-          chmod +x "$cache_dir/quick-sharun.sh"
-
+      # Linux ships on the CEF runtime: `pnpm tauri` (mirrors release.yml; see
+      # apps/readest-app/scripts/tauri.mjs) runs the feat/cef tauri CLI there.
+      # The nightly version is patched BEFORE `tauri build` so the bundle
+      # filenames carry the stamp.
       - name: build desktop bundles
         if: matrix.config.release != 'android'
         shell: bash
@@ -247,7 +307,9 @@ jobs:
         # latest.json for ALL platforms (#4906).
         timeout-minutes: 45
         env:
-          TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: 'true'
+          TAURI_CEF_CARGO: '1'
+          # See release.yml.
+          STRACE_MODE: '0'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -261,13 +323,28 @@ jobs:
           version="${{ needs.compute-version.outputs.nightly_version }}"
           node -e "const f='apps/readest-app/package.json';const j=require('./'+f);j.version='${version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
           cd apps/readest-app
-          # On Linux use the cargo `tauri` CLI (the truly-portable AppImage fork
-          # installed above); elsewhere the npm @tauri-apps/cli.
-          if [ "${{ matrix.config.release }}" = "linux" ]; then
-            cargo tauri build ${{ matrix.config.args }}
-          else
-            pnpm tauri build ${{ matrix.config.args }}
-          fi
+          pnpm tauri build ${{ matrix.config.args }}
+
+      # quick-sharun skips what it cannot find without failing; catch that
+      # before it ships.
+      - name: verify the AppImage bundle contents (linux only)
+        if: matrix.config.release == 'linux'
+        run: |
+          set -euo pipefail
+          lib=target/release/bundle/appimage/Readest.AppDir/lib
+          for so in libsoftokn3.so libfreeblpriv3.so libnssckbi.so libsqlite3.so.0 \
+                    libpulse.so.0 libspeechd.so.2 libxkbcommon-x11.so.0; do
+            [ -e "$lib/$so" ] || { echo "::error::$so is missing from the AppImage bundle"; exit 1; }
+          done
+          # libpulse finds its private half through a host RUNPATH; lib.path
+          # has to cover the bundled copy for it to win.
+          ls "$lib"/pulseaudio/libpulsecommon-*.so > /dev/null 2>&1 \
+            || { echo "::error::libpulsecommon is missing from the AppImage bundle"; exit 1; }
+          grep -qx '+/pulseaudio' "$lib/lib.path" \
+            || { echo "::error::lib.path does not cover lib/pulseaudio, so libpulse cannot load"; exit 1; }
+          # Without this hook every new AppImage asks for a root password.
+          [ -e "${lib%/lib}/bin/00-no-userns-prompt.hook" ] \
+            || { echo "::error::the no-userns-prompt hook is missing from the AppImage bundle"; exit 1; }
 
       # Portable Windows build: rebuild with NEXT_PUBLIC_PORTABLE_APP=true and
       # ship the raw exe (mirrors release.yml). Runs after the NSIS build above.
@@ -365,8 +442,14 @@ jobs:
           case "$release" in
             android)
               # Signed in the android step; basenames already version-stamped.
-              add_entry "apps/readest-app/Readest_${version}_universal.apk" "Readest_${version}_universal.apk" "android-universal"
-              add_entry "apps/readest-app/Readest_${version}_arm64.apk"     "Readest_${version}_arm64.apk"     "android-arm64"
+              apk="Readest_${version}_${arch}.apk"
+              add_entry "apps/readest-app/$apk" "$apk" "android-${arch}"
+              # Clients released before the per-ABI split look up
+              # android-universal on every non-arm64 device; most are armv7.
+              if [ "$arch" = "armv7" ]; then
+                jq '.platforms["android-universal"] = .platforms["android-armv7"]' "$frag" > "$frag.tmp" && mv "$frag.tmp" "$frag"
+                echo "fragment += android-universal -> $apk"
+              fi
               ;;
             macos)
               # Universal updater bundle: bundle/macos/Readest.app.tar.gz (no
@@ -398,7 +481,7 @@ jobs:
               add_entry "$portable_name" "$portable_name" "$portable_key"
               ;;
             linux)
-              # Truly-portable AppImage: bundle/appimage/Readest_<ver>_<amd64|aarch64>.AppImage
+              # CEF (sharun) AppImage: bundle/appimage/Readest_<ver>_<amd64|aarch64>.AppImage
               if [ "$arch" = "x86_64" ]; then
                 appimage_name="Readest_${version}_amd64.AppImage"
                 key="linux-x86_64-appimage"
@@ -406,7 +489,7 @@ jobs:
                 appimage_name="Readest_${version}_aarch64.AppImage"
                 key="linux-aarch64-appimage"
               fi
-              # The Linux leg builds with `cargo tauri build` WITHOUT `--target`
+              # The Linux leg builds with `pnpm tauri build` WITHOUT `--target`
               # (no matrix args), so cargo emits bundles under target/release/
               # (host-target default) — NOT target/<triple>/release/ like the
               # macOS/Windows legs, which DO pass `--target`. So there is no
@@ -424,7 +507,7 @@ jobs:
       # download.readest.com rather than a GitHub release. The .sig updater
       # signatures are excluded — they are not binaries users run.
       - name: attest nightly binaries
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             nightly-out/Readest*
@@ -441,6 +524,71 @@ jobs:
           rclone copy "$out" "$base/" --exclude "frag/**"
           # Per-leg manifest fragment.
           rclone copy "$out/frag" "$base/manifest-fragments/"
+
+  # Nightly KOReader plugin zip. Mirrors release.yml's build-koreader-plugin
+  # job (keep the helper-binary targets and zip exclusions in sync) but
+  # uploads to R2 under nightly/<version>/ next to the other nightly
+  # artifacts instead of a GitHub release. Deliberately NOT part of
+  # latest.json — the updater manifest carries Tauri app platforms only.
+  build-koreader-plugin:
+    needs: compute-version
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Build LocalSend helper binaries for KOReader (static musl armv7 + arm64)
+        run: |
+          rustup target add armv7-unknown-linux-musleabi
+          rustup target add aarch64-unknown-linux-musl
+          pip3 install --break-system-packages --require-hashes -r .github/requirements/zigbuild.txt
+          node apps/readest.koplugin/scripts/build-localsend-bins.mjs --only armv7
+          node apps/readest.koplugin/scripts/build-localsend-bins.mjs --only arm64
+
+      - name: create KOReader plugin zip
+        run: |
+          version="${{ needs.compute-version.outputs.nightly_version }}"
+          plugin_zip="Readest-${version}-1.koplugin.zip"
+          meta_file="apps/readest.koplugin/_meta.lua"
+          perl -i -pe "s/^}/    version = \"${version}\",\n}/" "${meta_file}"
+
+          # Same dev-only exclusions as release.yml (keep the two lists in sync).
+          cd apps
+          zip -r ../${plugin_zip} readest.koplugin \
+            -x 'readest.koplugin/scripts/*' \
+               'readest.koplugin/docs/*' \
+               'readest.koplugin/spec/*' \
+               'readest.koplugin/.busted' \
+               'readest.koplugin/native/*'
+
+      - name: install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
+      - name: configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.RELEASE_R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.RELEASE_R2_SECRET_ACCESS_KEY }}
+          endpoint = https://${{ secrets.RELEASE_R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          EOF
+
+      - name: upload plugin zip to R2
+        run: |
+          set -euo pipefail
+          version="${{ needs.compute-version.outputs.nightly_version }}"
+          mkdir -p koplugin-out
+          mv "Readest-${version}-1.koplugin.zip" koplugin-out/
+          rclone copy koplugin-out "r2:readest-releases/nightly/${version}/"
+          echo "uploaded https://download.readest.com/nightly/${version}/Readest-${version}-1.koplugin.zip"
 
   assemble-manifest:
     needs: [compute-version, build]

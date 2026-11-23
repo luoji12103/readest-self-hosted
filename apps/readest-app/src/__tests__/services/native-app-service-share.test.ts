@@ -6,6 +6,9 @@ const writeFileMock = vi.fn().mockResolvedValue(undefined);
 const mkdirMock = vi.fn().mockResolvedValue(undefined);
 const saveDialogMock = vi.fn().mockResolvedValue('/tmp/exported.md');
 const shareFileMock = vi.fn().mockResolvedValue(undefined);
+const copyURIToPathMock = vi.fn().mockResolvedValue({ success: true });
+const removeMock = vi.fn().mockResolvedValue(undefined);
+const basenameMock = vi.fn((p: string) => Promise.resolve(p.split('/').pop() ?? p));
 
 vi.mock('@tauri-apps/plugin-os', () => ({
   type: () => osTypeMock(),
@@ -19,7 +22,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
   writeTextFile: (...args: unknown[]) => writeTextFileMock(...args),
   writeFile: (...args: unknown[]) => writeFileMock(...args),
   readDir: vi.fn().mockResolvedValue([]),
-  remove: vi.fn().mockResolvedValue(undefined),
+  remove: (...args: unknown[]) => removeMock(...args),
   copyFile: vi.fn().mockResolvedValue(undefined),
   stat: vi.fn().mockResolvedValue({ size: 0 }),
   BaseDirectory: {},
@@ -38,7 +41,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 vi.mock('@tauri-apps/api/path', () => ({
   join: (...parts: string[]) => Promise.resolve(parts.join('/')),
-  basename: (p: string) => Promise.resolve(p.split('/').pop() ?? p),
+  basename: (p: string) => basenameMock(p),
   appDataDir: () => Promise.resolve('/tmp/app-data'),
   appConfigDir: () => Promise.resolve('/tmp/app-config'),
   appCacheDir: () => Promise.resolve('/tmp/app-cache'),
@@ -51,13 +54,32 @@ vi.mock('@choochmeque/tauri-plugin-sharekit-api', () => ({
 }));
 
 vi.mock('@/utils/bridge', () => ({
-  copyURIToPath: vi.fn().mockResolvedValue({ path: '' }),
+  copyURIToPath: (...args: unknown[]) => copyURIToPathMock(...args),
   getStorefrontRegionCode: vi.fn().mockResolvedValue({ regionCode: null }),
+  hasAmbientLightSensor: vi.fn().mockResolvedValue({ available: false }),
 }));
 
 vi.mock('@/utils/file', () => ({
-  NativeFile: class {},
-  RemoteFile: class {},
+  NativeFile: class {
+    constructor(
+      public path: string,
+      public name: string,
+    ) {}
+
+    async open() {
+      return this;
+    }
+  },
+  RemoteFile: class {
+    constructor(
+      public url: string,
+      public name: string,
+    ) {}
+
+    async open() {
+      return this;
+    }
+  },
 }));
 
 vi.mock('@/utils/files', () => ({
@@ -84,6 +106,83 @@ describe('NativeAppService.saveFile share gating', () => {
     mkdirMock.mockClear();
     saveDialogMock.mockClear();
     shareFileMock.mockClear();
+    copyURIToPathMock.mockClear();
+    removeMock.mockClear();
+  });
+
+  test.each([
+    'content://com.android.externalstorage.documents/document/primary%3Aopaque-id',
+    'content://com.android.providers.downloads.documents/document/7421',
+  ])('resolves the provider display name with basename for %s', async (uri) => {
+    const service = await loadServiceWithOS('android');
+    basenameMock.mockResolvedValueOnce('Original Manual.pdf');
+
+    const file = await service.openFile(uri, 'None');
+
+    expect(basenameMock).toHaveBeenCalledWith(uri);
+    expect(file.name).toBe('Original Manual.pdf');
+  });
+
+  test.each([
+    ['A%23B.epub', 'A#B.epub'],
+    ['100%25.epub', '100%.epub'],
+    ['Report%2520Final.epub', 'Report%20Final.epub'],
+    ['A%3FB.epub', 'A?B.epub'],
+    ['%E4%B8%89%E4%BD%93%20book.epub', '三体 book.epub'],
+  ])('decodes an iOS import basename exactly once: %s', async (encodedName, expected) => {
+    const service = await loadServiceWithOS('ios');
+    const uri = `file:///private/var/Inbox/${encodedName}`;
+    const file = await service.openFile(uri, 'None');
+    expect(file.name).toBe(expected);
+    const request = copyURIToPathMock.mock.calls[0]![0] as { uri: string; dst: string };
+    expect(request.uri).toBe(uri);
+    expect(request.dst.endsWith(`-${expected}`)).toBe(true);
+  });
+
+  test.each([
+    ['https://example.com/manual.pdf#zoom=1.25', undefined, 'manual.pdf'],
+    ['https://example.com/C%2B%2B.pdf?type=application/pdf', undefined, 'C++.pdf'],
+    ['https://example.com/one%5Cpart.pdf', undefined, 'one\\part.pdf'],
+    ['https://example.com/manual%FF.pdf', undefined, 'manual%FF.pdf'],
+    ['https://example.com/manual.pdf#page=2', 'Original%20Name.pdf', 'Original%20Name.pdf'],
+  ])('resolves native URL fallback names for %s with override %s', async (url, name, expected) => {
+    const service = await loadServiceWithOS('android');
+
+    const file = await service['fs'].openFile(url, 'None', name);
+
+    expect(file.name).toBe(expected);
+  });
+
+  test.each([
+    ['linux', '/books/first\\chapter.pdf', undefined, 'first\\chapter.pdf'],
+    ['linux', '/books/manual?rev1.pdf', undefined, 'manual?rev1.pdf'],
+    ['linux', '/books/Report%20Final.pdf', undefined, 'Report%20Final.pdf'],
+    ['windows', 'C:\\books\\Device_Manual.pdf', undefined, 'Device_Manual.pdf'],
+    ['windows', 'chapters\\manual.pdf', undefined, 'manual.pdf'],
+    ['windows', '\\chapters\\manual.pdf', undefined, 'manual.pdf'],
+    ['linux', 'chapters\\manual.pdf', undefined, 'chapters\\manual.pdf'],
+    ['windows', '\\\\server\\books\\Device_Manual.pdf', undefined, 'Device_Manual.pdf'],
+    ['macos', '/books/book.pdf', 'Original%20Name.pdf', 'Original%20Name.pdf'],
+  ] as const)('resolves local %s names for %s', async (os, path, name, expected) => {
+    const service = await loadServiceWithOS(os);
+    const file = await service['fs'].openFile(path, 'None', name);
+    expect(file.name).toBe(expected);
+  });
+
+  test('uses a unique cache path for same-named content-provider files', async () => {
+    const service = await loadServiceWithOS('android');
+
+    await Promise.all([
+      service.openFile('content://com.example.documents/first/book.pdf', 'None'),
+      service.openFile('content://com.example.documents/second/book.pdf', 'None'),
+    ]);
+
+    const destinations = copyURIToPathMock.mock.calls.map(
+      ([request]) => (request as { dst: string }).dst,
+    );
+    expect(destinations).toHaveLength(2);
+    expect(new Set(destinations).size).toBe(2);
+    expect(destinations.every((destination) => destination.endsWith('-book.pdf'))).toBe(true);
   });
 
   test('uses native share on macOS when share=true', async () => {
@@ -129,6 +228,58 @@ describe('NativeAppService.saveFile share gating', () => {
     expect(writeFileMock).toHaveBeenCalledWith(sharedPath, expect.any(Uint8Array));
     // The subdirectory is created before writing.
     expect(mkdirMock).toHaveBeenCalled();
+  });
+
+  // Regression (#6713): Android 10 resolves Tauri's Temp dir to the
+  // unwritable /data/local/tmp, so Temp files must live in the app cache.
+  test('stages Temp files in the app cache on Android', async () => {
+    const service = await loadServiceWithOS('android');
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    await service.saveFile('image.png', bytes, { share: true, mimeType: 'image/png' });
+
+    expect(shareFileMock.mock.calls[0]![0]).toBe('/tmp/app-cache/shared/image.png');
+  });
+
+  test('keeps Temp files in the temp dir on iOS', async () => {
+    const service = await loadServiceWithOS('ios');
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    await service.saveFile('image.png', bytes, { share: true, mimeType: 'image/png' });
+
+    expect(shareFileMock.mock.calls[0]![0]).toBe('file:///tmp/shared/image.png');
+  });
+
+  // Regression (#6719): the iOS plugin parses the path with `URL(string:)`,
+  // which on iOS 16 returns nil for a space or non-ASCII character, so the
+  // share sheet never opened. It gets a percent-encoded file URL instead.
+  test('hands iOS a percent-encoded file URL', async () => {
+    const service = await loadServiceWithOS('ios');
+    await service.saveFile('三体 (1).md', 'notes', { share: true, mimeType: 'text/markdown' });
+
+    expect(shareFileMock.mock.calls[0]![0]).toBe('file:///tmp/shared/%E4%B8%89%E4%BD%93%20(1).md');
+  });
+
+  // An iOS "Open with" book keeps its decoded `file://` URI as its file path.
+  test('does not re-wrap a file URI on iOS', async () => {
+    const service = await loadServiceWithOS('ios');
+    await service.saveFile('My Book.epub', null, {
+      share: true,
+      filePath: 'file:///private/var/Inbox/My Book.epub',
+    });
+
+    expect(shareFileMock.mock.calls[0]![0]).toBe('file:///private/var/Inbox/My%20Book.epub');
+    expect(removeMock).toHaveBeenCalledWith('/tmp/My Book.epub');
+  });
+
+  // The iOS plugin copies the file to `<tmp>/<name>` and silently keeps an
+  // existing copy, so a second export of the same book shared the first one.
+  test('clears the plugin copy of a previous share on iOS', async () => {
+    const service = await loadServiceWithOS('ios');
+    await service.saveFile('notes.md', 'hello', { share: true, mimeType: 'text/markdown' });
+
+    expect(removeMock).toHaveBeenCalledWith('/tmp/notes.md');
+    expect(removeMock.mock.invocationCallOrder[0]).toBeLessThan(
+      shareFileMock.mock.invocationCallOrder[0]!,
+    );
   });
 
   // The book "Send" flow hands an already-on-disk file straight to the share

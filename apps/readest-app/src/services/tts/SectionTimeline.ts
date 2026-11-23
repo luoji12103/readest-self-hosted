@@ -18,6 +18,11 @@ export interface TimelineSentence {
   markName: string;
   range: Range;
   text: string;
+  // Known-exact duration (seconds at rate 1.0), set only when the source
+  // carries real timings — recorded narration read from EPUB Media Overlays.
+  // It outranks the measured/estimated tiers and is not text-keyed, so two
+  // identical sentences keep their own durations.
+  duration?: number;
 }
 
 export class SectionTimeline {
@@ -41,6 +46,14 @@ export class SectionTimeline {
     return this.#sentences.length;
   }
 
+  // Sentence at an ordinal, for callers that address the timeline by index
+  // rather than by time (the lyric view). Never round-trip an index through
+  // seconds to get here: positionAt() divides by the rate and sentenceAtTime()
+  // multiplies it back, and the float error can land a line early.
+  sentenceAt(index: number): TimelineSentence | null {
+    return this.#sentences[index] ?? null;
+  }
+
   setVoice(voiceId: string): void {
     if (voiceId === this.#voiceId) return;
     this.#voiceId = voiceId;
@@ -61,11 +74,13 @@ export class SectionTimeline {
     let sum = 0;
     for (let i = 0; i < n; i++) {
       const sentence = this.#sentences[i]!;
-      const measured = getMeasuredDuration(this.#voiceId, sentence.text);
+      const measured = sentence.duration ?? getMeasuredDuration(this.#voiceId, sentence.text);
       const duration =
         measured ?? estimateSentenceSeconds(sentence.text, this.#lang, this.#voiceId);
       this.#durations[i] = duration;
-      this.#measured[i] = measured !== undefined;
+      // A sentence with nothing to speak (estimated at 0 s) is never
+      // synthesized: it is as known as a measured one.
+      this.#measured[i] = measured !== undefined || duration === 0;
       this.#prefix[i] = sum;
       sum += duration;
     }
@@ -75,6 +90,19 @@ export class SectionTimeline {
   // Seconds at the current rate.
   getDuration(): number {
     return this.#total / this.#rate;
+  }
+
+  // Where buffered audio ends, as a fraction of the timeline, while sentence
+  // `index` plays: through the run of measured (synthesized) sentences that
+  // starts there. Prefetched audio is measured as it arrives, so this is the
+  // player's buffer bar; it stays correct when playback resumes mid-section.
+  getBufferedFraction(index: number): number {
+    if (this.#total <= 0 || index < 0 || index >= this.#durations.length) return 0;
+    let end = this.#prefix[index]!;
+    for (let i = index; i < this.#durations.length && this.#measured[i]; i++) {
+      end += this.#durations[i]!;
+    }
+    return end / this.#total;
   }
 
   // Duration-weighted fraction of the timeline backed by measured (exact)
@@ -100,7 +128,9 @@ export class SectionTimeline {
   // Map seconds (at the current rate) to a sentence, clamping past-the-end
   // seeks to the last sentence so an over-estimated total is never a dead
   // gesture. Null only for an empty timeline.
-  sentenceAtTime(seconds: number): { index: number; sentence: TimelineSentence } | null {
+  sentenceAtTime(
+    seconds: number,
+  ): { index: number; sentence: TimelineSentence; withinMediaSec: number } | null {
     const n = this.#sentences.length;
     if (n === 0) return null;
     const target = Math.max(0, seconds) * this.#rate;
@@ -119,7 +149,11 @@ export class SectionTimeline {
     }
     // Binary search finds the last sentence starting at or before the target;
     // past-the-end targets land on the final sentence by construction.
-    return { index, sentence: this.#sentences[index]! };
+    const withinMediaSec = Math.min(
+      Math.max(target - this.#prefix[index]!, 0),
+      this.#durations[index]!,
+    );
+    return { index, sentence: this.#sentences[index]!, withinMediaSec };
   }
 
   // Locate the timeline sentence containing (or last starting at or before)

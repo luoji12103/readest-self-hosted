@@ -293,7 +293,7 @@ describe('FileSyncEngine soft-delete propagation', () => {
     const provider = makeProvider(null, null, capture);
     // The GC sweep is separate, so the deleted book's hash dir + file still
     // exist remotely. Passing the deleted book in (it stays in allBooksMap)
-    // must keep the discovery pass from re-adding it as a download candidate.
+    // must keep the discovery pass from re-adding it as a cloud-shelf candidate.
     provider.list = vi.fn(async (path: string) => {
       if (path.endsWith('/books'))
         return [{ name: 'h1', path: '/Readest/books/h1', isDirectory: true }];
@@ -312,7 +312,7 @@ describe('FileSyncEngine soft-delete propagation', () => {
     });
 
     expect(addBookToLibrary).not.toHaveBeenCalled();
-    expect(result.booksDownloaded).toBe(0);
+    expect(result.booksAdded).toBe(0);
     expect(capture.index!.books.find((b) => b.hash === 'h1')!.deletedAt).toBe(500);
   });
 });
@@ -389,5 +389,87 @@ describe('FileSyncEngine config merge before push (Sync now must not blind-overw
 
     const ids = capture.config!.booknotes.map((n) => n.id);
     expect(ids).toEqual(['local-note']);
+  });
+});
+
+// #6414: grouping, tagging and metadata / cover edits no longer bump
+// `updatedAt` (the Date Read sort key), so the engine has to notice them on
+// their own clocks in both directions.
+describe('FileSyncEngine field-only edits (#6414)', () => {
+  test('pulls a group-only change without re-downloading the cover or config', async () => {
+    const local = makeLocalBook({ updatedAt: 100 });
+    const remote = makeLocalBook({
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      groupUpdatedAt: 300,
+      updatedAt: 100,
+    });
+    const provider = makeProvider(makeRemoteIndex(remote), null, {});
+
+    const updateBookMetadata = vi.fn(async (_book: Book) => {});
+    const saveBookCover = vi.fn(async (_book: Book, _bytes: ArrayBuffer) => {});
+    const store = makeStore({ updateBookMetadata, saveBookCover });
+
+    const engine = new FileSyncEngine(provider, store);
+    await engine.syncLibrary([local], {
+      strategy: 'silent',
+      syncBooks: false,
+      deviceId: 'pc-device',
+    });
+
+    expect(updateBookMetadata).toHaveBeenCalledTimes(1);
+    expect(updateBookMetadata.mock.calls[0]![0]).toMatchObject({
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      groupUpdatedAt: 300,
+      updatedAt: 100,
+    });
+    expect(saveBookCover).not.toHaveBeenCalled();
+  });
+
+  test('publishes a group-only local edit to the index without pushing the config', async () => {
+    const local = makeLocalBook({
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      groupUpdatedAt: 300,
+      updatedAt: 100,
+    });
+    const remote = makeLocalBook({ updatedAt: 100 });
+    const capture: { index?: RemoteLibraryIndex | null; config?: RemoteBookConfig | null } = {};
+    const provider = makeProvider(makeRemoteIndex(remote), null, capture);
+
+    const engine = new FileSyncEngine(provider, makeStore());
+    await engine.syncLibrary([local], {
+      strategy: 'silent',
+      syncBooks: false,
+      deviceId: 'pc-device',
+    });
+
+    expect(capture.index?.books.find((b) => b.hash === 'h1')).toMatchObject({
+      groupId: 'g1',
+      groupName: 'Sci-Fi',
+      groupUpdatedAt: 300,
+    });
+    expect(capture.config).toBeUndefined();
+  });
+
+  test('pushes the config and cover for a metadata-only local edit', async () => {
+    const local = makeLocalBook({ title: 'Edited', metadataUpdatedAt: 300, updatedAt: 100 });
+    const remote = makeLocalBook({ updatedAt: 100 });
+    const capture: { index?: RemoteLibraryIndex | null; config?: RemoteBookConfig | null } = {};
+    const provider = makeProvider(makeRemoteIndex(remote), null, capture);
+
+    const loadBookCover = vi.fn(async () => null);
+    const store = makeStore({ loadBookCover });
+
+    const engine = new FileSyncEngine(provider, store);
+    await engine.syncLibrary([local], {
+      strategy: 'silent',
+      syncBooks: false,
+      deviceId: 'pc-device',
+    });
+
+    expect(capture.config).toBeTruthy();
+    expect(loadBookCover).toHaveBeenCalled();
   });
 });

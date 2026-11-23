@@ -39,7 +39,14 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
     }
   }
   primaryLang = code6392to6391(primaryLang?.toLowerCase() || '') || primaryLang;
-  if (lang === 'en' && primaryLang && !isSameLang(lang, primaryLang)) {
+  // `en` is what we fall back to when nothing declared a language, and it is
+  // also what authoring tools stamp on their own: Word leaves `<body
+  // lang="EN-US">` on every converted EPUB. foliate reads the nearest ancestor
+  // with a lang, so that body beats the book's own `<html lang="vi">` and the
+  // whole book gets read by an English voice. Treat the regional variants the
+  // same way as bare `en` and let the book's declared language win.
+  const isDefaultEnglish = lang.split('-')[0] === 'en';
+  if (isDefaultEnglish && primaryLang && !isSameLang(lang, primaryLang)) {
     lang = primaryLang.split('-')[0]!.toLowerCase();
   }
   const textWithoutLangTags = ssml.replace(/<lang[^>]*>.*?<\/lang>/gs, '');
@@ -114,6 +121,24 @@ export const parseSSMLMarks = (ssml: string, primaryLang?: string) => {
   return { plainText, marks };
 };
 
+// Cut an utterance down to the sentence at `markName`: everything from the
+// next <mark> on is dropped, so the engine ends where that sentence ends.
+export const truncateSSMLAfterMark = (ssml: string, markName: string): string => {
+  const doc = new DOMParser().parseFromString(ssml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) return ssml;
+  const marks = Array.from(doc.getElementsByTagName('mark'));
+  const index = marks.findIndex((mark) => mark.getAttribute('name') === markName);
+  const cut = index >= 0 ? marks[index + 1] : undefined;
+  if (!cut) return ssml;
+  let node: Node = cut;
+  while (node.parentNode && node !== doc.documentElement) {
+    while (node.nextSibling) node.parentNode.removeChild(node.nextSibling);
+    node = node.parentNode;
+  }
+  cut.remove();
+  return new XMLSerializer().serializeToString(doc);
+};
+
 export const findSSMLMark = (charIndex: number, marks: TTSMark[]) => {
   let left = 0;
   let right = marks.length - 1;
@@ -159,7 +184,7 @@ export const filterSSMLWithLang = (
   }
 
   // Check if target matches any <lang> block
-  const langBlocks: Array<{ match: string; lang: string; content: string }> = [];
+  const langBlocks: Array<{ match: string; lang: string; content: string; index: number }> = [];
   const langBlockRegex = /<lang\s+xml:lang="([^"]+)"[^>]*>(.*?)<\/lang>/gs;
   let match: RegExpExecArray | null;
 
@@ -171,6 +196,7 @@ export const filterSSMLWithLang = (
         match: match[0]!,
         lang: match[1]!,
         content: match[2]!,
+        index: match.index,
       });
     }
   }
@@ -183,7 +209,26 @@ export const filterSSMLWithLang = (
       return ssml;
     }
 
-    const combinedContent = langBlocks.map((block) => block.match).join('');
+    const combinedContent = langBlocks
+      .map((block) => {
+        const firstMarkIndex = block.content.search(/<mark\b[^>]*\/>/i);
+        const textBeforeFirstMark = block.content
+          .slice(0, firstMarkIndex < 0 ? undefined : firstMarkIndex)
+          .replace(/<[^>]+>/g, '')
+          .trim();
+        if (!textBeforeFirstMark) return block.match;
+
+        // Foliate can place the mark for the first translated sentence
+        // immediately before its <lang> block. Keep that existing mark when
+        // source text is filtered out, even when later translated sentences
+        // already have marks of their own.
+        const precedingMarks = ssml.slice(0, block.index).match(/<mark\b[^>]*\/>/gi);
+        const precedingMark = precedingMarks?.at(-1);
+        if (!precedingMark) return block.match;
+
+        return block.match.replace(/(<lang\b[^>]*>)/i, `$1${precedingMark}`);
+      })
+      .join('');
     return `${speakOpenMatch[0]}${combinedContent}${speakCloseMatch[0]}`;
   }
 

@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { Overlayer } from 'foliate-js/overlayer.js';
+import { expandRangeOverRuby } from '@/utils/ruby';
 
 interface RectLike {
   left: number;
@@ -126,6 +127,43 @@ describe('Overlayer rect splitting across block types', () => {
     }
   });
 
+  it('only examines the nodes around the range in a flat document', () => {
+    // A single-file book, or a chunk of one (foliate-js section-chunks.js):
+    // thousands of blocks right under <body>. A sentence range that ends
+    // before the next block has <body> as its common ancestor, and comparing
+    // a node with a range costs as much as the node's index among its
+    // siblings, so examining every child of <body> is quadratic.
+    const blocks = 2000;
+    document.body.innerHTML = Array.from(
+      { length: blocks },
+      (_, i) => `<p id="b${i}">Block ${i}.</p>`,
+    ).join('');
+    const range = document.createRange();
+    range.setStart(textNode('b100'), 0);
+    range.setEndBefore(byId('b101'));
+    expect(range.commonAncestorContainer).toBe(document.body);
+
+    let compared = 0;
+    const proto = Range.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originals = ['intersectsNode', 'comparePoint'].map((name) => {
+      const orig = proto[name]!;
+      proto[name] = function (this: Range, ...args: unknown[]) {
+        compared++;
+        return orig.apply(this, args);
+      };
+      return [name, orig] as const;
+    });
+    try {
+      const { draw } = drawSpy();
+      new Overlayer(document).add('tts', range, draw);
+    } finally {
+      for (const [name, orig] of originals) proto[name] = orig;
+    }
+
+    expect(covered).toEqual(['Block 100.']);
+    expect(compared).toBeLessThan(20);
+  });
+
   it('does not double-draw text of paragraphs nested inside list items', () => {
     document.body.innerHTML = `
       <section>
@@ -207,5 +245,86 @@ describe('Overlayer rect splitting across block types', () => {
     const text = covered.join('');
     expect(text).toContain('Before the image.');
     expect(text).toContain('After the image.');
+  });
+});
+
+describe('Overlayer ruby annotations', () => {
+  beforeEach(() => {
+    covered = [];
+    Object.defineProperty(Range.prototype, 'getClientRects', {
+      value: stubGetClientRects,
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    if (realGetClientRects) {
+      Object.defineProperty(Range.prototype, 'getClientRects', realGetClientRects);
+    } else {
+      delete (Range.prototype as { getClientRects?: unknown }).getClientRects;
+    }
+  });
+
+  // Furigana renders on its own line above the base, so its rects would draw a
+  // second box floating over the annotation instead of on the highlighted text.
+  it('never contributes rects for ruby annotations', () => {
+    document.body.innerHTML = `
+      <section>
+        <p id="p1">空には<ruby>数多<rp>(</rp><rt>あまた</rt><rp>)</rp></ruby>の星がある。</p>
+      </section>`;
+    const range = document.createRange();
+    range.selectNodeContents(byId('p1'));
+
+    const { draw } = drawSpy();
+    new Overlayer(document).add('annotation', range, draw);
+
+    const text = covered.join('');
+    expect(text).toContain('空には');
+    expect(text).toContain('数多');
+    expect(text).toContain('の星がある。');
+    expect(text).not.toContain('あまた');
+    expect(text).not.toContain('(');
+  });
+
+  it('never contributes rects for an injected gloss', () => {
+    document.body.innerHTML = `
+      <section>
+        <p id="p1">これは<ruby class="wl-gloss" cfi-skip=""
+          >辞書<rt cfi-inert="">dictionary</rt></ruby>です。</p>
+      </section>`;
+    const range = document.createRange();
+    range.selectNodeContents(byId('p1'));
+
+    const { draw } = drawSpy();
+    new Overlayer(document).add('annotation', range, draw);
+
+    const text = covered.join('');
+    expect(text).toContain('辞書');
+    expect(text).not.toContain('dictionary');
+  });
+
+  // The TTS highlight anchors on whichever side of the ruby is spoken. When
+  // that is the reading, the range starts inside the <rt> whose rects are now
+  // dropped — expandRangeOverRuby widens it so the base is painted instead.
+  it('paints the base of a ruby the range only entered through its reading', () => {
+    document.body.innerHTML = `
+      <section>
+        <p id="p1">空には<ruby>数多<rt>あまた</rt></ruby>の星がある。</p>
+      </section>`;
+    const rt = byId('p1').querySelector('rt')!;
+    const tail = byId('p1').lastChild as Text;
+    const range = document.createRange();
+    range.setStart(rt.firstChild!, 0);
+    range.setEnd(tail, tail.length);
+
+    const { draw } = drawSpy();
+    new Overlayer(document).add('annotation', expandRangeOverRuby(range), draw);
+
+    const text = covered.join('');
+    expect(text).toContain('数多');
+    expect(text).toContain('の星がある。');
+    expect(text).not.toContain('あまた');
   });
 });

@@ -14,6 +14,10 @@ export const SCROLL_WRAPPER_FIT_CLASS = 'scroll-wrapper-fit';
 // scroll itself (its box reports no overflow) — it's wrapped instead.
 const SCROLLABLE_SELECTOR = `.${SCROLL_WRAPPER_CLASS}`;
 const SCROLL_WRAPPER_TOLERANCE_PX = 4;
+// Set on <html> when links get an enlarged hit area (applyLinkHitArea in ./style.ts),
+// which reaches this far past each link.
+export const LINK_HIT_AREA_CLASS = 'link-hit-area';
+export const LINK_HIT_AREA_PX = 10;
 const SCROLL_WRAPPER_TOUCH_SCROLL_FLAG = 'data-readest-scroll-wrapper-touch-scroll';
 
 const canScrollX = (el: Element) => el.scrollWidth - el.clientWidth > SCROLL_WRAPPER_TOLERANCE_PX;
@@ -33,8 +37,10 @@ export const findScrollableBox = (target: EventTarget | null): HTMLElement | nul
   if (!target || !('closest' in target)) return null;
   let el: Element | null = (target as Element).closest(SCROLLABLE_SELECTOR);
   while (el) {
+    // A fit wrapper is overflow:visible and can't scroll, whatever its scroll sizes say.
+    const fits = el.classList.contains(SCROLL_WRAPPER_FIT_CLASS);
     // Either axis: a tall code block scrolls vertically though it fits horizontally.
-    if (canScrollX(el) || canScrollY(el)) return el as HTMLElement;
+    if (!fits && (canScrollX(el) || canScrollY(el))) return el as HTMLElement;
     el = el.parentElement?.closest(SCROLLABLE_SELECTOR) ?? null;
   }
   return null;
@@ -131,20 +137,28 @@ export const applyTableTouchScroll = (document: Document) => {
 };
 
 /**
- * A display equation: a <math> that is the sole content of its container (or is
- * explicitly display="block"). Those need a scroll wrapper; an inline <math> sitting
- * among text in a paragraph must be left alone so it keeps flowing with the text.
+ * A display equation: a <math> that is explicitly display="block", or that is the
+ * sole content of its nearest block container, possibly through a chain of inline
+ * wrappers that are themselves sole children (<div><span><math/></span></div>).
+ * Those need a scroll wrapper. An inline <math> sitting among text must be left
+ * alone so it keeps flowing with the text, even when it is the only child of an
+ * inline <span> (how DITA/MathType exports mark every inline formula, #480): a
+ * block wrapper there breaks the line and indents the formula.
  */
-const isDisplayMath = (math: Element): boolean => {
+const isDisplayMath = (math: Element, win: Window | null): boolean => {
   if (math.getAttribute('display') === 'block') return true;
-  const parent = math.parentElement;
-  if (!parent) return false;
-  for (const node of parent.childNodes) {
-    if (node === math) continue;
-    if (node.nodeType === Node.ELEMENT_NODE) return false;
-    if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) return false;
+  let el: Element = math;
+  for (;;) {
+    const parent = el.parentElement;
+    if (!parent) return false;
+    for (const node of parent.childNodes) {
+      if (node === el) continue;
+      if (node.nodeType === Node.ELEMENT_NODE) return false;
+      if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) return false;
+    }
+    if (!win?.getComputedStyle(parent).display.startsWith('inline')) return true;
+    el = parent;
   }
-  return true;
 };
 
 /**
@@ -172,9 +186,10 @@ export const applyScrollableStyle = (document: Document) => {
     hoistNegativeMargins(el, wrapper, win);
     decideTableFit(wrapper, win);
   };
-  document.querySelectorAll('table').forEach(wrap);
+  // skip the hidden placeholders of a chunked section (foliate-js section-chunks.js)
+  document.querySelectorAll('table:not([data-foliate-chunk])').forEach(wrap);
   document.querySelectorAll('math').forEach((math) => {
-    if (isDisplayMath(math)) wrap(math);
+    if (isDisplayMath(math, win)) wrap(math);
   });
 };
 
@@ -211,10 +226,36 @@ const hoistNegativeMargins = (
 /**
  * Toggle SCROLL_WRAPPER_FIT_CLASS: a table within tolerance of its column fits
  * (overflow:visible — not a scroll container), a wider one stays overflow:auto.
+ *
+ * A link's enlarged hit area is an absolutely positioned box that counts in the
+ * wrapper's scrollWidth, so a right-aligned link in the last column made a table
+ * that fits scroll by a few pixels (#6857). Overflow no wider than that hit area
+ * still fits when the table's own box is within the column.
  */
 export const updateTableFit = (wrapper: HTMLElement) => {
-  const fits = wrapper.scrollWidth - wrapper.clientWidth <= SCROLL_WRAPPER_TOLERANCE_PX;
-  wrapper.classList.toggle(SCROLL_WRAPPER_FIT_CLASS, fits);
+  const overflow = wrapper.scrollWidth - wrapper.clientWidth;
+  wrapper.classList.toggle(
+    SCROLL_WRAPPER_FIT_CLASS,
+    overflow <= SCROLL_WRAPPER_TOLERANCE_PX || overflowIsLinkHitArea(wrapper, overflow),
+  );
+};
+
+// The overflow is a link's hit area when hit areas are on, the table itself fits,
+// and a link's hit area reaches past the wrapper's edge by that much.
+const overflowIsLinkHitArea = (wrapper: HTMLElement, overflow: number) => {
+  if (overflow > LINK_HIT_AREA_PX + SCROLL_WRAPPER_TOLERANCE_PX) return false;
+  if (!wrapper.ownerDocument.documentElement.classList.contains(LINK_HIT_AREA_CLASS)) return false;
+  const table = wrapper.querySelector<HTMLElement>(':scope > table');
+  if (!table || table.offsetWidth - wrapper.clientWidth > SCROLL_WRAPPER_TOLERANCE_PX) return false;
+  // Only overflow past the end edge scrolls: the right one, or the left one in RTL.
+  const rtl = wrapper.ownerDocument.defaultView?.getComputedStyle(wrapper).direction === 'rtl';
+  const left = wrapper.getBoundingClientRect().left + wrapper.clientLeft;
+  const right = left + wrapper.clientWidth;
+  return [...table.querySelectorAll('a')].some((a) => {
+    const rect = a.getBoundingClientRect();
+    const past = rtl ? left - rect.left : rect.right - right;
+    return past + LINK_HIT_AREA_PX >= overflow - SCROLL_WRAPPER_TOLERANCE_PX;
+  });
 };
 
 /**
@@ -230,6 +271,35 @@ const decideTableFit = (wrapper: HTMLElement, win: (Window & typeof globalThis) 
     if (wrapper.clientWidth <= 0) return; // not laid out yet
     updateTableFit(wrapper);
     observer.disconnect();
+    remeasureAfterLateLayout(wrapper, win);
   });
   observer.observe(wrapper);
+};
+
+const FONT_POLL_MS = 100;
+const FONT_POLL_MAX_MS = 10_000;
+
+/**
+ * The first measurement can land before a swapped-in web font or a decoded
+ * image has widened the table (#6198): the cells measure in the fallback font,
+ * the wrapper is marked fit, and once the real font arrives the table runs past
+ * the column with overflow visible. Re-measure once the fonts settle and as each
+ * image in the table loads — a bounded handful of checks, not a persistent
+ * observer. `fonts.ready` is never touched: creating that promise crashes
+ * WebContent on iOS <= 16 (#5654), so poll `fonts.status` like foliate does.
+ */
+const remeasureAfterLateLayout = (wrapper: HTMLElement, win: Window & typeof globalThis) => {
+  const fonts = wrapper.ownerDocument.fonts;
+  if (fonts?.status === 'loading') {
+    const deadline = Date.now() + FONT_POLL_MAX_MS;
+    const timer = win.setInterval(() => {
+      if (fonts.status === 'loading' && Date.now() < deadline) return;
+      win.clearInterval(timer);
+      updateTableFit(wrapper);
+    }, FONT_POLL_MS);
+  }
+  for (const img of Array.from(wrapper.querySelectorAll('img'))) {
+    if (img.complete) continue;
+    img.addEventListener('load', () => updateTableFit(wrapper), { once: true });
+  }
 };
